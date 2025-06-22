@@ -53,7 +53,7 @@ class Blackjack(commands.Cog):
         e = Embed(title="Blackjack")
         e.add_field(name="Your hand", value=f"{ph} ({hand_value(ph)})", inline=False)
         e.add_field(name="Dealer shows", value=f"[{dh[0]}]", inline=False)
-        files = [File(os.path.join("cards", c + ".png"), filename=c + ".png") for c in ph]
+        files = [File(os.path.join(os.path.dirname(__file__), "cards", c + ".png"), filename=f"{c}.png")]
         await ctx.send(embed=e, files=files)
         if start:
             await ctx.send("React 🔁 to Hit, ⏭️ to Stand.")
