@@ -54,19 +54,14 @@ class BlackjackView(View):
         g = self.cog.games[self.ctx.author.id]
         g["player"].append(g["deck"].pop())
 
+        await self.cog.show_game(self.ctx, message=self.message)
+
         if hand_value(g["player"]) > 21:
-            await self.cog.show_game(self.ctx, message=self.message)
             await interaction.message.edit(view=None)
-            await self.cog.resolve(self.ctx, busted=True)
-            return
-            await interaction.response.edit_message(content="You busted!", view=None)
             await self.cog.resolve(self.ctx, busted=True)
         elif hand_value(g["player"]) == 21:
-            await self.cog.show_game(self.ctx, message=self.message)
             await interaction.message.edit(view=None)
             await self.cog.resolve(self.ctx)
-        else:
-            await self.cog.show_game(self.ctx, message=self.message, interaction=interaction)
 
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="🛑")
     async def stand(self, interaction: discord.Interaction, button: Button):
@@ -89,19 +84,21 @@ class Blackjack(commands.Cog):
             return await ctx.send("Bet must be positive.")
         if bet > bal:
             return await ctx.send("Not enough CrewCoin.")
+
         await bank.withdraw_credits(ctx.author, bet)
         deck = make_deck()
         random.shuffle(deck)
-        ph = [deck.pop(), deck.pop()]
-        dh = [deck.pop(), deck.pop()]
-        self.games[ctx.author.id] = {"deck": deck, "player": ph, "dealer": dh, "bet": bet}
+
+        self.games[ctx.author.id] = {
+            "deck": deck,
+            "player": [deck.pop(), deck.pop()],
+            "dealer": [deck.pop(), deck.pop()],
+            "bet": bet
+        }
+
         await self.show_game(ctx, start=True)
 
     async def show_game(self, ctx, start=False, message=None, interaction=None):
-        # Determine if dealer hand should be hidden
-        if start is None:
-            g = self.games[ctx.author.id]
-            start = len(g['player']) == 2 and len(g['dealer']) == 2
         g = self.games[ctx.author.id]
         ph, dh = g["player"], g["dealer"]
 
@@ -140,6 +137,7 @@ class Blackjack(commands.Cog):
 
         player_hand = " ".join(format_card(c) for c in ph)
         dealer_hand = " ".join(format_card(c) for c in dh) if not start else format_card(dh[0]) + " ??"
+
         e = Embed(title="Blackjack")
         e.add_field(name="Your Hand", value=f"{player_hand} ({hand_value(ph)})", inline=False)
         e.add_field(name="Dealer Shows", value=f"{dealer_hand}" if start else f"{dealer_hand} ({hand_value(dh)})", inline=False)
@@ -157,33 +155,37 @@ class Blackjack(commands.Cog):
     async def resolve(self, ctx, busted=False):
         g = self.games.pop(ctx.author.id)
         ph, dh, deck, bet = g["player"], g["dealer"], g["deck"], g["bet"]
+
         if not busted:
             while hand_value(dh) < 17:
                 dh.append(deck.pop())
 
         pv, dv = hand_value(ph), hand_value(dh)
+        user_cfg = CONFIG.user(ctx.author)
+
+        result_msg = ""
         if busted or pv < dv <= 21:
-            await ctx.send(f"You lose! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}).")
+            result_msg = f"You lose! Dealer: {' '.join(format_card(c) for c in dh)} ({dv})."
+            await user_cfg.total_losses.set(await user_cfg.total_losses() + 1)
         elif pv > dv or dv > 21:
             winnings = bet * 2
+            result_msg = f"You win! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}). You earned {winnings} CrewCoin."
             await bank.deposit_credits(ctx.author, winnings)
-            await ctx.send(f"You win! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}). You earned {winnings} CrewCoin.")
+            await user_cfg.total_wins.set(await user_cfg.total_wins() + 1)
         else:
+            result_msg = f"Push! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}). Your bet was returned."
             await bank.deposit_credits(ctx.author, bet)
-            await ctx.send(f"Push! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}). Your bet was returned.")
 
-        u = ctx.author
-        await CONFIG.user(u).total_bet.set(await CONFIG.user(u).total_bet() + bet)
-        if busted or pv < dv <= 21:
-            await CONFIG.user(u).total_losses.set(await CONFIG.user(u).total_losses() + 1)
-        elif pv > dv or dv > 21:
-            await CONFIG.user(u).total_wins.set(await CONFIG.user(u).total_wins() + 1)
+        await user_cfg.total_bet.set(await user_cfg.total_bet() + bet)
+        await ctx.send(result_msg)
 
     @commands.command()
     async def bjstats(self, ctx):
         """Show your blackjack stats."""
         data = await CONFIG.user(ctx.author).all()
-        await ctx.send(f"Wins: {data['total_wins']}, Losses: {data['total_losses']}, Bet total: {data['total_bet']}")
+        await ctx.send(
+            f"Wins: {data['total_wins']}, Losses: {data['total_losses']}, Bet total: {data['total_bet']}"
+        )
 
 def setup(bot):
     bot.add_cog(Blackjack())
