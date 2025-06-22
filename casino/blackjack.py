@@ -57,6 +57,12 @@ class BlackjackView(View):
         if hand_value(g["player"]) > 21:
             await interaction.response.edit_message(content="You busted!", view=None)
             await self.cog.resolve(self.ctx, busted=True)
+            return
+            await interaction.response.edit_message(content="You busted!", view=None)
+            await self.cog.resolve(self.ctx, busted=True)
+        elif hand_value(g["player"]) == 21:
+            await self.cog.resolve(self.ctx)
+            await interaction.message.edit(view=None)
         else:
             await self.cog.show_game(self.ctx, message=self.message, interaction=interaction)
 
@@ -90,6 +96,10 @@ class Blackjack(commands.Cog):
         await self.show_game(ctx, start=True)
 
     async def show_game(self, ctx, start=False, message=None, interaction=None):
+        # Determine if dealer hand should be hidden
+        if start is None:
+            g = self.games[ctx.author.id]
+            start = len(g['player']) == 2 and len(g['dealer']) == 2
         g = self.games[ctx.author.id]
         ph, dh = g["player"], g["dealer"]
 
@@ -104,7 +114,7 @@ class Blackjack(commands.Cog):
             return imgs
 
         p_imgs = load_images(ph)
-        d_imgs = load_images(dh, reveal_all=False if start else True)
+        d_imgs = load_images(dh, reveal_all=not start)
 
         pw = sum(img.width for img in p_imgs)
         dw = sum(img.width for img in d_imgs)
@@ -127,7 +137,7 @@ class Blackjack(commands.Cog):
             temp_path = temp.name
 
         player_hand = " ".join(format_card(c) for c in ph)
-        dealer_hand = " ".join(format_card(c) for c in ([dh[0]] if start else dh))
+        dealer_hand = " ".join(format_card(c) for c in dh) if not start else format_card(dh[0]) + " ??"
         e = Embed(title="Blackjack")
         e.add_field(name="Your Hand", value=f"{player_hand} ({hand_value(ph)})", inline=False)
         e.add_field(name="Dealer Shows", value=f"{dealer_hand}" if start else f"{dealer_hand} ({hand_value(dh)})", inline=False)
