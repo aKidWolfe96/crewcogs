@@ -4,9 +4,21 @@ import os
 from discord import File, Embed
 from PIL import Image
 import tempfile
+import discord
+from discord.ui import View, Button
 
 CONFIG = Config.get_conf(None, identifier=1234567890)
 CONFIG.register_user(total_wins=0, total_losses=0, total_bet=0)
+
+SUIT_EMOJIS = {
+    "H": "♥",
+    "D": "♦",
+    "S": "♠",
+    "C": "♣"
+}
+
+def format_card(card: str) -> str:
+    return f"{card[:-1]}{SUIT_EMOJIS[card[-1]]}"
 
 def card_value(card: str) -> int:
     rank = card[0]
@@ -27,10 +39,40 @@ def hand_value(cards: list[str]) -> int:
 def make_deck():
     return [f"{r}{s}" for r in "A23456789TJQK" for s in "SHDC"]
 
+class BlackjackView(View):
+    def __init__(self, cog, ctx):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.ctx = ctx
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="🃏")
+    async def hit(self, interaction: discord.Interaction, button: Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message("This isn't your game!", ephemeral=True)
+
+        g = self.cog.games[self.ctx.author.id]
+        g["player"].append(g["deck"].pop())
+
+        if hand_value(g["player"]) > 21:
+            await interaction.response.edit_message(content="You busted!", view=None)
+            await self.cog.resolve(self.ctx, busted=True)
+        else:
+            await interaction.response.defer()
+            await self.cog.show_game(self.ctx, update=interaction)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="🛑")
+    async def stand(self, interaction: discord.Interaction, button: Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message("This isn't your game!", ephemeral=True)
+
+        await interaction.response.defer()
+        await self.cog.resolve(self.ctx)
+        await interaction.message.edit(view=None)
+
 class Blackjack(commands.Cog):
     """Blackjack casino using Red economy."""
     def __init__(self):
-        self.games = {}  # ctx.author.id ➔ game state
+        self.games = {}
 
     @commands.command()
     async def blackjack(self, ctx, bet: int):
@@ -48,20 +90,36 @@ class Blackjack(commands.Cog):
         self.games[ctx.author.id] = {"deck": deck, "player": ph, "dealer": dh, "bet": bet}
         await self.show_game(ctx, start=True)
 
-    async def show_game(self, ctx, start=False):
+    async def show_game(self, ctx, start=False, update=None):
         g = self.games[ctx.author.id]
         ph, dh = g["player"], g["dealer"]
 
-        images = []
-        for card in ph:
-            path = os.path.join(os.path.dirname(__file__), "cards", f"{card}.png")
-            images.append(Image.open(path))
+        def load_images(hand, reveal_all=True):
+            imgs = []
+            for idx, card in enumerate(hand):
+                if idx == 1 and not reveal_all:
+                    path = os.path.join(os.path.dirname(__file__), "cards", "back.png")
+                else:
+                    path = os.path.join(os.path.dirname(__file__), "cards", f"{card}.png")
+                imgs.append(Image.open(path).resize((100, 145)))
+            return imgs
 
-        total_width = sum(img.width for img in images)
-        max_height = max(img.height for img in images)
-        combo = Image.new("RGBA", (total_width, max_height))
-        x = 0
-        for img in images:
+        p_imgs = load_images(ph)
+        d_imgs = load_images(dh, reveal_all=False if start else True)
+
+        pw = sum(img.width for img in p_imgs)
+        dw = sum(img.width for img in d_imgs)
+        total_width = max(pw, dw)
+        total_height = 145 * 2 + 20
+        combo = Image.new("RGBA", (total_width, total_height), (0, 0, 0, 0))
+
+        x = (total_width - pw) // 2
+        for img in p_imgs:
+            combo.paste(img, (x, 155))
+            x += img.width
+
+        x = (total_width - dw) // 2
+        for img in d_imgs:
             combo.paste(img, (x, 0))
             x += img.width
 
@@ -69,37 +127,20 @@ class Blackjack(commands.Cog):
             combo.save(temp.name)
             temp_path = temp.name
 
-        e = Embed(title="Blackjack", description=f"Your hand: {ph} ({hand_value(ph)})\nDealer shows: [{dh[0]}]")
+        player_hand = " ".join(format_card(c) for c in ph)
+        dealer_hand = " ".join(format_card(c) for c in ([dh[0]] if start else dh))
+        e = Embed(title="Blackjack")
+        e.add_field(name="Your Hand", value=f"{player_hand} ({hand_value(ph)})", inline=False)
+        e.add_field(name="Dealer Shows", value=f"{dealer_hand}" if start else f"{dealer_hand} ({hand_value(dh)})", inline=False)
         file = File(temp_path, filename="hand.png")
         e.set_image(url="attachment://hand.png")
-        await ctx.send(embed=e, file=file)
 
-        if start:
-            msg = await ctx.send("React 🔁 to Hit, ⏭️ to Stand.")
-            await msg.add_reaction("🔁")
-            await msg.add_reaction("⏭️")
+        view = BlackjackView(self, ctx)
 
-    @commands.Cog.listener()
-    async def on_reaction_add(self, reaction, user):
-        if user.bot or reaction.message.author.bot:
-            return
-        if user.id not in self.games:
-            return
-
-        emoji = str(reaction.emoji)
-        g = self.games[user.id]
-        deck = g["deck"]
-
-        if emoji == "🔁":
-            g["player"].append(deck.pop())
-            if hand_value(g["player"]) > 21:
-                await reaction.message.channel.send("You busted!")
-                await self.resolve(await reaction.message.channel.fetch_message(reaction.message.id), busted=True)
-            else:
-                await self.show_game(await reaction.message.channel.fetch_message(reaction.message.id))
-
-        elif emoji == "⏭️":
-            await self.resolve(await reaction.message.channel.fetch_message(reaction.message.id))
+        if update:
+            await update.edit_original_response(embed=e, file=file, view=view)
+        else:
+            await ctx.send(embed=e, file=file, view=view)
 
     async def resolve(self, ctx, busted=False):
         g = self.games.pop(ctx.author.id)
@@ -110,14 +151,14 @@ class Blackjack(commands.Cog):
 
         pv, dv = hand_value(ph), hand_value(dh)
         if busted or pv < dv <= 21:
-            await ctx.send(f"You lose! Dealer: {dh} ({dv}).")
+            await ctx.send(f"You lose! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}).")
         elif pv > dv or dv > 21:
             winnings = bet * 2
             await bank.deposit_credits(ctx.author, winnings)
-            await ctx.send(f"You win! Dealer: {dh} ({dv}). You earned {winnings} CrewCoin.")
+            await ctx.send(f"You win! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}). You earned {winnings} CrewCoin.")
         else:
             await bank.deposit_credits(ctx.author, bet)
-            await ctx.send(f"Push! Dealer: {dh} ({dv}). Your bet was returned.")
+            await ctx.send(f"Push! Dealer: {' '.join(format_card(c) for c in dh)} ({dv}). Your bet was returned.")
 
         u = ctx.author
         await CONFIG.user(u).total_bet.set(await CONFIG.user(u).total_bet() + bet)
