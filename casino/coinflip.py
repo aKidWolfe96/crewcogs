@@ -3,8 +3,13 @@ import random
 import os
 from discord import File, Embed
 
+from redbot.core import Config
+
 class CoinFlip(commands.Cog):
     """Coin Flip casino game using Red economy."""
+
+    CONFIG = Config.get_conf(None, identifier=9876543210)
+CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
     def __init__(self, bot):
         self.bot = bot
@@ -40,6 +45,21 @@ class CoinFlip(commands.Cog):
         e.set_image(url="attachment://coin.png")
 
         await ctx.send(embed=e, file=file)
+
+        await CONFIG.user(ctx.author).total_cf_bet.set(await CONFIG.user(ctx.author).total_cf_bet() + bet)
+        if win:
+            await CONFIG.user(ctx.author).total_cf_wins.set(await CONFIG.user(ctx.author).total_cf_wins() + 1)
+        else:
+            await CONFIG.user(ctx.author).total_cf_losses.set(await CONFIG.user(ctx.author).total_cf_losses() + 1)
+
+@commands.command()
+    async def cfstats(self, ctx):
+        """Show your coinflip stats."""
+        data = await CONFIG.user(ctx.author).all()
+        await ctx.send(
+            f"Coinflip Wins: {data['total_cf_wins']}, Losses: {data['total_cf_losses']}, Bet total: {data['total_cf_bet']}"
+        )
+
 
 def setup(bot):
     bot.add_cog(CoinFlip(bot))
