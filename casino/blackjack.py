@@ -18,11 +18,13 @@ SUIT_EMOJIS = {
 }
 
 def format_card(card: str) -> str:
-    return f"{card[:-1]}{SUIT_EMOJIS[card[-1]]}"
+    rank = card[:-1]
+    suit = card[-1]
+    return f"{rank}{SUIT_EMOJIS[suit]}"
 
 def card_value(card: str) -> int:
-    rank = card[0]
-    if rank in "TJQK":
+    rank = card[:-1]
+    if rank in ["J", "Q", "K"]:
         return 10
     if rank == "A":
         return 11
@@ -30,14 +32,14 @@ def card_value(card: str) -> int:
 
 def hand_value(cards: list[str]) -> int:
     total = sum(card_value(c) for c in cards)
-    aces = sum(1 for c in cards if c[0] == "A")
+    aces = sum(1 for c in cards if c[:-1] == "A")
     while total > 21 and aces:
         total -= 10
         aces -= 1
     return total
 
 def make_deck():
-    return [f"{r}{s}" for r in "A23456789TJQK" for s in "SHDC"]
+    return [f"{r}{s}" for r in ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"] for s in "SHDC"]
 
 class BlackjackView(View):
     def __init__(self, cog, ctx, message):
@@ -51,7 +53,7 @@ class BlackjackView(View):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("This isn't your game!", ephemeral=True)
 
-        await interaction.response.defer()  # Interaction fix
+        await interaction.response.defer()
 
         g = self.cog.games[self.ctx.author.id]
         g["player"].append(g["deck"].pop())
@@ -70,7 +72,7 @@ class BlackjackView(View):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("This isn't your game!", ephemeral=True)
 
-        await interaction.response.defer()  # Interaction fix
+        await interaction.response.defer()
 
         await self.cog.resolve(self.ctx)
         await interaction.message.edit(view=None)
