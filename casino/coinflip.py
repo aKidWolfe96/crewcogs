@@ -13,9 +13,6 @@ class CoinFlip(commands.Cog):
         self.CONFIG = Config.get_conf(self, identifier=9876543210)
         self.CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
-    def __init__(self, bot):
-        self.bot = bot
-
     @commands.command()
     async def coinflip(self, ctx, side: str, bet: int):
         """Bet on heads or tails."""
@@ -50,9 +47,9 @@ class CoinFlip(commands.Cog):
 
         await self.CONFIG.user(ctx.author).total_cf_bet.set(await self.CONFIG.user(ctx.author).total_cf_bet() + bet)
         if win:
-            await self.CONFIG.user(ctx.author).total_cf_wins.set(await CONFIG.user(ctx.author).total_cf_wins() + 1)
+            await self.CONFIG.user(ctx.author).total_cf_wins.set(await self.CONFIG.user(ctx.author).total_cf_wins() + 1)
         else:
-            await self.CONFIG.user(ctx.author).total_cf_losses.set(await CONFIG.user(ctx.author).total_cf_losses() + 1)
+            await self.CONFIG.user(ctx.author).total_cf_losses.set(await self.CONFIG.user(ctx.author).total_cf_losses() + 1)
 
     @commands.command()
     async def cfstats(self, ctx):
