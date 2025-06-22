@@ -9,7 +9,7 @@ class CoinFlip(commands.Cog):
     """Coin Flip casino game using Red economy."""
 
     CONFIG = Config.get_conf(None, identifier=9876543210)
-CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
+    CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
     def __init__(self, bot):
         self.bot = bot
@@ -52,7 +52,7 @@ CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
         else:
             await CONFIG.user(ctx.author).total_cf_losses.set(await CONFIG.user(ctx.author).total_cf_losses() + 1)
 
-@commands.command()
+    @commands.command()
     async def cfstats(self, ctx):
         """Show your coinflip stats."""
         data = await CONFIG.user(ctx.author).all()
