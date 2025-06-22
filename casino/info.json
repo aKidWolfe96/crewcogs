@@ -1,0 +1,11 @@
+{
+  "author": ["YourName"],
+  "install_msg": "Thanks for installing Blackjack Casino!",
+  "name": "casino",
+  "short": "Blackjack with Red economy integration",
+  "description": "Play Blackjack using CrewCoin with PNG cards and stat tracking.",
+  "permissions": [],
+  "required_cogs": [],
+  "requirements": [],
+  "tags": ["casino", "blackjack", "economy", "cards"]
+}
