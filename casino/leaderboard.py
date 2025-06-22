@@ -24,27 +24,21 @@ class CasinoLeaderboard(commands.Cog):
             cf = await self.cf_config.user(user).all()
             bj = await self.bj_config.user(user).all()
             total_bet = cf['total_cf_bet'] + bj['total_bet']
-            total_wins = cf['total_cf_wins'] + bj['total_wins']
-            total_losses = cf['total_cf_losses'] + bj['total_losses']
             if total_bet == 0:
                 continue
-            leaderboard.append((user.display_name, cf, bj))
+            leaderboard.append((user.display_name, cf, bj, total_bet))
 
-        leaderboard.sort(key=lambda x: x[1], reverse=True)
+        leaderboard.sort(key=lambda x: x[3], reverse=True)
         top = leaderboard[:10]
 
         embed = Embed(title="🎰 Casino Leaderboard", description="Top 10 high rollers by total bet across all games", color=0xFFD700)
-        for i, (name, cf, bj) in enumerate(top, 1):
+        for i, (name, cf, bj, _) in enumerate(top, 1):
             embed.add_field(
                 name=f"#{i} - {name}",
                 value=(
-                    f"🎲 **Blackjack**
-"
-                    f"💰 Bet: {bj['total_bet']} | ✅ Wins: {bj['total_wins']} | ❌ Losses: {bj['total_losses']}
-
-"
-                    f"🪙 **Coinflip**
-"
+                    f"🎲 **Blackjack**\n"
+                    f"💰 Bet: {bj['total_bet']} | ✅ Wins: {bj['total_wins']} | ❌ Losses: {bj['total_losses']}\n\n"
+                    f"🪙 **Coinflip**\n"
                     f"💰 Bet: {cf['total_cf_bet']} | ✅ Wins: {cf['total_cf_wins']} | ❌ Losses: {cf['total_cf_losses']}"
                 ),
                 inline=False
