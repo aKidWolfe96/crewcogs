@@ -40,10 +40,11 @@ def make_deck():
     return [f"{r}{s}" for r in "A23456789TJQK" for s in "SHDC"]
 
 class BlackjackView(View):
-    def __init__(self, cog, ctx):
+    def __init__(self, cog, ctx, message):
         super().__init__(timeout=60)
         self.cog = cog
         self.ctx = ctx
+        self.message = message
 
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="🃏")
     async def hit(self, interaction: discord.Interaction, button: Button):
@@ -57,7 +58,7 @@ class BlackjackView(View):
             await interaction.response.edit_message(content="You busted!", view=None)
             await self.cog.resolve(self.ctx, busted=True)
         else:
-            await self.cog.show_game(self.ctx, update=interaction)
+            await self.cog.show_game(self.ctx, message=self.message, interaction=interaction)
 
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="🛑")
     async def stand(self, interaction: discord.Interaction, button: Button):
@@ -86,9 +87,9 @@ class Blackjack(commands.Cog):
         ph = [deck.pop(), deck.pop()]
         dh = [deck.pop(), deck.pop()]
         self.games[ctx.author.id] = {"deck": deck, "player": ph, "dealer": dh, "bet": bet}
-        await self.show_game(ctx, start=True)
+        await self.show_game(ctx)
 
-    async def show_game(self, ctx, start=False, update=None):
+    async def show_game(self, ctx, start=False, message=None, interaction=None):
         g = self.games[ctx.author.id]
         ph, dh = g["player"], g["dealer"]
 
@@ -133,12 +134,13 @@ class Blackjack(commands.Cog):
         file = File(temp_path, filename="hand.png")
         e.set_image(url="attachment://hand.png")
 
-        view = BlackjackView(self, ctx)
-
-        if update:
-            await update.message.edit(embed=e, attachments=[file], view=view)
+        if message:
+            view = BlackjackView(self, ctx, message)
+            await message.edit(embed=e, attachments=[file], view=view)
         else:
-            await ctx.send(embed=e, file=file, view=view)
+            sent_msg = await ctx.send(embed=e, file=file)
+            view = BlackjackView(self, ctx, sent_msg)
+            await sent_msg.edit(view=view)
 
     async def resolve(self, ctx, busted=False):
         g = self.games.pop(ctx.author.id)
