@@ -6,6 +6,7 @@ class CasinoLeaderboard(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        # Fix: use consistent owner (None) for both configs
         self.cf_config = Config.get_conf(None, identifier=9876543210, force_registration=True)
         self.cf_config.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
@@ -21,11 +22,15 @@ class CasinoLeaderboard(commands.Cog):
         for user in users:
             if user.bot:
                 continue
+
+            # Pull from the unified config system
             cf = await self.cf_config.user(user).all()
             bj = await self.bj_config.user(user).all()
+
             total_bet = cf['total_cf_bet'] + bj['total_bet']
             if total_bet == 0:
                 continue
+
             leaderboard.append((user.display_name, cf, bj, total_bet))
 
         leaderboard.sort(key=lambda x: x[3], reverse=True)
