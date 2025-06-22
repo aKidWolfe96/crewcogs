@@ -55,14 +55,16 @@ class BlackjackView(View):
         g["player"].append(g["deck"].pop())
 
         if hand_value(g["player"]) > 21:
-            await interaction.response.edit_message(content="You busted!", view=None)
+            await self.cog.show_game(self.ctx, message=self.message)
+            await interaction.message.edit(view=None)
             await self.cog.resolve(self.ctx, busted=True)
             return
             await interaction.response.edit_message(content="You busted!", view=None)
             await self.cog.resolve(self.ctx, busted=True)
         elif hand_value(g["player"]) == 21:
-            await self.cog.resolve(self.ctx)
+            await self.cog.show_game(self.ctx, message=self.message)
             await interaction.message.edit(view=None)
+            await self.cog.resolve(self.ctx)
         else:
             await self.cog.show_game(self.ctx, message=self.message, interaction=interaction)
 
