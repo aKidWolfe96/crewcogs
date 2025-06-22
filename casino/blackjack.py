@@ -51,6 +51,8 @@ class BlackjackView(View):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("This isn't your game!", ephemeral=True)
 
+        await interaction.response.defer()  # Interaction fix
+
         g = self.cog.games[self.ctx.author.id]
         g["player"].append(g["deck"].pop())
 
@@ -67,6 +69,8 @@ class BlackjackView(View):
     async def stand(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("This isn't your game!", ephemeral=True)
+
+        await interaction.response.defer()  # Interaction fix
 
         await self.cog.resolve(self.ctx)
         await interaction.message.edit(view=None)
