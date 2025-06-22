@@ -8,8 +8,8 @@ from redbot.core import Config
 class CoinFlip(commands.Cog):
     """Coin Flip casino game using Red economy."""
 
-    CONFIG = Config.get_conf(None, identifier=9876543210)
-    CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
+        CONFIG = Config.get_conf(None, identifier=9876543210)
+        CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
     def __init__(self, bot):
         self.bot = bot
@@ -46,7 +46,7 @@ class CoinFlip(commands.Cog):
 
         await ctx.send(embed=e, file=file)
 
-        await CONFIG.user(ctx.author).total_cf_bet.set(await CONFIG.user(ctx.author).total_cf_bet() + bet)
+        await self.CONFIG.user(ctx.author).total_cf_bet.set(await CONFIG.user(ctx.author).total_cf_bet() + bet)
         if win:
             await CONFIG.user(ctx.author).total_cf_wins.set(await CONFIG.user(ctx.author).total_cf_wins() + 1)
         else:
