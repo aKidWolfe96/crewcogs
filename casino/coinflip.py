@@ -10,7 +10,7 @@ class CoinFlip(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.CONFIG = Config.get_conf(self, identifier=9876543210)
+        self.CONFIG = Config.get_conf(None, identifier=9876543210)
         self.CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
     @commands.command()
