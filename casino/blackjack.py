@@ -57,7 +57,6 @@ class BlackjackView(View):
             await interaction.response.edit_message(content="You busted!", view=None)
             await self.cog.resolve(self.ctx, busted=True)
         else:
-            await interaction.response.defer()
             await self.cog.show_game(self.ctx, update=interaction)
 
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="🛑")
@@ -65,7 +64,6 @@ class BlackjackView(View):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("This isn't your game!", ephemeral=True)
 
-        await interaction.response.defer()
         await self.cog.resolve(self.ctx)
         await interaction.message.edit(view=None)
 
@@ -138,7 +136,7 @@ class Blackjack(commands.Cog):
         view = BlackjackView(self, ctx)
 
         if update:
-            await update.edit_original_response(embed=e, file=file, view=view)
+            await update.message.edit(embed=e, attachments=[file], view=view)
         else:
             await ctx.send(embed=e, file=file, view=view)
 
