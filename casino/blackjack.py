@@ -2,6 +2,8 @@ from redbot.core import commands, Config, bank
 import random
 import os
 from discord import File, Embed
+from PIL import Image
+import tempfile
 
 CONFIG = Config.get_conf(None, identifier=1234567890)
 CONFIG.register_user(total_wins=0, total_losses=0, total_bet=0)
@@ -16,7 +18,6 @@ def card_value(card: str) -> int:
 
 def hand_value(cards: list[str]) -> int:
     total = sum(card_value(c) for c in cards)
-    # adjust for Aces
     aces = sum(1 for c in cards if c[0] == "A")
     while total > 21 and aces:
         total -= 10
@@ -29,7 +30,7 @@ def make_deck():
 class Blackjack(commands.Cog):
     """Blackjack casino using Red economy."""
     def __init__(self):
-        self.games = {}  # ctx.author.id ➡ game state
+        self.games = {}  # ctx.author.id ➔ game state
 
     @commands.command()
     async def blackjack(self, ctx, bet: int):
@@ -50,18 +51,33 @@ class Blackjack(commands.Cog):
     async def show_game(self, ctx, start=False):
         g = self.games[ctx.author.id]
         ph, dh = g["player"], g["dealer"]
-        e = Embed(title="Blackjack")
-        e.add_field(name="Your hand", value=f"{ph} ({hand_value(ph)})", inline=False)
-        e.add_field(name="Dealer shows", value=f"[{dh[0]}]", inline=False)
-        files = [File(os.path.join(os.path.dirname(__file__), "cards", c + ".png"), filename=f"{c}.png")]
-        await ctx.send(embed=e, files=files)
+
+        images = []
+        for card in ph:
+            path = os.path.join(os.path.dirname(__file__), "cards", f"{card}.png")
+            images.append(Image.open(path))
+
+        total_width = sum(img.width for img in images)
+        max_height = max(img.height for img in images)
+        combo = Image.new("RGBA", (total_width, max_height))
+        x = 0
+        for img in images:
+            combo.paste(img, (x, 0))
+            x += img.width
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp:
+            combo.save(temp.name)
+            temp_path = temp.name
+
+        e = Embed(title="Blackjack", description=f"Your hand: {ph} ({hand_value(ph)})\nDealer shows: [{dh[0]}]")
+        file = File(temp_path, filename="hand.png")
+        e.set_image(url="attachment://hand.png")
+        await ctx.send(embed=e, file=file)
+
         if start:
-            await ctx.send("React 🔁 to Hit, ⏭️ to Stand.")
-            msg = await ctx.message.reply("React now!")
+            msg = await ctx.send("React 🔁 to Hit, ⏭️ to Stand.")
             await msg.add_reaction("🔁")
             await msg.add_reaction("⏭️")
-        else:
-            await self.resolve(ctx)
 
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction, user):
@@ -69,21 +85,21 @@ class Blackjack(commands.Cog):
             return
         if user.id not in self.games:
             return
-        if reaction.message.author != reaction.message.author:  # sanity check
-            pass
-        g = self.games[user.id]
+
         emoji = str(reaction.emoji)
+        g = self.games[user.id]
         deck = g["deck"]
 
         if emoji == "🔁":
             g["player"].append(deck.pop())
             if hand_value(g["player"]) > 21:
                 await reaction.message.channel.send("You busted!")
-                await self.resolve(reaction.message.channel.get_context(), busted=True)
+                await self.resolve(await reaction.message.channel.fetch_message(reaction.message.id), busted=True)
             else:
-                await self.show_game(reaction.message.channel.get_context())
+                await self.show_game(await reaction.message.channel.fetch_message(reaction.message.id))
+
         elif emoji == "⏭️":
-            await self.resolve(reaction.message.channel.get_context())
+            await self.resolve(await reaction.message.channel.fetch_message(reaction.message.id))
 
     async def resolve(self, ctx, busted=False):
         g = self.games.pop(ctx.author.id)
@@ -93,27 +109,22 @@ class Blackjack(commands.Cog):
                 dh.append(deck.pop())
 
         pv, dv = hand_value(ph), hand_value(dh)
-        outcome = ""
         if busted or pv < dv <= 21:
-            outcome = "loss"
             await ctx.send(f"You lose! Dealer: {dh} ({dv}).")
-            await bank.withdraw_credits(ctx.author, 0)  # already withdrawn
         elif pv > dv or dv > 21:
-            outcome = "win"
             winnings = bet * 2
             await bank.deposit_credits(ctx.author, winnings)
             await ctx.send(f"You win! Dealer: {dh} ({dv}). You earned {winnings} CrewCoin.")
         else:
-            outcome = "push"
             await bank.deposit_credits(ctx.author, bet)
             await ctx.send(f"Push! Dealer: {dh} ({dv}). Your bet was returned.")
 
         u = ctx.author
         await CONFIG.user(u).total_bet.set(await CONFIG.user(u).total_bet() + bet)
-        if outcome == "win":
-            await CONFIG.user(u).total_wins.set(await CONFIG.user(u).total_wins() + 1)
-        elif outcome == "loss":
+        if busted or pv < dv <= 21:
             await CONFIG.user(u).total_losses.set(await CONFIG.user(u).total_losses() + 1)
+        elif pv > dv or dv > 21:
+            await CONFIG.user(u).total_wins.set(await CONFIG.user(u).total_wins() + 1)
 
     @commands.command()
     async def bjstats(self, ctx):
