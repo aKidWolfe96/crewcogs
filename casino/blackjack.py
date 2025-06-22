@@ -87,7 +87,7 @@ class Blackjack(commands.Cog):
         ph = [deck.pop(), deck.pop()]
         dh = [deck.pop(), deck.pop()]
         self.games[ctx.author.id] = {"deck": deck, "player": ph, "dealer": dh, "bet": bet}
-        await self.show_game(ctx)
+        await self.show_game(ctx, start=True)
 
     async def show_game(self, ctx, start=False, message=None, interaction=None):
         g = self.games[ctx.author.id]
