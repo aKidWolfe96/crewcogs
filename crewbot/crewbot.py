@@ -8,7 +8,7 @@ class CrewBot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.api_url = "http://localhost:11434/api/chat"
-        self.model = "llama3"  # Customize this model name
+        self.model = "self.model = "llama2-uncensored"  # Customize this model name
 
     @commands.command(name="crewbot")
     async def crewbot_chat(self, ctx, *, message: str):
