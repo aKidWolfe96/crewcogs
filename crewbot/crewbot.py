@@ -25,7 +25,7 @@ class CrewBot(commands.Cog):
         }
 
         try:
-            response = requests.post(self.api_chat_url, json=payload, timeout=60)
+            response = requests.post(self.api_chat_url, json=payload, timeout=300)
             response.raise_for_status()
             data = response.json()
 
@@ -48,7 +48,7 @@ class CrewBot(commands.Cog):
         }
 
         try:
-            response = requests.post(self.api_generate_url, json=payload, timeout=60)
+            response = requests.post(self.api_generate_url, json=payload, timeout=300)
             response.raise_for_status()
             data = response.json()
 
