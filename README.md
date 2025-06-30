@@ -26,19 +26,6 @@ You can replace `crewbot` with any other cog name in this repo.
 ```bash
 [p]load crewbot
 ```
-
-## 🛠 Updating
-
-```bash
-[p]cog update crewcogs
-```
-
-Then reload the cog:
-
-```bash
-[p]reload crewbot
-```
 ---
-
 ## ✍️ Created by
 aKidWolfe
