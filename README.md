@@ -22,55 +22,16 @@ Example: to install `crewbot` (Ollama chatbot)
 You can replace `crewbot` with any other cog name in this repo.
 
 ### 3. Load the Cog
-```bash
+
 [p]load crewbot
-```
-
----
-
-## 🧠 Cog: CrewBot (Chat with Ollama)
-
-Talk to a locally hosted LLM like `llama2-uncensored` using:
-
-```bash
-[prefix]crewbot <your message>
-```
-
-**Requirements:**
-- Ollama running locally (`ollama run llama2-uncensored`)
-- `requests` library installed in your RedBot venv:
-  ```bash
-  pip install requests
-  ```
-
----
-
-## 📁 Folder Structure
-
-```
-CREW/
-└── cogs/
-    └── CogManager/
-        └── cogs/
-            ├── crewbot/
-            ├── ...
-```
-
----
 
 ## 🛠 Updating
 
-When the repo is updated, run:
-
-```bash
 [p]cog update crewcogs
-```
 
 Then reload the cog:
 
-```bash
 [p]reload crewbot
-```
 
 ---
 
