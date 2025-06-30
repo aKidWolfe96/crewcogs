@@ -7,8 +7,8 @@ class CrewBot(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.api_chat_url = "http://localhost:11434/api/chat"
-        self.api_generate_url = "http://localhost:11434/api/generate"
+        self.api_chat_url = "http://172.17.0.2:11434/api/chat"
+        self.api_generate_url = "http://172.17.0.2:11434/api/generate"
         self.model = "llama2-uncensored"  # Update to your preferred model
 
     @commands.command(name="crewbot")
