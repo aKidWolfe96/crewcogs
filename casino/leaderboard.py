@@ -22,7 +22,6 @@ class CasinoLeaderboard(commands.Cog):
             if user.bot:
                 continue
 
-            # Pull from the unified config system
             cf = await self.cf_config.user(user).all()
             bj = await self.bj_config.user(user).all()
 
