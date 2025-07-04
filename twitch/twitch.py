@@ -1,5 +1,6 @@
 import discord
-from redbot.core import commands, Config, tasks
+from redbot.core import commands, Config
+from redbot.core.utils import tasks
 import aiohttp
 import logging
 
@@ -143,6 +144,3 @@ class Twitch(commands.Cog):
     @live_check.before_loop
     async def before_live_check(self):
         await self.bot.wait_until_ready()
-
-async def setup(bot):
-    await bot.add_cog(Twitch(bot))
