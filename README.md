@@ -5,9 +5,6 @@ A collection of custom Red-DiscordBot cogs built for CrewBot. Includes tools, ga
 
 ## 🚀 Installation
 
-## - Install Redbot - 
-https://github.com/Cog-Creators/Red-DiscordBot
-
 ### 1. Add Repo to Red
 In Discord or your Redbot console, run:
 
@@ -30,5 +27,8 @@ You can replace `crewbot` with any other cog name in this repo.
 [p]load crewbot
 ```
 ---
+
+## - Link to install Red-DiscordBot -
+https://github.com/Cog-Creators/Red-DiscordBot
 ## ✍️ Created by
 aKidWolfe
