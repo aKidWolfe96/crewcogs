@@ -40,7 +40,7 @@ class AudioPlayer(commands.Cog):
         await ctx.send(f"🎵 Now playing: **{track.title}**")
 
     @commands.command()
-    async def leave(self, ctx):
+    async def leaveaudio(self, ctx):
         """Disconnect from the voice channel."""
         if ctx.voice_client:
             await ctx.voice_client.disconnect()
