@@ -8,33 +8,46 @@ class AudioPlayer(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        self.node_ready = False
         self.bot.loop.create_task(self.start_lavalink())
 
     async def start_lavalink(self):
         await self.bot.wait_until_ready()
-        if not wavelink.NodePool.nodes:
-            await wavelink.NodePool.create_node(
-                bot=self.bot,
-                host="127.0.0.1",
-                port=2333,
-                password="youshallnotpass",
-                region="us_central",
-            )
+        try:
+            if not wavelink.NodePool.nodes:
+                await wavelink.NodePool.create_node(
+                    bot=self.bot,
+                    host="127.0.0.1",
+                    port=2333,
+                    password="youshallnotpass",
+                    region="us_central",
+                )
+            self.node_ready = True
+            print("[AudioPlayer] Lavalink node connected successfully.")
+        except Exception as e:
+            print(f"[AudioPlayer] Lavalink connection failed: {e}")
 
     @commands.command()
     async def join(self, ctx):
         """Join your voice channel."""
+        if not self.node_ready:
+            return await ctx.send("❌ Lavalink node is not ready. Try again shortly.")
+
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("You're not in a voice channel.")
-        channel = ctx.author.voice.channel
 
         if ctx.voice_client:
-            return await ctx.send("I'm already connected.")
+            return await ctx.send("I'm already connected to a channel.")
+
+        channel = ctx.author.voice.channel
         await channel.connect(cls=wavelink.Player)
 
     @commands.command()
     async def play(self, ctx, *, query: str):
         """Play a song from YouTube."""
+        if not self.node_ready:
+            return await ctx.send("❌ Lavalink node is not ready. Try again shortly.")
+
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("You're not in a voice channel.")
 
@@ -42,10 +55,11 @@ class AudioPlayer(commands.Cog):
             await ctx.invoke(self.join)
 
         player: wavelink.Player = ctx.voice_client
-        if not player.is_connected():
-            await player.connect(ctx.author.voice.channel)
 
-        track = await wavelink.YouTubeTrack.search(query, return_first=True)
+        try:
+            track = await wavelink.YouTubeTrack.search(query, return_first=True)
+        except Exception as e:
+            return await ctx.send(f"Search failed: {e}")
 
         if not track:
             return await ctx.send("No track found.")
