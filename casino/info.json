@@ -5,7 +5,7 @@
   "short": "Blackjack, Coinflip, and Daily Rewards with Red economy integration",
   "description": "Play Blackjack or Coinflip using CrewCoin with PNG cards and stat tracking.",
   "permissions": [],
-  "required_cogs": [],
+  "required_cogs": [economy],
   "requirements": [],
   "tags": ["casino", "blackjack", "economy", "cards", "rewards']
 }
