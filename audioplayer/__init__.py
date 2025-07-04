@@ -1,4 +1,4 @@
 from .audioplayer import AudioPlayer
 
-def setup(bot):
-    bot.add_cog(AudioPlayer(bot))
+async def setup(bot):
+    await bot.add_cog(AudioPlayer(bot))
