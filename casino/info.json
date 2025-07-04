@@ -3,7 +3,7 @@
   "install_msg": "Thanks for installing The Casino!",
   "name": "casino",
   "short": "Blackjack, Coinflip, and Daily Rewards with Red economy integration",
-  "description": "Play Blackjack or Coinflip using CrewCoin with PNG cards and stat tracking.",
+  "description": "Play Blackjack or Coinflip using the built in economy with stat tracking.",
   "permissions": [],
   "required_cogs": [economy],
   "requirements": [],
