@@ -6,7 +6,6 @@ class CasinoLeaderboard(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        # Fix: use consistent owner (None) for both configs
         self.cf_config = Config.get_conf(None, identifier=9876543210, force_registration=True)
         self.cf_config.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
