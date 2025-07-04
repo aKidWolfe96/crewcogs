@@ -1,6 +1,6 @@
 import discord
 from redbot.core import commands, Config
-from redbot.core.utils import tasks
+from discord.ext import tasks
 import aiohttp
 import logging
 
