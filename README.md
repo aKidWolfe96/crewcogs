@@ -30,5 +30,3 @@ You can replace `crewbot` with any other cog name in this repo.
 
 ## - Link to install Red-DiscordBot -
 https://github.com/Cog-Creators/Red-DiscordBot
-## ✍️ Created by
-aKidWolfe
