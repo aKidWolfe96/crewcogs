@@ -1,9 +1,12 @@
 # CrewCogs 🔧
-A collection of custom Red-DiscordBot cogs built for CrewBot. Includes tools, games, and AI-powered features like local chatbot integration with Ollama.
+A collection of custom Red-DiscordBot cogs built for CrewBot. Includes tools, games, and AI features like local chatbot integration with Ollama.
 
 ---
 
 ## 🚀 Installation
+
+## - Install Redbot - 
+https://github.com/Cog-Creators/Red-DiscordBot
 
 ### 1. Add Repo to Red
 In Discord or your Redbot console, run:
