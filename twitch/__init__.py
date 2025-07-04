@@ -1,4 +1,4 @@
-from .twitch import Twitch  # or from twitch import Twitch for single file
+from .twitch import Twitch
 
 async def setup(bot):
     await bot.add_cog(Twitch(bot))
