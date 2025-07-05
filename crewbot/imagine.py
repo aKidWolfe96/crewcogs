@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import time
 from urllib.parse import quote
+import io
 
 class Imagine(commands.Cog):
     """Generate images using ComfyUI and the flux_schnell workflow."""
@@ -65,12 +66,18 @@ class Imagine(commands.Cog):
                                     image_path = images[0].get("filename")
                                     break
                             if image_path:
-                                image_url = f"{self.api_url}/view?filename={quote(image_path)}"
                                 await loading_msg.edit(content=f"✅ Image generated for prompt: `{prompt}`")
-                                embed = discord.Embed(title="Your image")
-                                embed.set_image(url=image_url)
-                                await ctx.send(embed=embed)
-                                return
+
+                                # Download image bytes
+                                async with session.get(f"{self.api_url}/view?filename={quote(image_path)}") as img_resp:
+                                    if img_resp.status == 200:
+                                        img_bytes = await img_resp.read()
+                                        file = discord.File(fp=io.BytesIO(img_bytes), filename=image_path)
+                                        await ctx.send(file=file)
+                                        return
+                                    else:
+                                        await ctx.send("❌ Failed to download generated image.")
+                                        return
 
                     await loading_msg.edit(content=f"{dots[dot_index]} Generating image... `{prompt}`")
                     dot_index = (dot_index + 1) % len(dots)
