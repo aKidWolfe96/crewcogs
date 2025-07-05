@@ -13,7 +13,7 @@ class Imagine(commands.Cog):
         self.bot = bot
         self.server_address = "127.0.0.1:8000"
         self.workflow_path = Path(__file__).parent / "flux_schnell-api.json"
-        self.output_folder = Path(r"C:\Users\SERVER\Documents\ComfyUI\output")  # Hardcoded ComfyUI output path
+        self.output_folder = Path(r"C:\Users\SERVER\Documents\ComfyUI\output")
 
     async def generate_image(self, prompt: str):
         client_id = str(uuid.uuid4())
@@ -39,38 +39,26 @@ class Imagine(commands.Cog):
                 prompt_id = data.get("prompt_id")
                 print(f"[IMAGINE] Submitted prompt_id: {prompt_id}")
 
-            # Wait for generation via websocket
-            ws_url = f"ws://{self.server_address}/ws?clientId={client_id}"
-            async with session.ws_connect(ws_url) as ws:
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        message = json.loads(msg.data)
-                        if message.get("type") == "execution_start":
-                            print(f"[IMAGINE] Generation started.")
-                        if message.get("type") == "executing" and message["data"].get("prompt_id") == prompt_id and message["data"].get("node") is None:
-                            print(f"[IMAGINE] Generation completed.")
-                            break
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        print("[IMAGINE] WebSocket closed or errored.")
-                        break
+            # Poll for up to 3 minutes to find the generated image
+            for i in range(36):  # 36 * 5s = 180s = 3 minutes
+                await asyncio.sleep(5)
+                print(f"[IMAGINE] Polling history... ({i + 1}/36)")
+                async with session.get(f"http://{self.server_address}/history/{prompt_id}") as hist_resp:
+                    if hist_resp.status != 200:
+                        continue
+                    history = await hist_resp.json()
 
-            # Fetch generated image filename
-            async with session.get(f"http://{self.server_address}/history/{prompt_id}") as hist_resp:
-                history = await hist_resp.json()
+                outputs = history.get(prompt_id, {}).get("outputs", {})
+                for node_output in outputs.values():
+                    for image in node_output.get("images", []):
+                        filename = image.get("filename")
+                        image_path = self.output_folder / filename
+                        print(f"[IMAGINE] Looking for image at: {image_path}")
+                        if image_path.exists():
+                            print(f"[IMAGINE] ✅ Found image: {image_path}")
+                            return image_path
 
-            outputs = history.get(prompt_id, {}).get("outputs", {})
-            for node_output in outputs.values():
-                for image in node_output.get("images", []):
-                    filename = image.get("filename")
-                    image_path = self.output_folder / filename
-                    print(f"[IMAGINE] Looking for image at: {image_path}")
-                    if image_path.exists():
-                        print(f"[IMAGINE] ✅ Found image: {image_path}")
-                        return image_path
-                    else:
-                        print(f"[IMAGINE] ❌ Image not found on disk: {image_path}")
-
-            raise Exception("No valid image file found in output folder.")
+            raise Exception("Timeout waiting for generated image.")
 
     @commands.command()
     async def imagine(self, ctx, *, prompt: str):
