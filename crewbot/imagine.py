@@ -4,13 +4,14 @@ import aiohttp
 import asyncio
 import json
 from pathlib import Path
+import time
 
 class Imagine(commands.Cog):
     """Generate images using ComfyUI and the flux_schnell workflow."""
 
     def __init__(self, bot):
         self.bot = bot
-        self.api_url = "http://127.0.0.1:8000"  # Your ComfyUI API port
+        self.api_url = "http://127.0.0.1:8000"
         self.workflow_path = Path(__file__).parent / "flux_schnell-api.json"
 
     @commands.command()
@@ -20,21 +21,18 @@ class Imagine(commands.Cog):
         loading_msg = await ctx.send("🧠 Preparing your image...")
 
         try:
-            # Load workflow JSON with top-level "prompt" key
             with open(self.workflow_path, "r", encoding="utf-8") as f:
                 prompt_data = json.load(f)
 
             if "prompt" not in prompt_data:
                 return await ctx.send("❌ flux_schnell-api.json must wrap nodes in a top-level 'prompt' key.")
 
-            # Inject user prompt in all fields containing "{prompt}"
             for node_id, node in prompt_data["prompt"].items():
                 if isinstance(node, dict) and "inputs" in node:
                     for key, val in node["inputs"].items():
                         if isinstance(val, str) and "{prompt}" in val:
                             node["inputs"][key] = val.replace("{prompt}", prompt)
 
-            # Submit to ComfyUI
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{self.api_url}/prompt", json=prompt_data) as resp:
                     if resp.status != 200:
@@ -43,33 +41,37 @@ class Imagine(commands.Cog):
                     data = await resp.json()
                     prompt_id = data.get("prompt_id")
 
-            # Animated loading
+            start_time = time.time()
+            timeout = 180  # seconds
+            poll_interval = 3
             dots = ["⏳", "🔄", "🌀", "🔃", "🔁", "♻️", "💫"]
-            for i in range(12):
-                await loading_msg.edit(content=f"{dots[i % len(dots)]} Generating image... `{prompt}`")
-                await asyncio.sleep(1.5)
+            dot_index = 0
 
-            # Retrieve results
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.api_url}/history/{prompt_id}") as resp:
-                    if resp.status != 200:
-                        return await ctx.send("❌ Failed to retrieve result.")
-                    result = await resp.json()
+                while True:
+                    if time.time() - start_time > timeout:
+                        await loading_msg.edit(content="❌ Image generation timed out.")
+                        return
 
-            # Find the first image filename in outputs
-            outputs = result.get("outputs", {})
-            image_path = None
-            for node_output in outputs.values():
-                images = node_output.get("images")
-                if images:
-                    image_path = images[0].get("filename")
-                    break
+                    async with session.get(f"{self.api_url}/history/{prompt_id}") as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            outputs = result.get("outputs", {})
+                            image_path = None
+                            for node_output in outputs.values():
+                                images = node_output.get("images")
+                                if images:
+                                    image_path = images[0].get("filename")
+                                    break
+                            if image_path:
+                                image_url = f"{self.api_url}/view?filename={image_path}"
+                                await loading_msg.edit(content=f"✅ Image generated for prompt: `{prompt}`")
+                                await ctx.send(embed=discord.Embed(title="Your image").set_image(url=image_url))
+                                return
 
-            if not image_path:
-                return await ctx.send("❌ No image generated.")
-
-            image_url = f"{self.api_url}/view?filename={image_path}"
-            await ctx.send(embed=discord.Embed(title="Your image").set_image(url=image_url))
+                    await loading_msg.edit(content=f"{dots[dot_index]} Generating image... `{prompt}`")
+                    dot_index = (dot_index + 1) % len(dots)
+                    await asyncio.sleep(poll_interval)
 
         except Exception as e:
             await ctx.send(f"⚠️ Error: `{e}`")
