@@ -10,7 +10,7 @@ class Imagine(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.api_url = "http://127.0.0.1:8188"  # Update this if needed
+        self.api_url = "http://127.0.0.1:8000"  # Update this if needed
         self.workflow_path = Path(__file__).parent / "flux_schnell-api.json"
 
     @commands.command()
