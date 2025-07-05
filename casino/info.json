@@ -1,11 +1,10 @@
 {
-  "author": ["aKidWolfe"],
-  "install_msg": "Thanks for installing The Casino!",
-  "name": "casino",
-  "short": "Blackjack, Coinflip, and Daily Rewards with Red economy integration",
-  "description": "Play Blackjack or Coinflip using the built in economy with stat tracking.",
-  "permissions": [],
-  "required_cogs": [economy],
+  "author": ["aKidWolfe96"],
+  "name": "Casino",
+  "description": "Casino games like blackjack and daily spin.",
+  "install_msg": "Good luck, don't lose it all.",
   "requirements": [],
-  "tags": ["casino", "blackjack", "economy", "cards", "rewards']
+  "tags": ["casino", "games", "fun"],
+  "hidden": false,
+  "type": "COG"
 }
