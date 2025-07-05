@@ -5,6 +5,7 @@ import asyncio
 import json
 from pathlib import Path
 import time
+from urllib.parse import quote
 
 class Imagine(commands.Cog):
     """Generate images using ComfyUI and the flux_schnell workflow."""
@@ -42,7 +43,7 @@ class Imagine(commands.Cog):
                     prompt_id = data.get("prompt_id")
 
             start_time = time.time()
-            timeout = 180  # seconds
+            timeout = 180  # 3 minutes max wait
             poll_interval = 3
             dots = ["⏳", "🔄", "🌀", "🔃", "🔁", "♻️", "💫"]
             dot_index = 0
@@ -64,9 +65,11 @@ class Imagine(commands.Cog):
                                     image_path = images[0].get("filename")
                                     break
                             if image_path:
-                                image_url = f"{self.api_url}/view?filename={image_path}"
+                                image_url = f"{self.api_url}/view?filename={quote(image_path)}"
                                 await loading_msg.edit(content=f"✅ Image generated for prompt: `{prompt}`")
-                                await ctx.send(embed=discord.Embed(title="Your image").set_image(url=image_url))
+                                embed = discord.Embed(title="Your image")
+                                embed.set_image(url=image_url)
+                                await ctx.send(embed=embed)
                                 return
 
                     await loading_msg.edit(content=f"{dots[dot_index]} Generating image... `{prompt}`")
