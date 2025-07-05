@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 class Imagine(commands.Cog):
-    """Generate images using ComfyUI and send output file when ready."""
+    """Generate images using ComfyUI and send output when ready."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -18,7 +18,7 @@ class Imagine(commands.Cog):
     async def generate_image(self, prompt: str):
         client_id = str(uuid.uuid4())
 
-        # Load and inject prompt into workflow
+        # Load and inject prompt
         workflow = json.loads(self.workflow_path.read_text(encoding="utf-8"))
         if "prompt" not in workflow:
             raise Exception("Workflow must contain a top-level 'prompt' key.")
@@ -30,7 +30,7 @@ class Imagine(commands.Cog):
                         node["inputs"][k] = v.replace("{prompt}", prompt)
 
         async with aiohttp.ClientSession() as session:
-            # Submit prompt
+            # Submit the prompt
             async with session.post(f"http://{self.server_address}/prompt", json=workflow) as resp:
                 if resp.status != 200:
                     text = await resp.text()
@@ -39,44 +39,49 @@ class Imagine(commands.Cog):
                 prompt_id = data.get("prompt_id")
                 print(f"[IMAGINE] Submitted prompt_id: {prompt_id}")
 
-            # Wait for generation to complete via WebSocket
+            # WebSocket: wait up to 60s for generation to finish
             ws_url = f"ws://{self.server_address}/ws?clientId={client_id}"
-            async with session.ws_connect(ws_url) as ws:
-                print("[IMAGINE] Waiting for generation to complete...")
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        event = json.loads(msg.data)
-                        if (
-                            event.get("type") == "executing"
-                            and event["data"].get("prompt_id") == prompt_id
-                            and event["data"].get("node") is None
-                        ):
-                            print("[IMAGINE] Generation complete.")
-                            break
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        raise Exception("WebSocket connection failed")
+            try:
+                async with session.ws_connect(ws_url) as ws:
+                    print("[IMAGINE] Waiting for WebSocket done event...")
+                    for _ in range(60):
+                        msg = await ws.receive(timeout=1)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if (
+                                data.get("type") == "executing"
+                                and data["data"].get("prompt_id") == prompt_id
+                                and data["data"].get("node") is None
+                            ):
+                                print("[IMAGINE] ✅ WebSocket: Generation complete.")
+                                break
+            except Exception as e:
+                print(f"[IMAGINE] ⚠️ WebSocket timeout or error: {e}")
 
-            # Fetch history to get output filename
-            async with session.get(f"http://{self.server_address}/history/{prompt_id}") as hist_resp:
-                if hist_resp.status != 200:
-                    raise Exception("Failed to fetch generation history.")
-                history = await hist_resp.json()
+            # Fallback: Poll /history up to 3 minutes
+            for i in range(36):
+                await asyncio.sleep(5)
+                print(f"[IMAGINE] Polling history ({i+1}/36)...")
+                async with session.get(f"http://{self.server_address}/history/{prompt_id}") as hist_resp:
+                    if hist_resp.status != 200:
+                        continue
+                    history = await hist_resp.json()
 
-            outputs = history.get(prompt_id, {}).get("outputs", {})
-            for node_output in outputs.values():
-                for image in node_output.get("images", []):
-                    filename = image.get("filename")
-                    image_path = self.output_folder / filename
-                    print(f"[IMAGINE] Checking image path: {image_path}")
-                    if image_path.exists():
-                        print(f"[IMAGINE] ✅ Image found: {image_path}")
-                        return image_path
+                outputs = history.get(prompt_id, {}).get("outputs", {})
+                for node_output in outputs.values():
+                    for image in node_output.get("images", []):
+                        filename = image.get("filename")
+                        image_path = self.output_folder / filename
+                        print(f"[IMAGINE] Checking image path: {image_path}")
+                        if image_path.exists():
+                            print(f"[IMAGINE] ✅ Found image: {image_path}")
+                            return image_path
 
-            raise Exception("Image file not found after completion.")
+            raise Exception("Image not found after timeout.")
 
     @commands.command()
     async def imagine(self, ctx, *, prompt: str):
-        """Generate an image from a prompt and send it to Discord."""
+        """Generate an image using ComfyUI and your prompt."""
         loading = await ctx.send(f"🧠 Generating image for: `{prompt}`")
         try:
             image_path = await self.generate_image(prompt)
