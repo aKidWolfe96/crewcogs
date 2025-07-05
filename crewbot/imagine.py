@@ -10,7 +10,7 @@ class Imagine(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.api_url = "http://127.0.0.1:8000"  # Use port 8000
+        self.api_url = "http://127.0.0.1:8000"  # Your ComfyUI API port
         self.workflow_path = Path(__file__).parent / "flux_schnell-api.json"
 
     @commands.command()
@@ -20,15 +20,14 @@ class Imagine(commands.Cog):
         loading_msg = await ctx.send("🧠 Preparing your image...")
 
         try:
-            # Load and inject prompt
+            # Load workflow JSON with top-level "prompt" key
             with open(self.workflow_path, "r", encoding="utf-8") as f:
                 prompt_data = json.load(f)
 
-            # Make sure the file has the correct structure
             if "prompt" not in prompt_data:
-                return await ctx.send("❌ `flux_schnell-api.json` must wrap nodes in a top-level 'prompt' key.")
+                return await ctx.send("❌ flux_schnell-api.json must wrap nodes in a top-level 'prompt' key.")
 
-            # Replace `{prompt}` placeholders in the workflow
+            # Inject user prompt in all fields containing "{prompt}"
             for node_id, node in prompt_data["prompt"].items():
                 if isinstance(node, dict) and "inputs" in node:
                     for key, val in node["inputs"].items():
@@ -44,23 +43,22 @@ class Imagine(commands.Cog):
                     data = await resp.json()
                     prompt_id = data.get("prompt_id")
 
-            # Animated loading bar
+            # Animated loading
             dots = ["⏳", "🔄", "🌀", "🔃", "🔁", "♻️", "💫"]
             for i in range(12):
                 await loading_msg.edit(content=f"{dots[i % len(dots)]} Generating image... `{prompt}`")
                 await asyncio.sleep(1.5)
 
-            # Poll results
+            # Retrieve results
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{self.api_url}/history/{prompt_id}") as resp:
                     if resp.status != 200:
                         return await ctx.send("❌ Failed to retrieve result.")
                     result = await resp.json()
 
-            # Extract image filename
+            # Find the first image filename in outputs
             outputs = result.get("outputs", {})
             image_path = None
-
             for node_output in outputs.values():
                 images = node_output.get("images")
                 if images:
@@ -71,7 +69,7 @@ class Imagine(commands.Cog):
                 return await ctx.send("❌ No image generated.")
 
             image_url = f"{self.api_url}/view?filename={image_path}"
-            await ctx.send("✅ Done!", embed=discord.Embed(title="Your image").set_image(url=image_url))
+            await ctx.send(embed=discord.Embed(title="Your image").set_image(url=image_url))
 
         except Exception as e:
             await ctx.send(f"⚠️ Error: `{e}`")
