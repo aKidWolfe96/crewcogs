@@ -2,9 +2,10 @@ import discord
 import aiohttp
 import asyncio
 import datetime
+import logging
+
 from redbot.core import commands
 from discord.ext.tasks import loop
-import logging
 
 log = logging.getLogger("red.twitch")
 
@@ -35,13 +36,14 @@ class TwitchWebhook(commands.Cog):
             async with session.post(url, params=params) as resp:
                 data = await resp.json()
                 self.access_token = data.get("access_token")
+                if not self.access_token:
+                    log.error(f"Twitch token error: {data}")
 
-    @tasks.loop(seconds=60)
+    @loop(seconds=60)
     async def poll_streams(self):
         if not self.access_token:
             await self.get_access_token()
             if not self.access_token:
-                log.error("Failed to get Twitch access token.")
                 return
 
         headers = {
@@ -70,13 +72,14 @@ class TwitchWebhook(commands.Cog):
             "username": "Twitch Alert",
             "embeds": [
                 {
-                    "title": f"{stream['user_name']} is now LIVE!",
+                    "title": "Click here to watch the stream!",
                     "url": f"https://twitch.tv/{stream['user_login']}",
                     "description": stream['title'],
                     "color": 0x9146FF,
                     "timestamp": datetime.datetime.utcnow().isoformat(),
                     "thumbnail": {"url": thumbnail},
                     "fields": [
+                        {"name": "Streamer", "value": f"[{stream['user_name']}](https://twitch.tv/{stream['user_login']})", "inline": True},
                         {"name": "Game", "value": stream.get('game_name', 'Unknown'), "inline": True},
                         {"name": "Viewers", "value": str(stream.get('viewer_count', '0')), "inline": True}
                     ]
@@ -87,4 +90,4 @@ class TwitchWebhook(commands.Cog):
         async with aiohttp.ClientSession() as session:
             async with session.post(self.webhook_url, json=payload) as resp:
                 if resp.status not in (200, 204):
-                    log.error(f"Webhook failed with status: {resp.status}")
+                    log.error(f"Webhook failed: {resp.status} | {await resp.text()}")
