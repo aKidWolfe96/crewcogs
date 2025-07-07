@@ -16,7 +16,7 @@ class TwitchWebhook(commands.Cog):
         self.client_id = "50mc80jxcaob6a8l79vag8moceqoxq"
         self.client_secret = "xb32ylq8yrzk1l67vg5lqmp5rq1d43"
         self.webhook_url = "https://discord.com/api/webhooks/1391915121344774144/1tgy7G4hO0u7uHYjwHc1o5d3ALzKlHdQByblLUcIM_t74MbH_7lrzColbROIuxabhjUt"
-        self.streamers = ["onlyabi"]  # lowercase login names
+        self.streamers = ["onlyabi", "akidwolfe"]  # lowercase login names
         self.checked = {}
         self.access_token = None
         self.poll_streams.start()
