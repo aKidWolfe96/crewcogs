@@ -2,7 +2,8 @@ import discord
 import aiohttp
 import asyncio
 import datetime
-from redbot.core import commands, tasks
+from redbot.core import commands
+from redbot.core.tasks import loop
 import logging
 
 log = logging.getLogger("red.twitch")
