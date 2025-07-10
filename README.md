@@ -13,7 +13,7 @@ In Discord or your Redbot console, run:
 ```
 
 ### 2. Install Specific Cog
-Example: to install `crewbot` (Ollama chatbot+ Image generation via Comfyui)
+Example: to install `crewbot` (Ollama chatbot + Image generation via Comfyui)
 
 ```bash
 [p]cog install crewcogs crewbot
