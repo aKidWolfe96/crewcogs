@@ -4,7 +4,7 @@ from redbot.core import commands
 from xml.etree import ElementTree
 from urllib.parse import quote
 
-class PlexDirect(commands.Cog):
+class Plex(commands.Cog):
     """Search Plex and send direct stream URLs."""
 
     def __init__(self, bot):
