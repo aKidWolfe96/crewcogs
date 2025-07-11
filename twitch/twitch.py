@@ -15,15 +15,15 @@ class TwitchWebhook(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.client_id = "CHANGEME"
-        self.client_secret = "CHANGEME"
-        self.webhook_url = "CHANGEME"
-        self.streamers = ["TWITCHUSER1", "TWITCHUSER2"]
+        self.client_id = "50mc80jxcaob6a8l79vag8moceqoxq"
+        self.client_secret = "nf5wycw2gnspmy0yivyftqt9cc97ez"
+        self.webhook_url = "https://discord.com/api/webhooks/1392851670043590830/VF0-2sIeRKQbu7zyuI87F2icxJdz9msALULJhX38viTzLuN1X-mCNLfCcEbPH7mXqLnU"
+        self.streamers = ["onlyabbii", "akidwolfe"]
 
         # Map Twitch login → Discord user ID
         self.discord_map = {
-            "TWITCHUSER1": DISCORDID,
-            "TWITCHUSER2": DISCORDID
+            "onlyabbii": 820559750302269450,
+            "akidwolfe": 593248744636678154
         }
 
         self.streamer_role_id = 1390723266909569054  # Role to assign/remove
