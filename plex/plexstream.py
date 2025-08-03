@@ -1,5 +1,4 @@
 import discord
-import requests
 from redbot.core import commands, Config
 from plexapi.server import PlexServer
 
@@ -70,7 +69,13 @@ class PlexStream(commands.Cog):
             summary = movie.summary or "No description available."
             studio = getattr(movie, 'studio', 'Unknown Studio')
             duration = int(getattr(movie, 'duration', 0) / 60000) if getattr(movie, 'duration', None) else "N/A"
-            poster_url = getattr(movie, 'thumbUrl', None)
+
+            # Build full poster URL with Plex token
+            poster_path = movie.thumb or movie.art
+            if poster_path:
+                poster_url = f"{self.plex._baseurl}{poster_path}?X-Plex-Token={self.plex._token}"
+            else:
+                poster_url = None
 
             embed = discord.Embed(
                 title=title,
@@ -80,18 +85,9 @@ class PlexStream(commands.Cog):
             embed.set_footer(text=f"{studio} • {duration} minutes")
 
             if poster_url:
-                try:
-                    img_data = requests.get(poster_url).content
-                    tmp_path = '/tmp/movie.jpg'
-                    with open(tmp_path, 'wb') as f:
-                        f.write(img_data)
-                    file = discord.File(tmp_path, filename='movie.jpg')
-                    embed.set_image(url="attachment://movie.jpg")
-                    await ctx.send(file=file, embed=embed)
-                except Exception as e:
-                    await ctx.send(f"🎬 **{title}**\n📄 *Image failed to load: {e}*", embed=embed)
-            else:
-                await ctx.send(embed=embed)
+                embed.set_image(url=poster_url)
+
+            await ctx.send(embed=embed)
 
         except Exception as e:
             await ctx.send(f"❌ Error: {e}")
