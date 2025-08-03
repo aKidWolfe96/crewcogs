@@ -2,7 +2,6 @@ import discord
 import requests
 from redbot.core import commands, Config
 from plexapi.server import PlexServer
-from plexapi.mixins import PosterUrlMixin
 
 class PlexStream(commands.Cog):
     """Search and display information from your Plex library."""
@@ -59,6 +58,7 @@ class PlexStream(commands.Cog):
         if not await self.initialize_plex(ctx.guild):
             await ctx.send("❌ Plex not initialized.")
             return
+
         try:
             results = self.plex.library.section('Movies').search(keyword)
             if not results:
@@ -66,23 +66,30 @@ class PlexStream(commands.Cog):
                 return
 
             movie = results[0]
-            duration = int(movie.duration / 60000) if movie.duration else "N/A"
-            poster_url = PosterUrlMixin.thumbUrl.fget(movie)
+            title = f"{movie.title} ({getattr(movie, 'year', 'N/A')})"
+            summary = movie.summary or "No description available."
+            studio = getattr(movie, 'studio', 'Unknown Studio')
+            duration = int(getattr(movie, 'duration', 0) / 60000) if getattr(movie, 'duration', None) else "N/A"
+            poster_url = getattr(movie, 'thumbUrl', None)
 
             embed = discord.Embed(
-                title=f"{movie.title} ({movie.year})",
-                description=movie.summary or "No description available.",
+                title=title,
+                description=summary,
                 color=discord.Color.orange()
             )
-            embed.set_footer(text=f"{movie.studio or 'Unknown Studio'} - {duration} min")
+            embed.set_footer(text=f"{studio} • {duration} minutes")
 
             if poster_url:
-                img_data = requests.get(poster_url).content
-                with open('/tmp/movie.jpg', 'wb') as handler:
-                    handler.write(img_data)
-                file = discord.File('/tmp/movie.jpg', filename='movie.jpg')
-                embed.set_image(url="attachment://movie.jpg")
-                await ctx.send(file=file, embed=embed)
+                try:
+                    img_data = requests.get(poster_url).content
+                    tmp_path = '/tmp/movie.jpg'
+                    with open(tmp_path, 'wb') as f:
+                        f.write(img_data)
+                    file = discord.File(tmp_path, filename='movie.jpg')
+                    embed.set_image(url="attachment://movie.jpg")
+                    await ctx.send(file=file, embed=embed)
+                except Exception as e:
+                    await ctx.send(f"🎬 **{title}**\n📄 *Image failed to load: {e}*", embed=embed)
             else:
                 await ctx.send(embed=embed)
 
