@@ -52,7 +52,7 @@ class PlexStream(commands.Cog):
             await ctx.send(f"❌ Error: {str(e)}")
 
     @commands.command()
-    async def plexsearchinfo(self, ctx, *, keyword):
+    async def movieinfo(self, ctx, *, keyword):
         """Search Plex and show detailed info about the top result."""
         if not await self.initialize_plex(ctx.guild):
             await ctx.send("❌ Plex not initialized.")
