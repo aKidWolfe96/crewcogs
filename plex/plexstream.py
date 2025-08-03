@@ -53,8 +53,8 @@ class PlexStream(commands.Cog):
                 await ctx.send("❌ No results found.")
                 return
             results = "\n".join(titles)
-            await ctx.send(f"🎬 Search results for {keyword}:
-{results}")
+            await ctx.send(f"""🎬 Search results for {keyword}:
+{results}""")
         except Exception as e:
             await ctx.send(f"❌ Error: {str(e)}")
 
