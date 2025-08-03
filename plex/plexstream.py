@@ -3,7 +3,7 @@ from redbot.core import commands, Config
 from plexapi.server import PlexServer
 
 class PlexStream(commands.Cog):
-    """Stream and control your Plex media via Plex clients."""
+    """Control Plex playback via active Plex sessions."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -23,13 +23,13 @@ class PlexStream(commands.Cog):
         self.plex = PlexServer(settings["plex_url"], settings["plex_token"])
 
     async def get_client(self):
-        settings = await self.config.all()
-        client_name = settings["plex_client_name"]
-        if not client_name:
+        client_name = await self.config.plex_client_name()
+        if not client_name or not self.plex:
             return None
-        for client in self.plex.clients():
-            if client.title == client_name:
-                return client
+        # Search active sessions for matching player title
+        for session in self.plex.sessions():
+            if session.player.title == client_name:
+                return session.player
         return None
 
     @commands.command()
@@ -41,7 +41,7 @@ class PlexStream(commands.Cog):
 
     @commands.command()
     async def plexinit(self, ctx):
-        """Initialize connection to Plex server."""
+        """Initialize Plex connection."""
         try:
             await self.initialize_plex()
             await ctx.send("✅ Connected to Plex server.")
@@ -49,29 +49,34 @@ class PlexStream(commands.Cog):
             await ctx.send(f"❌ Could not connect to Plex server: `{e}`")
 
     @commands.command()
-    async def plexclients(self, ctx):
-        """List available Plex clients."""
+    async def plexsessions(self, ctx):
+        """List active Plex sessions (players currently streaming)."""
         if not self.plex:
             await ctx.send("Plex not initialized. Run `[p]plexinit` first.")
             return
-        clients = [client.title for client in self.plex.clients()]
-        if not clients:
-            await ctx.send("No Plex clients currently found.")
+        sessions = self.plex.sessions()
+        if not sessions:
+            await ctx.send("No active Plex sessions detected.")
             return
-        await ctx.send("Available Plex clients:\n" + "\n".join(clients))
+        msg = "\n".join(
+            f"{s.player.title} playing **{s.title}** (User: {', '.join(s.usernames)})"
+            for s in sessions
+        )
+        await ctx.send(f"Active Plex sessions:\n{msg}")
 
     @commands.command()
     async def plexselect(self, ctx, *, client_name: str):
-        """Select a Plex client to control."""
+        """Select a Plex client/player to control (must be active session)."""
         if not self.plex:
             await ctx.send("Plex not initialized. Run `[p]plexinit` first.")
             return
-        clients = [client.title for client in self.plex.clients()]
-        if client_name not in clients:
-            await ctx.send(f"Client `{client_name}` not found. Use `[p]plexclients` to see available clients.")
+        sessions = self.plex.sessions()
+        valid_clients = [s.player.title for s in sessions]
+        if client_name not in valid_clients:
+            await ctx.send(f"Client `{client_name}` not found among active sessions. Use `[p]plexsessions` to see active clients.")
             return
         await self.config.plex_client_name.set(client_name)
-        await ctx.send(f"✅ Plex client set to `{client_name}`")
+        await ctx.send(f"✅ Plex client/player set to `{client_name}`")
 
     @commands.command()
     async def plexsearch(self, ctx, *, keyword: str):
@@ -92,13 +97,13 @@ class PlexStream(commands.Cog):
 
     @commands.command()
     async def plexplay(self, ctx, *, title: str):
-        """Play a movie on the selected Plex client."""
+        """Play a movie on the selected Plex client/player."""
         if not self.plex:
             await ctx.send("Plex not initialized. Run `[p]plexinit` first.")
             return
         client = await self.get_client()
         if not client:
-            await ctx.send("No Plex client selected. Use `[p]plexselect` to select one.")
+            await ctx.send("No Plex client/player selected or active. Use `[p]plexselect` after confirming active sessions.")
             return
         try:
             section = self.plex.library.section("Movies")
@@ -109,4 +114,41 @@ class PlexStream(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Could not play movie: `{e}`")
 
-    # Optional: Add pause, resume, stop commands similarly
+    @commands.command()
+    async def plexpause(self, ctx):
+        """Pause playback on selected client/player."""
+        client = await self.get_client()
+        if not client:
+            await ctx.send("No Plex client/player selected or active.")
+            return
+        try:
+            client.pause()
+            await ctx.send("⏸️ Playback paused.")
+        except Exception as e:
+            await ctx.send(f"❌ Could not pause playback: `{e}`")
+
+    @commands.command()
+    async def plexresume(self, ctx):
+        """Resume playback on selected client/player."""
+        client = await self.get_client()
+        if not client:
+            await ctx.send("No Plex client/player selected or active.")
+            return
+        try:
+            client.play()
+            await ctx.send("▶️ Playback resumed.")
+        except Exception as e:
+            await ctx.send(f"❌ Could not resume playback: `{e}`")
+
+    @commands.command()
+    async def plexstop(self, ctx):
+        """Stop playback on selected client/player."""
+        client = await self.get_client()
+        if not client:
+            await ctx.send("No Plex client/player selected or active.")
+            return
+        try:
+            client.stop()
+            await ctx.send("⏹️ Playback stopped.")
+        except Exception as e:
+            await ctx.send(f"❌ Could not stop playback: `{e}`")
