@@ -1,211 +1,145 @@
-from redbot.core import commands, Config, checks
 import discord
-from plexapi.server import PlexServer
-from plexapi.mixins import PosterUrlMixin
 import random
 import requests
-from io import BytesIO
+from redbot.core import commands, Config
+from plexapi.server import PlexServer
+from plexapi.mixins import PosterUrlMixin
 
 class PlexStream(commands.Cog):
-    """Plex control cog with slash commands for Red Discord Bot."""
-
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567890123456)
-        default_global = {
-            "baseurl": None,
-            "plextoken": None,
-            "system": None,
-            "voicechannel": None,
+        self.config = Config.get_conf(self, identifier=1234567890)
+        default_guild = {
+            "base_url": None,
+            "plex_token": None,
+            "machine_id": None,
+            "voice_channel": None
         }
-        self.config.register_global(**default_global)
+        self.config.register_guild(**default_guild)
         self.plex = None
-        self.movielist = []
+        self.client = None
         self.savemovietitle = None
-        self.p = 0
-        self.r = 0
 
-    async def initialize_plex(self):
-        baseurl = await self.config.baseurl()
-        token = await self.config.plextoken()
-        if baseurl and token:
-            self.plex = PlexServer(baseurl, token)
-            movies = self.plex.library.section('Movies')
-            self.movielist = [video.title for video in movies.search()]
+    async def initialize_plex(self, guild):
+        settings = await self.config.guild(guild).all()
+        if not all([settings["base_url"], settings["plex_token"], settings["machine_id"]]):
+            return False
+        self.plex = PlexServer(settings["base_url"], settings["plex_token"])
+        for c in self.plex.clients():
+            if c.machineIdentifier == settings["machine_id"]:
+                self.client = c
+                break
+        return self.client is not None
+
+    @commands.command()
+    async def plexconfig(self, ctx, base_url: str, plex_token: str, machine_id: str, voice_channel_id: int):
+        await self.config.guild(ctx.guild).base_url.set(base_url)
+        await self.config.guild(ctx.guild).plex_token.set(plex_token)
+        await self.config.guild(ctx.guild).machine_id.set(machine_id)
+        await self.config.guild(ctx.guild).voice_channel.set(voice_channel_id)
+        initialized = await self.initialize_plex(ctx.guild)
+        if initialized:
+            await ctx.send("✅ Plex configuration saved and Plex initialized.")
         else:
-            self.plex = None
-
-    @commands.is_owner()
-    @commands.command()
-    async def plexconfig(self, ctx, baseurl: str, plextoken: str, system: str, voicechannel: int):
-        """Configure Plex connection details."""
-        await self.config.baseurl.set(baseurl)
-        await self.config.plextoken.set(plextoken)
-        await self.config.system.set(system)
-        await self.config.voicechannel.set(voicechannel)
-        await self.initialize_plex()
-        await ctx.send("✅ Plex configuration saved and Plex initialized.")
+            await ctx.send("⚠️ Plex configuration saved, but could not find the specified Plex client.")
 
     @commands.command()
-    async def plexclients(self, ctx):
-        """List available Plex clients."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
-            return
-        clients = self.plex.clients()
-        if not clients:
-            await ctx.send("No Plex clients found.")
-            return
-        msg = "**Available Plex Clients:**\n"
-        for c in clients:
-            msg += f"• {c.title} ({c.product})\n"
-        await ctx.send(msg)
+    async def plexsearch(self, ctx, *, keyword):
+        await self.initialize_plex(ctx.guild)
+        try:
+            movies = self.plex.library.section('Movies').search(keyword)
+            titles = [m.title for m in movies]
+            if not titles:
+                await ctx.send("❌ No results found.")
+                return
+            results = "\n".join(titles)
+            await ctx.send(f"🎬 Search results for {keyword}:
+{results}")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {str(e)}")
 
     @commands.command()
-    async def plexsearch(self, ctx, *, keyword: str):
-        """Search for movies with a keyword."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
+    async def plexplay(self, ctx, *, movie_title):
+        if not await self.initialize_plex(ctx.guild):
+            await ctx.send("❌ Plex not initialized correctly.")
             return
         try:
-            movies = self.plex.library.section('Movies')
-            results = [video.title for video in movies.search(keyword)]
-            if not results:
-                return await ctx.send("No movies found.")
-            await ctx.send(f"🎬 Search results for **{keyword}**:\n" + "\n".join(results))
-        except Exception:
-            await ctx.send("Error searching movies.")
-
-    @commands.command()
-    async def plexinfo(self, ctx, *, movie: str):
-        """Get info about a movie."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
-            return
-        try:
-            play = self.plex.library.section('Movies').get(movie)
+            self.savemovietitle = movie_title
+            play = self.plex.library.section('Movies').get(movie_title)
+            self.client.proxyThroughServer()
+            self.client.playMedia(play)
+            self.client.setParameters(volume=100, shuffle=0, repeat=0)
             duration = int(play.duration / 60000)
-            image_url = PosterUrlMixin.thumbUrl.fget(play)
-            embed = discord.Embed(title=f"Info for: {movie}", description=play.summary, color=0xf5dd03)
-            embed.add_field(name="Rotten Tomatoes Rating", value=str(play.audienceRating))
-            embed.add_field(name="Content Rating", value=str(play.contentRating))
-            embed.add_field(name="Duration", value=f"{duration} minutes")
-            embed.set_footer(text=f"{play.year} - {play.studio}")
-            # Get image bytes
-            resp = requests.get(image_url)
-            image_bytes = BytesIO(resp.content)
-            image_bytes.seek(0)
-            file = discord.File(fp=image_bytes, filename="movie.jpg")
+            image = PosterUrlMixin.thumbUrl.fget(play)
+            img_data = requests.get(image).content
+            with open('/tmp/movie.jpg', 'wb') as handler:
+                handler.write(img_data)
+            file = discord.File('/tmp/movie.jpg', filename='movie.jpg')
+            embed = discord.Embed(title=f"Playing: {movie_title}", description=play.summary, color=0xf5dd03)
             embed.set_image(url="attachment://movie.jpg")
-            await ctx.send(file=file, embed=embed)
-        except Exception:
-            await ctx.send(f"Couldn't find movie: {movie}")
-
-    @commands.command()
-    async def plexplay(self, ctx, *, movie: str):
-        """Play a movie on the Plex client."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
-            return
-        try:
-            system = await self.config.system()
-            play = self.plex.library.section('Movies').get(movie)
-            client = self.plex.client(system)
-            client.proxyThroughServer()
-            client.playMedia(play)
-            client.setParameters(volume=100, shuffle=0, repeat=0)
-            self.savemovietitle = movie
-            duration = int(play.duration / 60000)
-            image_url = PosterUrlMixin.thumbUrl.fget(play)
-            embed = discord.Embed(title=f"Playing: {movie}", description=play.summary, color=0xf5dd03)
-            embed.add_field(name="Rotten Tomatoes Rating", value=str(play.audienceRating))
-            embed.add_field(name="Content Rating", value=str(play.contentRating))
-            embed.add_field(name="Duration", value=f"{duration} minutes")
-            embed.set_footer(text=f"{play.year} - {play.studio}")
-            resp = requests.get(image_url)
-            image_bytes = BytesIO(resp.content)
-            image_bytes.seek(0)
-            file = discord.File(fp=image_bytes, filename="movie.jpg")
-            embed.set_image(url="attachment://movie.jpg")
+            embed.set_footer(text=f"{play.year} - {play.studio} - {duration} Minutes")
             await ctx.send(file=file, embed=embed)
         except Exception as e:
-            await ctx.send(f"❌ Could not play movie: {e}")
-
-    @commands.command()
-    async def plexstop(self, ctx):
-        """Stop playback on the Plex client."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
-            return
-        try:
-            system = await self.config.system()
-            client = self.plex.client(system)
-            client.proxyThroughServer()
-            client.stop()
-            await ctx.send(f"⏹️ Stopped playing: {self.savemovietitle}")
-        except Exception:
-            await ctx.send("Error stopping playback.")
+            await ctx.send(f"❌ Could not play movie: {str(e)}")
 
     @commands.command()
     async def plexpause(self, ctx):
-        """Pause playback."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
+        if not await self.initialize_plex(ctx.guild):
+            await ctx.send("❌ Plex not initialized correctly.")
             return
         try:
-            system = await self.config.system()
-            client = self.plex.client(system)
-            client.proxyThroughServer()
-            client.pause()
+            self.client.proxyThroughServer()
+            self.client.pause()
             await ctx.send(f"⏸️ Paused: {self.savemovietitle}")
-        except Exception:
-            await ctx.send("Error pausing playback.")
+        except Exception as e:
+            await ctx.send(f"❌ Could not pause movie: {str(e)}")
 
     @commands.command()
     async def plexresume(self, ctx):
-        """Resume playback."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
+        if not await self.initialize_plex(ctx.guild):
+            await ctx.send("❌ Plex not initialized correctly.")
             return
         try:
-            system = await self.config.system()
-            client = self.plex.client(system)
-            client.proxyThroughServer()
-            client.play()
+            self.client.proxyThroughServer()
+            self.client.play()
             await ctx.send(f"▶️ Resumed: {self.savemovietitle}")
-        except Exception:
-            await ctx.send("Error resuming playback.")
+        except Exception as e:
+            await ctx.send(f"❌ Could not resume movie: {str(e)}")
+
+    @commands.command()
+    async def plexstop(self, ctx):
+        if not await self.initialize_plex(ctx.guild):
+            await ctx.send("❌ Plex not initialized correctly.")
+            return
+        try:
+            self.client.proxyThroughServer()
+            self.client.stop()
+            await ctx.send(f"⏹️ Stopped: {self.savemovietitle}")
+        except Exception as e:
+            await ctx.send(f"❌ Could not stop movie: {str(e)}")
 
     @commands.command()
     async def plexshuffle(self, ctx):
-        """Play a random movie."""
-        if not self.plex:
-            await ctx.send("Plex server not configured.")
+        if not await self.initialize_plex(ctx.guild):
+            await ctx.send("❌ Plex not initialized correctly.")
             return
         try:
-            rc = random.choice(self.movielist)
-            system = await self.config.system()
-            play = self.plex.library.section('Movies').get(rc)
-            client = self.plex.client(system)
-            client.proxyThroughServer()
-            client.playMedia(play)
-            client.setParameters(volume=100, shuffle=0, repeat=0)
-            self.savemovietitle = rc
-            duration = int(play.duration / 60000)
-            image_url = PosterUrlMixin.thumbUrl.fget(play)
-            embed = discord.Embed(title=f"Playing: {rc}", description=play.summary, color=0xf5dd03)
-            embed.add_field(name="Rotten Tomatoes Rating", value=str(play.audienceRating))
-            embed.add_field(name="Content Rating", value=str(play.contentRating))
-            embed.add_field(name="Duration", value=f"{duration} minutes")
-            embed.set_footer(text=f"{play.year} - {play.studio}")
-            resp = requests.get(image_url)
-            image_bytes = BytesIO(resp.content)
-            image_bytes.seek(0)
-            file = discord.File(fp=image_bytes, filename="movie.jpg")
+            section = self.plex.library.section('Movies')
+            all_movies = section.all()
+            movie = random.choice(all_movies)
+            self.savemovietitle = movie.title
+            self.client.proxyThroughServer()
+            self.client.playMedia(movie)
+            self.client.setParameters(volume=100, shuffle=0, repeat=0)
+            duration = int(movie.duration / 60000)
+            image = PosterUrlMixin.thumbUrl.fget(movie)
+            img_data = requests.get(image).content
+            with open('/tmp/movie.jpg', 'wb') as handler:
+                handler.write(img_data)
+            file = discord.File('/tmp/movie.jpg', filename='movie.jpg')
+            embed = discord.Embed(title=f"Randomly Playing: {movie.title}", description=movie.summary, color=0xf5dd03)
             embed.set_image(url="attachment://movie.jpg")
+            embed.set_footer(text=f"{movie.year} - {movie.studio} - {duration} Minutes")
             await ctx.send(file=file, embed=embed)
-        except Exception:
-            await ctx.send("Error playing random movie.")
-
-def setup(bot):
-    bot.add_cog(PlexStream(bot))
+        except Exception as e:
+            await ctx.send(f"❌ Could not play random movie: {str(e)}")
