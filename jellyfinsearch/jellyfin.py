@@ -2,89 +2,118 @@ from redbot.core import commands, Config
 import aiohttp
 import urllib.parse
 import discord
+from datetime import datetime
 
-class JellyfinMultiView(discord.ui.View):
-    """View that generates a unique button for every search result"""
-    def __init__(self, app_id: str, items: list):
-        super().__init__(timeout=180)
-        # Create a button for each result (up to 5)
-        for i, item in enumerate(items, 1):
-            name = item.get('Name')
-            # The label is "Watch [Movie Name]" or just the number to keep it clean
-            self.add_item(discord.ui.Button(
-                label=f"Watch #{i}",
-                url=f"https://discord.com/activities/{app_id}",
-                style=discord.ButtonStyle.link,
-                emoji=f"{i}\N{COMBINING ENCLOSING KEYCAP}"
-            ))
+class JellyfinLaunchView(discord.ui.View):
+    """View containing a button to launch the Discord Activity"""
+    def __init__(self, app_id: str, item_id: str):
+        super().__init__(timeout=None)
+        # The Activity URL format for Discord
+        activity_url = f"https://discord.com/activities/{app_id}"
+        
+        self.add_item(discord.ui.Button(
+            label="Watch in Discord",
+            url=activity_url,
+            style=discord.ButtonStyle.link,
+            emoji="🎬"
+        ))
 
 class JellyfinSearch(commands.Cog):
-    """Customized Jellyfin search with individual launch buttons"""
+    """Jellyfin search commands with Discord Activity support"""
 
     def __init__(self, bot):
         self.bot = bot
-        self.app_id = "1385831372643373119"
+        self.app_id = "1385831372643373119" # Your provided App ID
         self.config = Config.get_conf(self, identifier=856712356)
-        default_global = {"base_url": None, "api_key": None}
+        default_global = {
+            "base_url": None,
+            "api_key": None
+        }
         self.config.register_global(**default_global)
 
-    def format_runtime(self, ticks):
-        if not ticks: return "N/A"
-        minutes = int(ticks / 600000000)
-        h, m = divmod(minutes, 60)
-        return f"{h}h {m}m" if h > 0 else f"{m}m"
+    async def get_base_url(self):
+        return await self.config.base_url()
+
+    async def get_api_key(self):
+        return await self.config.api_key()
+
+    @commands.command()
+    @commands.is_owner()
+    async def setjellyfinurl(self, ctx, url: str):
+        """Set the Jellyfin server URL"""
+        url = url.rstrip('/')
+        await self.config.base_url.set(url)
+        await ctx.send(f"Jellyfin server URL has been set to: {url}")
+
+    @commands.command()
+    @commands.is_owner()
+    async def setjellyfinapi(self, ctx, api_key: str):
+        """Set the Jellyfin API key"""
+        await self.config.api_key.set(api_key)
+        await ctx.send("Jellyfin API key has been set.")
+        await ctx.message.delete()
+
+    def format_runtime(self, runtime_ticks):
+        if not runtime_ticks:
+            return "N/A"
+        minutes = int(runtime_ticks / (10000000 * 60))
+        hours = minutes // 60
+        remaining_minutes = minutes % 60
+        return f"{hours}h {remaining_minutes}m" if hours > 0 else f"{remaining_minutes}m"
 
     @commands.command(name="searchj")
     async def searchj(self, ctx, *, query: str):
-        """Search with unique buttons and extra metadata"""
-        base_url = await self.config.base_url()
-        api_key = await self.config.api_key()
+        """Search and watch content directly in Discord"""
+        base_url = await self.get_base_url()
+        api_key = await self.get_api_key()
         
         if not base_url or not api_key:
             return await ctx.send("Please set the URL and API key first.")
 
-        # Clean URL and set params
-        clean_url = base_url.rstrip('/')
-        search_url = f"{clean_url}/Items"
-        params = {
-            "searchTerm": query,
-            "IncludeItemTypes": "Movie,Series",
-            "Recursive": "true",
-            "Limit": 5,
-            "Fields": "Genres,CommunityRating,RunTimeTicks", # Request extra data
-            "api_key": api_key
-        }
+        encoded_query = urllib.parse.quote(query)
+        # Added Items/Images access to the search
+        search_url = f"{base_url}/Items?searchTerm={encoded_query}&IncludeItemTypes=Movie,Series&Recursive=true&SearchType=String&Limit=5&api_key={api_key}"
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, params=params) as resp:
-                if resp.status != 200:
-                    return await ctx.send(f"Server Error: {resp.status}")
-                
-                data = await resp.json()
-                items = data.get('Items', [])
-                if not items:
-                    return await ctx.send("Nothing found.")
+            try:
+                async with session.get(search_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        items = data.get('Items', [])
 
-                embed = discord.Embed(
-                    title=f"🎬 Results for: {query}",
-                    description="Select a movie to launch the Discord Activity theater.",
-                    color=discord.Color.from_rgb(0, 164, 220) # Jellyfin Blue
-                )
+                        if not items:
+                            return await ctx.send("No results found.")
 
-                # Use the first result's poster as the main image
-                top_id = items[0].get('Id')
-                embed.set_thumbnail(url=f"{clean_url}/Items/{top_id}/Images/Primary?api_key={api_key}")
+                        # Create the primary embed for the first result
+                        top_item = items[0]
+                        item_id = top_item.get('Id')
+                        
+                        embed = discord.Embed(
+                            title=f"Search Results: {query}",
+                            description="Click the button below to launch the theater in Discord!",
+                            color=discord.Color.dark_purple()
+                        )
 
-                for i, item in enumerate(items, 1):
-                    name = item.get('Name')
-                    year = item.get('ProductionYear', 'N/A')
-                    rating = item.get('CommunityRating', 'N/A')
-                    runtime = self.format_runtime(item.get('RunTimeTicks'))
-                    genres = ", ".join(item.get('Genres', [])[:2]) # Only show first 2 genres
-                    
-                    # Formatting the field value with extra info
-                    info = f"⭐ {rating} | ⏳ {runtime} | 🎭 {genres}"
-                    embed.add_field(name=f"{i}. {name} ({year})", value=info, inline=False)
+                        # Set the poster image for the first result
+                        image_url = f"{base_url}/Items/{item_id}/Images/Primary?api_key={api_key}"
+                        embed.set_thumbnail(url=image_url)
 
-                view = JellyfinMultiView(self.app_id, items)
-                await ctx.send(embed=embed, view=view)
+                        for item in items:
+                            name = item.get('Name')
+                            year = item.get('ProductionYear', 'N/A')
+                            i_id = item.get('Id')
+                            item_type = item.get('Type')
+                            
+                            embed.add_field(
+                                name=f"{name} ({year})",
+                                value=f"Type: {item_type} | [Web Link]({base_url}/web/index.html#!/details?id={i_id})",
+                                inline=False
+                            )
+
+                        # We use the top result for the Activity Button
+                        view = JellyfinLaunchView(self.app_id, item_id)
+                        await ctx.send(embed=embed, view=view)
+                    else:
+                        await ctx.send(f"Server returned error code: {response.status}")
+            except Exception as e:
+                await ctx.send(f"Connection error: {str(e)}")
