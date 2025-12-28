@@ -2,23 +2,24 @@ from redbot.core import commands, Config
 import aiohttp
 import urllib.parse
 import discord
-import re
 
-class JellyfinLaunchView(discord.ui.View):
-    """View containing a button to launch the Discord Activity"""
-    def __init__(self, app_id: str):
-        super().__init__(timeout=None)
-        activity_url = f"https://discord.com/activities/{app_id}"
-        
-        self.add_item(discord.ui.Button(
-            label="Watch in Discord",
-            url=activity_url,
-            style=discord.ButtonStyle.link,
-            emoji="🎬"
-        ))
+class JellyfinMultiView(discord.ui.View):
+    """View that generates a unique button for every search result"""
+    def __init__(self, app_id: str, items: list):
+        super().__init__(timeout=180)
+        # Create a button for each result (up to 5)
+        for i, item in enumerate(items, 1):
+            name = item.get('Name')
+            # The label is "Watch [Movie Name]" or just the number to keep it clean
+            self.add_item(discord.ui.Button(
+                label=f"Watch #{i}",
+                url=f"https://discord.com/activities/{app_id}",
+                style=discord.ButtonStyle.link,
+                emoji=f"{i}\N{COMBINING ENCLOSING KEYCAP}"
+            ))
 
 class JellyfinSearch(commands.Cog):
-    """Jellyfin search commands with automatic URL sanitization"""
+    """Customized Jellyfin search with individual launch buttons"""
 
     def __init__(self, bot):
         self.bot = bot
@@ -27,86 +28,63 @@ class JellyfinSearch(commands.Cog):
         default_global = {"base_url": None, "api_key": None}
         self.config.register_global(**default_global)
 
-    @commands.command()
-    @commands.is_owner()
-    async def setjellyfinurl(self, ctx, url: str):
-        """Set the Jellyfin server URL (it will automatically clean up trailing slashes)"""
-        # Clean the URL: Remove trailing slashes and common web UI paths
-        clean_url = url.rstrip('/')
-        clean_url = re.sub(r'/(web|home|index\.html).*$', '', clean_url)
-        
-        if not clean_url.startswith(('http://', 'https://')):
-            return await ctx.send("❌ Error: URL must start with http:// or https://")
-
-        await self.config.base_url.set(clean_url)
-        await ctx.send(f"✅ Jellyfin server URL set and cleaned: `{clean_url}`")
-
-    @commands.command()
-    @commands.is_owner()
-    async def setjellyfinapi(self, ctx, api_key: str):
-        """Set the Jellyfin API key"""
-        await self.config.api_key.set(api_key)
-        await ctx.send("✅ Jellyfin API key has been set.")
-        try:
-            await ctx.message.delete()
-        except discord.Forbidden:
-            pass
+    def format_runtime(self, ticks):
+        if not ticks: return "N/A"
+        minutes = int(ticks / 600000000)
+        h, m = divmod(minutes, 60)
+        return f"{h}h {m}m" if h > 0 else f"{m}m"
 
     @commands.command(name="searchj")
     async def searchj(self, ctx, *, query: str):
-        """Search and watch content directly in Discord"""
+        """Search with unique buttons and extra metadata"""
         base_url = await self.config.base_url()
         api_key = await self.config.api_key()
         
         if not base_url or not api_key:
             return await ctx.send("Please set the URL and API key first.")
 
-        # Ensure we are calling the API path, not the web path
-        search_url = f"{base_url}/Items"
+        # Clean URL and set params
+        clean_url = base_url.rstrip('/')
+        search_url = f"{clean_url}/Items"
         params = {
             "searchTerm": query,
             "IncludeItemTypes": "Movie,Series",
             "Recursive": "true",
             "Limit": 5,
+            "Fields": "Genres,CommunityRating,RunTimeTicks", # Request extra data
             "api_key": api_key
         }
 
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(search_url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        items = data.get('Items', [])
+            async with session.get(search_url, params=params) as resp:
+                if resp.status != 200:
+                    return await ctx.send(f"Server Error: {resp.status}")
+                
+                data = await resp.json()
+                items = data.get('Items', [])
+                if not items:
+                    return await ctx.send("Nothing found.")
 
-                        if not items:
-                            return await ctx.send(f"No results found for '{query}'.")
+                embed = discord.Embed(
+                    title=f"🎬 Results for: {query}",
+                    description="Select a movie to launch the Discord Activity theater.",
+                    color=discord.Color.from_rgb(0, 164, 220) # Jellyfin Blue
+                )
 
-                        top_item = items[0]
-                        item_id = top_item.get('Id')
-                        
-                        embed = discord.Embed(
-                            title=f"Results for: {query}",
-                            description="Click the button to watch inside Discord!",
-                            color=discord.Color.dark_purple()
-                        )
+                # Use the first result's poster as the main image
+                top_id = items[0].get('Id')
+                embed.set_thumbnail(url=f"{clean_url}/Items/{top_id}/Images/Primary?api_key={api_key}")
 
-                        # Fetch the poster for the main result
-                        image_url = f"{base_url}/Items/{item_id}/Images/Primary?api_key={api_key}"
-                        embed.set_thumbnail(url=image_url)
+                for i, item in enumerate(items, 1):
+                    name = item.get('Name')
+                    year = item.get('ProductionYear', 'N/A')
+                    rating = item.get('CommunityRating', 'N/A')
+                    runtime = self.format_runtime(item.get('RunTimeTicks'))
+                    genres = ", ".join(item.get('Genres', [])[:2]) # Only show first 2 genres
+                    
+                    # Formatting the field value with extra info
+                    info = f"⭐ {rating} | ⏳ {runtime} | 🎭 {genres}"
+                    embed.add_field(name=f"{i}. {name} ({year})", value=info, inline=False)
 
-                        for item in items[:5]:
-                            name = item.get('Name')
-                            year = item.get('ProductionYear', 'N/A')
-                            i_id = item.get('Id')
-                            embed.add_field(
-                                name=f"{name} ({year})",
-                                value=f"[Open in Browser]({base_url}/web/index.html#!/details?id={i_id})",
-                                inline=False
-                            )
-
-                        view = JellyfinLaunchView(self.app_id)
-                        await ctx.send(embed=embed, view=view)
-                    else:
-                        await ctx.send(f"❌ Server Error: {response.status}. Verify your API key.")
-            except Exception as e:
-                await ctx.send(f"❌ Connection error: {str(e)}")
+                view = JellyfinMultiView(self.app_id, items)
+                await ctx.send(embed=embed, view=view)
