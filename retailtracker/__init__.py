@@ -1,4 +1,4 @@
-from .walmartchecker import WalmartChecker
+from .retailtracker import RetailTracker
 
 async def setup(bot):
-    await bot.add_cog(WalmartChecker(bot))
+    await bot.add_cog(RetailTracker(bot))
