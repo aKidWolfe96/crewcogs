@@ -27,7 +27,7 @@ class RetailTracker(commands.Cog):
 
         self.headers = {
             "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json"
+            "Accept": "text/html"
         }
 
         self.monitor_task = bot.loop.create_task(self.monitor_loop())
@@ -41,26 +41,41 @@ class RetailTracker(commands.Cog):
 
     async def walmart_lookup(self, item_id):
 
-        url = f"https://www.walmart.com/orchestra/home/pages/item?itemId={item_id}"
+        url = f"https://www.walmart.com/ip/{item_id}"
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
 
             async with session.get(url, headers=self.headers, ssl=False) as r:
 
                 if r.status != 200:
                     return None
 
-                data = await r.json(content_type=None)
+                text = await r.text()
+
+        match = re.search(
+            r'window\.__WML_REDUX_INITIAL_STATE__\s*=\s*(\{.*?\});',
+            text
+        )
+
+        if not match:
+            return None
 
         try:
 
-            product = data["props"]["pageProps"]["initialData"]["data"]["product"]
+            data = json.loads(match.group(1))
 
-            name = product.get("name")
+            product = data["product"]["products"][item_id]
+
+            name = product.get("productName")
 
             upc = product.get("upc")
 
-            price = product["priceInfo"]["currentPrice"]["price"]
+            price = None
+
+            if product.get("price"):
+                price = product["price"].get("price")
 
             availability = product.get("availabilityStatus")
 
@@ -69,16 +84,16 @@ class RetailTracker(commands.Cog):
             image = None
 
             if product.get("imageInfo"):
-                image = product["imageInfo"]["thumbnailUrl"]
+                image = product["imageInfo"].get("thumbnailUrl")
 
             return {
                 "name": name,
                 "upc": str(upc),
                 "item_id": str(item_id),
-                "price": float(price),
+                "price": float(price) if price else 0.0,
                 "in_stock": in_stock,
                 "image": image,
-                "url": f"https://www.walmart.com/ip/{item_id}"
+                "url": url
             }
 
         except Exception:
@@ -95,6 +110,10 @@ class RetailTracker(commands.Cog):
         while True:
 
             products = await self.config.products()
+
+            if not products:
+                await asyncio.sleep(300)
+                continue
 
             for upc, data in products.items():
 
@@ -155,7 +174,7 @@ class RetailTracker(commands.Cog):
 
                                 await user.send(embed=embed)
 
-                            except:
+                            except Exception:
                                 pass
 
                 data["last_stock"] = new_stock
@@ -192,7 +211,7 @@ class RetailTracker(commands.Cog):
 
         if "walmart.com" in input_value:
 
-            match = re.search(r"/ip/(\d+)", input_value)
+            match = re.search(r"/ip/(?:[^/]+/)?(\d+)", input_value)
 
             if match:
                 item_id = match.group(1)
