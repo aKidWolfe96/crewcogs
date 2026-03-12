@@ -45,7 +45,7 @@ class RetailTracker(commands.Cog):
 
         async with aiohttp.ClientSession() as session:
 
-            async with session.get(url, headers=self.headers) as r:
+            async with session.get(url, headers=self.headers, ssl=False) as r:
 
                 if r.status != 200:
                     return None
