@@ -218,23 +218,19 @@ class AmountView(View):
         except Exception:
             pass
 
-        type_desc = {"win": "finish **1st**", "place": "finish **top 2**", "show": "finish **top 3**"}
-        medals    = {"win": "🥇", "place": "🥈", "show": "🥉"}
-        e = Embed(
-            title="✅  Bet Confirmed",
-            description=(
-                f"{medals[self.bet_type]} **{amount} CrewCoin** on "
-                f"{self.horse['emoji']} **{self.horse['name']}** ({self.horse['odds_label']}) "
-                f"to {type_desc[self.bet_type]}\n"
-                f"Potential payout: **{int(amount * self.mult)} CrewCoin** ({self.mult}x)"
-            ),
-            color=0xFFD700
-        )
-        e.set_footer(text="You can click Join Race again to change your bet before gates open.")
+        # delete the ephemeral betting flow message so the user sees the lobby embed
+        try:
+            ephemeral_msg = self.race.get("ephemeral_msgs", {}).get(self.user.id)
+            if ephemeral_msg:
+                await ephemeral_msg.delete()
+                self.race["ephemeral_msgs"].pop(self.user.id, None)
+        except Exception:
+            pass
+
         if followup:
-            await interaction.followup.send(embed=e, ephemeral=True)
+            await interaction.followup.send("✅ Bet placed! Check the lobby above.", ephemeral=True, delete_after=3)
         else:
-            await interaction.response.send_message(embed=e, ephemeral=True)
+            await interaction.response.defer()
         self.stop()
 
 # ─────────────────────────────────────────────
@@ -276,7 +272,7 @@ class BetTypeView(View):
                 color=0x1a6b2e
             )
             view = AmountView(self.cog, self.race, self.user, h, bet_type)
-            await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+            await interaction.response.edit_message(embed=e, view=view)
             self.stop()
         return cb
 
@@ -284,7 +280,7 @@ class BetTypeView(View):
         if interaction.user != self.user:
             return await interaction.response.send_message("Not your bet!", ephemeral=True)
         e = Embed(title="🏇 Pick Your Horse", description="Select a horse to bet on:", color=0x1a6b2e)
-        await interaction.response.send_message(embed=e, view=HorseSelectView(self.cog, self.race, self.user), ephemeral=True)
+        await interaction.response.edit_message(embed=e, view=HorseSelectView(self.cog, self.race, self.user))
         self.stop()
 
 # ─────────────────────────────────────────────
@@ -321,7 +317,7 @@ class HorseSelectView(View):
                 ),
                 color=0x1a6b2e
             )
-            await interaction.response.send_message(embed=e, view=BetTypeView(self.cog, self.race, self.user, horse), ephemeral=True)
+            await interaction.response.edit_message(embed=e, view=BetTypeView(self.cog, self.race, self.user, horse))
             self.stop()
         return cb
 
@@ -344,6 +340,9 @@ class JoinView(View):
             view=HorseSelectView(self.cog, self.race, interaction.user),
             ephemeral=True
         )
+        # store the ephemeral message so later steps can edit/delete it
+        msg = await interaction.original_response()
+        self.race.setdefault("ephemeral_msgs", {})[interaction.user.id] = msg
 
     @discord.ui.button(label="🚦  Start Race", style=discord.ButtonStyle.danger, row=0)
     async def start_race(self, interaction: discord.Interaction, button: Button):
