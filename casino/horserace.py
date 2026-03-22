@@ -381,7 +381,7 @@ class HorseRace(commands.Cog):
         self.active_races = {}
 
     @commands.command()
-    async def start(self, ctx):
+    async def startrace(self, ctx):
         """Open a horse race lobby. Players click to join and bet."""
         if ctx.channel.id in self.active_races:
             return await ctx.send("🏇 A race is already running in this channel!")
