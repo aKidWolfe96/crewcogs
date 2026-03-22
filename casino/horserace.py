@@ -139,7 +139,7 @@ class AmountView(View):
         self.mult     = {"win": horse["win_mult"], "place": horse["place_mult"], "show": horse["show_mult"]}[bet_type]
 
         for amt in PRESET_AMOUNTS:
-            btn = Button(label=f"{amt} CC", style=discord.ButtonStyle.secondary)
+            btn = Button(label=f"{amt} KrustyCoins", style=discord.ButtonStyle.secondary)
             btn.callback = self._make_preset(amt)
             self.add_item(btn)
 
@@ -436,10 +436,10 @@ class HorseRace(commands.Cog):
                     await bank.deposit_credits(member, winnings)
                     await cfg.hr_wins.set(await cfg.hr_wins() + 1)
                     await cfg.hr_earned.set(await cfg.hr_earned() + winnings)
-                    payout_lines.append(f"✅ {member.display_name} — {horse['emoji']} **{horse['name']}** #{fp} ({b['bet_type'].upper()}) → **+{winnings} CC**")
+                    payout_lines.append(f"✅ {member.display_name} — {horse['emoji']} **{horse['name']}** #{fp} ({b['bet_type'].upper()}) → **+{winnings} KrustyCoins**")
                 else:
                     await cfg.hr_losses.set(await cfg.hr_losses() + 1)
-                    payout_lines.append(f"❌ {member.display_name} — {horse['emoji']} **{horse['name']}** #{fp} ({b['bet_type'].upper()}) → lost {b['amount']} CC")
+                    payout_lines.append(f"❌ {member.display_name} — {horse['emoji']} **{horse['name']}** #{fp} ({b['bet_type'].upper()}) → lost {b['amount']} KrustyCoins")
 
         final_e = build_track_embed(horses, turn, race_over=True)
         if payout_lines:
