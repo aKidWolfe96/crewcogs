@@ -1,11 +1,9 @@
 import discord
 import random
 import asyncio
-from io import BytesIO
 from redbot.core import commands, bank, Config
-from discord import Embed, File
+from discord import Embed
 from discord.ui import View, Button
-from PIL import Image, ImageDraw, ImageFont
 
 # ─────────────────────────────────────────────
 #  Config
@@ -16,10 +14,9 @@ CONFIG.register_user(hr_wins=0, hr_losses=0, hr_bet=0, hr_earned=0)
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
-TRACK_LENGTH  = 20
-TURN_DELAY    = 2.5
-NUM_HORSES    = 6
-JOIN_WINDOW   = 30
+TRACK_LENGTH   = 20
+TURN_DELAY     = 2.5
+NUM_HORSES     = 6
 PRESET_AMOUNTS = [100, 500, 1000]
 
 HORSE_NAMES = [
@@ -92,80 +89,29 @@ def build_track_embed(horses, turn, race_over=False):
         lines.append(f"{h['emoji']} `{h['name'][:16].ljust(16)}` `[{bar}]`{badge}")
     e.description = "\n".join(lines)
     if race_over:
-        podium = sorted([h for h in horses if h["finish_pos"] in (1, 2, 3)], key=lambda x: x["finish_pos"])
-        e.add_field(
-            name="Podium",
-            value="\n".join(f"{'🥇🥈🥉'[h['finish_pos']-1]} {h['name']} ({h['odds_label']})" for h in podium),
-            inline=False
-        )
-        e.set_footer(text="Final results")
+        all_finished = sorted(horses, key=lambda x: x["finish_pos"])
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        results_lines = []
+        for h in all_finished:
+            medal = medals.get(h["finish_pos"], f"#{h['finish_pos']} ")
+            results_lines.append(f"{medal} {h['emoji']} **{h['name']}** ({h['odds_label']})")
+        e.add_field(name="🏁  Final Order", value="\n".join(results_lines), inline=False)
+        e.set_footer(text="Race complete — payouts below")
     else:
         e.set_footer(text=f"Turn {turn} — horses are running...")
     return e
 
 # ─────────────────────────────────────────────
-#  Podium image
-# ─────────────────────────────────────────────
-def render_podium_image(horses):
-    W, H = 900, 420
-    img  = Image.new("RGB", (W, H), (10, 40, 15))
-    draw = ImageDraw.Draw(img)
-    for i in range(0, H, 20):
-        shade = (10, 42, 16) if (i // 20) % 2 == 0 else (12, 48, 18)
-        draw.rectangle([0, i, W, i + 20], fill=shade)
-    draw.rectangle([0, 0, W, 60], fill=(180, 140, 20))
-    try:
-        fb = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
-        fr = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
-        font_title = ImageFont.truetype(fb, 28)
-        font_name  = ImageFont.truetype(fb, 18)
-        font_small = ImageFont.truetype(fr, 14)
-    except Exception:
-        font_title = font_name = font_small = ImageFont.load_default()
-
-    draw.text((W // 2, 30), "🏆  FINAL RESULTS  🏆", font=font_title, fill=(255, 245, 180), anchor="mm")
-
-    slots = [
-        (1, (218, 165, 32),  270, 180, 120),
-        (2, (160, 160, 175), 80,  220, 100),
-        (3, (176, 115, 65),  480, 240,  80),
-    ]
-    top3 = {h["finish_pos"]: h for h in horses if h["finish_pos"] in (1, 2, 3)}
-    for place, block_color, bx, by, bh in slots:
-        h = top3.get(place)
-        if not h:
-            continue
-        draw.rectangle([bx, by, bx+180, by+bh], fill=block_color, outline=(255,215,0), width=2)
-        draw.text((bx+90, by+bh//2+by//10), str(place), font=font_title, fill=(255,255,255), anchor="mm")
-        cy = by - 55
-        draw.ellipse([bx+65, cy, bx+115, cy+50], fill=(30,80,35), outline=(255,215,0), width=2)
-        draw.text((bx+90, cy+25), h["emoji"], font=font_name, fill=(255,255,255), anchor="mm")
-        draw.text((bx+90, cy-18), h["name"][:13]+('' if len(h["name"])<=13 else '.'), font=font_small, fill=(255,240,180), anchor="mm")
-        draw.text((bx+90, cy-4),  f"({h['odds_label']})", font=font_small, fill=(200,200,150), anchor="mm")
-
-    rest = sorted([h for h in horses if h["finish_pos"] not in (1,2,3)], key=lambda x: x["finish_pos"])
-    draw.text((760, 80), "Also Ran", font=font_name, fill=(200,200,150), anchor="mm")
-    for i, h in enumerate(rest):
-        draw.text((760, 105+i*22), f"#{h['finish_pos']} {h['emoji']} {h['name'][:14]}", font=font_small, fill=(170,200,160), anchor="mm")
-    draw.rectangle([2, 2, W-3, H-3], outline=(180,140,20), width=3)
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-# ─────────────────────────────────────────────
 #  Lobby embed
 # ─────────────────────────────────────────────
 def build_lobby_embed(horses, joined, seconds_left):
-    e = Embed(
-        title="🏇  POST TIME — JOIN THE RACE",
-        description=(
-            f"Click **Join Race** to place your bet!\n"
-            f"Gates open in **{seconds_left} seconds**.\n\u200b"
-        ),
-        color=0x1a6b2e
+    desc = (
+        "Click **Join Race** to place your bet!\n"
+        "The host will start the race when everyone is ready.\n\u200b"
+    ) if seconds_left == 0 else (
+        f"🚦 Race starting in **{seconds_left} seconds**...\n\u200b"
     )
+    e = Embed(title="🏇  POST TIME — JOIN THE RACE", description=desc, color=0x1a6b2e)
     for h in horses:
         e.add_field(
             name=f"#{h['num']}  {h['emoji']}  {h['name']}",
@@ -384,11 +330,11 @@ class HorseSelectView(View):
 # ─────────────────────────────────────────────
 class JoinView(View):
     def __init__(self, cog, race):
-        super().__init__(timeout=JOIN_WINDOW + 5)
+        super().__init__(timeout=600)
         self.cog  = cog
         self.race = race
 
-    @discord.ui.button(label="🏇  Join Race", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="🏇  Join Race", style=discord.ButtonStyle.success, row=0)
     async def join(self, interaction: discord.Interaction, button: Button):
         if not self.race.get("open"):
             return await interaction.response.send_message("Betting is closed — race has started!", ephemeral=True)
@@ -398,6 +344,32 @@ class JoinView(View):
             view=HorseSelectView(self.cog, self.race, interaction.user),
             ephemeral=True
         )
+
+    @discord.ui.button(label="🚦  Start Race", style=discord.ButtonStyle.danger, row=0)
+    async def start_race(self, interaction: discord.Interaction, button: Button):
+        race = self.race
+        if interaction.user != race["ctx"].author:
+            return await interaction.response.send_message("Only the race host can start the race!", ephemeral=True)
+        if not race.get("open"):
+            return await interaction.response.send_message("Race is already starting!", ephemeral=True)
+        if not race["bets"]:
+            return await interaction.response.send_message("No bets placed yet — wait for players to join!", ephemeral=True)
+
+        race["open"] = False
+        self.stop()
+        await interaction.response.defer()
+
+        # 10 second countdown: 10 → 5 → 3 → 2 → 1
+        for i, wait in [(10, 5), (5, 2), (3, 1), (2, 1), (1, 1)]:
+            try:
+                countdown_e = build_lobby_embed(race["horses"], race["joined"], 0)
+                countdown_e.title = f"🚦  RACE STARTING IN {i}..."
+                await race["lobby_msg"].edit(embed=countdown_e, view=None)
+            except Exception:
+                pass
+            await asyncio.sleep(wait)
+
+        await self.cog._run_race(race["ctx"], race)
 
 # ─────────────────────────────────────────────
 #  Cog
@@ -418,26 +390,13 @@ class HorseRace(commands.Cog):
         horses = generate_horses()
         race = {
             "horses": horses, "bets": {}, "joined": {},
-            "open": True, "seconds_left": JOIN_WINDOW,
-            "lobby_msg": None, "ctx": ctx,
+            "open": True, "lobby_msg": None, "ctx": ctx,
         }
         self.active_races[ctx.channel.id] = race
 
-        join_view  = JoinView(self, race)
-        lobby_msg  = await ctx.send(embed=build_lobby_embed(horses, {}, JOIN_WINDOW), view=join_view)
+        join_view = JoinView(self, race)
+        lobby_msg = await ctx.send(embed=build_lobby_embed(horses, {}, 0), view=join_view)
         race["lobby_msg"] = lobby_msg
-
-        # countdown ticks at 20s and 10s remaining
-        for tick in range(JOIN_WINDOW, 0, -10):
-            await asyncio.sleep(10)
-            race["seconds_left"] = max(tick - 10, 0)
-            try:
-                await lobby_msg.edit(embed=build_lobby_embed(horses, race["joined"], race["seconds_left"]))
-            except Exception:
-                pass
-
-        race["open"] = False
-        await self._run_race(ctx, race)
 
     async def _run_race(self, ctx, race):
         horses, bets = race["horses"], race["bets"]
@@ -456,16 +415,9 @@ class HorseRace(commands.Cog):
             await race_msg.edit(embed=build_track_embed(horses, turn))
             await asyncio.sleep(TURN_DELAY)
 
-        await race_msg.edit(embed=build_track_embed(horses, turn, race_over=True))
-
-        buf = render_podium_image(horses)
-        podium_e = Embed(title="🏆  Official Podium", color=0xFFD700)
-        podium_e.set_image(url="attachment://podium.png")
-        await ctx.send(embed=podium_e, file=File(buf, filename="podium.png"))
-
-        await asyncio.sleep(1)
+        # build payout results before editing final embed
+        payout_lines = []
         if bets:
-            results = []
             for user_id, b in bets.items():
                 member = ctx.guild.get_member(user_id)
                 if not member:
@@ -484,14 +436,17 @@ class HorseRace(commands.Cog):
                     await bank.deposit_credits(member, winnings)
                     await cfg.hr_wins.set(await cfg.hr_wins() + 1)
                     await cfg.hr_earned.set(await cfg.hr_earned() + winnings)
-                    results.append(f"✅ {member.display_name} — {horse['emoji']} **{horse['name']}** finished **#{fp}** ({b['bet_type'].upper()}) → **+{winnings} CrewCoin**")
+                    payout_lines.append(f"✅ {member.display_name} — {horse['emoji']} **{horse['name']}** #{fp} ({b['bet_type'].upper()}) → **+{winnings} CC**")
                 else:
                     await cfg.hr_losses.set(await cfg.hr_losses() + 1)
-                    results.append(f"❌ {member.display_name} — {horse['emoji']} **{horse['name']}** finished **#{fp}** ({b['bet_type'].upper()}) → lost {b['amount']} CrewCoin")
+                    payout_lines.append(f"❌ {member.display_name} — {horse['emoji']} **{horse['name']}** #{fp} ({b['bet_type'].upper()}) → lost {b['amount']} CC")
 
-            await ctx.send(embed=Embed(title="💰  Race Payouts", description="\n".join(results), color=0x1a6b2e))
+        final_e = build_track_embed(horses, turn, race_over=True)
+        if payout_lines:
+            final_e.add_field(name="💰  Payouts", value="\n".join(payout_lines), inline=False)
         else:
-            await ctx.send("No bets were placed this race.")
+            final_e.add_field(name="💰  Payouts", value="No bets were placed this race.", inline=False)
+        await race_msg.edit(embed=final_e)
 
         del self.active_races[ctx.channel.id]
 
