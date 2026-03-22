@@ -159,12 +159,15 @@ class Blackjack(commands.Cog):
             await sent_msg.edit(view=view)
 
     async def resolve(self, ctx, busted=False):
-        g = self.games.pop(ctx.author.id)
+        g = self.games[ctx.author.id]
         ph, dh, deck, bet = g["player"], g["dealer"], g["deck"], g["bet"]
 
         if not busted:
             while hand_value(dh) < 17:
                 dh.append(deck.pop())
+
+        # Show the final board with all dealer cards revealed before sending result
+        await self.show_game(ctx, start=False)
 
         pv, dv = hand_value(ph), hand_value(dh)
         user_cfg = CONFIG.user(ctx.author)
@@ -183,6 +186,7 @@ class Blackjack(commands.Cog):
             await bank.deposit_credits(ctx.author, bet)
 
         await user_cfg.total_bet.set(await user_cfg.total_bet() + bet)
+        self.games.pop(ctx.author.id)
         await ctx.send(result_msg)
 
     @commands.command()
