@@ -1021,7 +1021,7 @@ class PokéBot(commands.Cog):
 
     # ── Leaderboard ───────────────────────────────────────────────────────────
 
-    @commands.command(name="leaderboard", aliases=["lb"])
+    @commands.command(name="pokeboard", aliases=["pb"])
     async def leaderboard(self, ctx: commands.Context, category: str = "wins") -> None:
         """View the server leaderboard. Categories: wins, caught, shinies, credits"""
         category = category.lower()
