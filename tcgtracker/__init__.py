@@ -1,0 +1,1 @@
+from .tcgtracker import setup
