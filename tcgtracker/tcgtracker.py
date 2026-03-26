@@ -14,7 +14,7 @@ Settings commands (admin only):
   [p]tcgset status                — show current configuration
 
 Product commands (admin only):
-  [p]tcgadd <upc> <msrp> <name>  — add a product to track
+  [p]tcgadd <upc> <msrp> <n>  — add a product to track
   [p]tcgremove <upc>              — stop tracking a product
   [p]tcglist                      — list all tracked products
   [p]tcgcheck                     — manually trigger a check right now
@@ -97,17 +97,19 @@ class TCGTracker(commands.Cog):
     async def _run_checks(self) -> None:
         """Background loop: check all guilds and products, fire alerts for new restocks."""
         for guild in self.bot.guilds:
-            conf      = await self.config.guild(guild).all()
-            products  = conf.get("products", {})
+            conf     = await self.config.guild(guild).all()
+            products = conf.get("products", {})
             if not products:
                 continue
 
-            channel   = guild.get_channel(conf["alert_channel_id"]) if conf["alert_channel_id"] else None
-            role      = guild.get_role(conf["alert_role_id"]) if conf["alert_role_id"] else None
-            bby_key   = conf.get("bestbuy_key", "")
+            channel = guild.get_channel(conf["alert_channel_id"]) if conf["alert_channel_id"] else None
+            role    = guild.get_role(conf["alert_role_id"]) if conf["alert_role_id"] else None
+            bby_key = conf.get("bestbuy_key", "")
 
             for upc, product in products.items():
-                results = await check_bestbuy(self._session, upc, bby_key)
+                results = await check_bestbuy(
+                    self._session, upc, bby_key, product_name=product["name"]
+                )
                 await self._process_results(guild, upc, product, results, channel, role)
                 await asyncio.sleep(1)
 
@@ -213,7 +215,10 @@ class TCGTracker(commands.Cog):
         if not results:
             embed.add_field(
                 name="⚪ Best Buy",
-                value="Not found in Best Buy's catalog for this UPC.",
+                value=(
+                    "Not found in Best Buy's catalog for this UPC or product name.\n"
+                    "The product may not be carried by Best Buy or isn't indexed yet."
+                ),
                 inline=False,
             )
             embed.set_footer(text="TCGTracker • Manual check")
@@ -224,6 +229,7 @@ class TCGTracker(commands.Cog):
             price    = result.get("price")
             url      = result.get("url", "")
             in_stock = result["in_stock"]
+            name     = result.get("name", product["name"])
 
             status = "🟢 **IN STOCK**" if in_stock else "🔴 Out of stock"
 
@@ -238,6 +244,9 @@ class TCGTracker(commands.Cog):
             value = f"{status} · {price_str}"
             if url:
                 value += f"\n[View listing]({url})"
+            # Show matched name if it differs from what we searched (keyword fallback)
+            if name.lower() != product["name"].lower():
+                value += f"\n_Matched: {name}_"
 
             embed.add_field(name="💛 Best Buy", value=value, inline=True)
 
@@ -251,10 +260,11 @@ class TCGTracker(commands.Cog):
         zip_code: str,
         store_results: list,
     ) -> None:
-        """Send in-store availability results for one product + ZIP."""
-        in_stock_stores = [s for s in store_results if s["in_stock"]]
-        oos_stores      = [s for s in store_results if not s["in_stock"]]
-
+        """
+        Send in-store availability results for one product + ZIP.
+        Per the API docs, every store in store_results IS in stock —
+        the endpoint only returns stores that have the item available.
+        """
         embed = discord.Embed(
             title=f"🏪 Best Buy In-Store — ZIP {zip_code}",
             description=f"**{product['name']}** · UPC `{product['upc']}`",
@@ -263,32 +273,29 @@ class TCGTracker(commands.Cog):
         )
 
         def fmt_store(s: dict) -> str:
-            parts    = [p for p in [s.get("address"), s.get("city"), s.get("state"), s.get("zip")] if p]
-            addr     = ", ".join(parts) if parts else "Address unavailable"
-            dist     = f" · {s['distance_miles']:.1f} mi" if s.get("distance_miles") is not None else ""
-            return f"{addr}{dist}"
+            parts = [p for p in [s.get("address"), s.get("city"), s.get("state"), s.get("zip")] if p]
+            addr  = ", ".join(parts) if parts else "Address unavailable"
+            dist  = f" · {s['distance_miles']:.1f} mi" if s.get("distance_miles") is not None else ""
+            warn  = " ⚠️ Low Stock" if s.get("low_stock") else ""
+            return f"{addr}{dist}{warn}"
 
-        if in_stock_stores:
-            lines = [f"• **{s['store_name']}** — {fmt_store(s)}" for s in in_stock_stores[:8]]
-            if len(in_stock_stores) > 8:
-                lines.append(f"_…and {len(in_stock_stores) - 8} more_")
+        if store_results:
+            lines = [f"• **{s['store_name']}** — {fmt_store(s)}" for s in store_results[:10]]
+            if len(store_results) > 10:
+                lines.append(f"_…and {len(store_results) - 10} more_")
             embed.add_field(
-                name=f"🟢 In Stock ({len(in_stock_stores)} location{'s' if len(in_stock_stores) != 1 else ''})",
+                name=f"🟢 In Stock ({len(store_results)} location{'s' if len(store_results) != 1 else ''})",
                 value="\n".join(lines),
                 inline=False,
             )
         else:
             embed.add_field(
-                name="🔴 No In-Store Stock Found",
-                value=f"Checked {len(store_results)} Best Buy location(s) within 25 miles — none have it in stock.",
+                name="🔴 Not In Stock Nearby",
+                value="No Best Buy locations near this ZIP currently have this item in stock.",
                 inline=False,
             )
 
-        if oos_stores and in_stock_stores:
-            embed.set_footer(text=f"Also checked (OOS): {len(oos_stores)} location(s) · TCGTracker")
-        else:
-            embed.set_footer(text="TCGTracker • In-store check")
-
+        embed.set_footer(text="TCGTracker • In-store check · Results within 250 miles, sorted by proximity")
         await channel.send(embed=embed)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -447,15 +454,15 @@ class TCGTracker(commands.Cog):
         """List all currently tracked products."""
         products = await self.config.guild(ctx.guild).products()
         if not products:
-            await ctx.send(embed=self._err("No products tracked. Use `tcgadd <upc> <msrp> <name>` to add one."))
+            await ctx.send(embed=self._err("No products tracked. Use `tcgadd <upc> <msrp> <n>` to add one."))
             return
 
         product_list = list(products.items())
         for page_start in range(0, len(product_list), MAX_EMBED_FIELDS):
-            chunk      = product_list[page_start:page_start + MAX_EMBED_FIELDS]
-            page_num   = (page_start // MAX_EMBED_FIELDS) + 1
+            chunk       = product_list[page_start:page_start + MAX_EMBED_FIELDS]
+            page_num    = (page_start // MAX_EMBED_FIELDS) + 1
             total_pages = (len(product_list) + MAX_EMBED_FIELDS - 1) // MAX_EMBED_FIELDS
-            title      = f"📋 Tracked Products ({len(products)})"
+            title       = f"📋 Tracked Products ({len(products)})"
             if total_pages > 1:
                 title += f" — Page {page_num}/{total_pages}"
 
@@ -489,12 +496,12 @@ class TCGTracker(commands.Cog):
             await ctx.send(embed=self._err("No products tracked."))
             return
 
-        conf            = await self.config.guild(ctx.guild).all()
-        bby_key         = conf.get("bestbuy_key", "")
-        zip_codes       = conf.get("zip_codes", [])
-        channel_id      = conf.get("alert_channel_id")
+        conf             = await self.config.guild(ctx.guild).all()
+        bby_key          = conf.get("bestbuy_key", "")
+        zip_codes        = conf.get("zip_codes", [])
+        channel_id       = conf.get("alert_channel_id")
         store_channel_id = conf.get("store_channel_id")
-        role_id         = conf.get("alert_role_id")
+        role_id          = conf.get("alert_role_id")
 
         online_channel = ctx.guild.get_channel(channel_id) if channel_id else ctx.channel
         store_channel  = ctx.guild.get_channel(store_channel_id) if store_channel_id else ctx.channel
@@ -509,12 +516,14 @@ class TCGTracker(commands.Cog):
         found_any = False
 
         for upc, product in products.items():
-            results = await check_bestbuy(self._session, upc, bby_key)
+            results = await check_bestbuy(
+                self._session, upc, bby_key, product_name=product["name"]
+            )
 
             # Full status summary → online channel
             await self._send_manual_summary(online_channel, product, results)
 
-            # Role-ping alerts for new restocks only
+            # Role-ping alerts for genuinely new restocks only
             found_any = await self._process_results(
                 ctx.guild, upc, product, results, online_channel, role
             ) or found_any
@@ -522,13 +531,15 @@ class TCGTracker(commands.Cog):
             # In-store checks per ZIP → store channel
             if zip_codes:
                 sku = next((r.get("sku", "") for r in results if r.get("sku")), "")
-                for zip_code in zip_codes:
-                    store_results = await check_bestbuy_stores(
-                        self._session, sku, zip_code, bby_key
-                    )
-                    if store_results:
+                if sku:
+                    for zip_code in zip_codes:
+                        store_results = await check_bestbuy_stores(
+                            self._session, sku, zip_code, bby_key
+                        )
                         await self._send_store_embed(store_channel, product, zip_code, store_results)
-                    await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.5)
+                else:
+                    log.debug("Skipping in-store check for UPC %s — no SKU found from online lookup", upc)
 
             await asyncio.sleep(1)
 
