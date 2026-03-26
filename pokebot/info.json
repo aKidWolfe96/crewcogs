@@ -1,0 +1,13 @@
+{
+    "author": ["UncleClaude-Hxnter-aKidWolfe"],
+    "install_msg": "Thanks for installing PokéBot! Use `[p]pokeset spawnchannel #channel` to set your spawn channel, then `[p]start` to begin your journey!",
+    "name": "PokéBot",
+    "short": "A Pokémon catching, battling, and collecting bot.",
+    "description": "Full-featured Pokémon bot. Catch wild Pokémon, battle other trainers, manage your collection, and more. Powered by PokéAPI.",
+    "tags": ["pokemon", "game", "fun"],
+    "requirements": ["aiohttp"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
