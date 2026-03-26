@@ -1,0 +1,13 @@
+{
+    "author": ["converted"],
+    "install_msg": "Thanks for installing TCG Tracker!\n\nSet your Best Buy API key first (free at developer.bestbuy.com):\n  `[p]tcgset bestbuy_key <your_key>`\n\nThen set your alert channel and role:\n  `[p]tcgset channel #channel`\n  `[p]tcgset role @role`\n\nAdd products with:\n  `[p]tcgadd <upc> <msrp> <product name>`\n\nOptionally add ZIP codes for in-store checks:\n  `[p]tcgset zip <zip>`",
+    "name": "TCGTracker",
+    "short": "Track Pokémon TCG product drops at Best Buy by UPC.",
+    "description": "Monitors Pokémon TCG products by UPC at Best Buy using their official API. Alerts a Discord channel with a role ping when a product is found in stock, showing price vs MSRP. Supports in-store inventory checks by ZIP code. Alerts fire once per restock cycle to prevent spam.",
+    "tags": ["pokemon", "tcg", "tracker", "restock", "shopping", "bestbuy"],
+    "requirements": ["aiohttp"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
