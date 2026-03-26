@@ -75,7 +75,10 @@ class TCGTracker(commands.Cog):
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def cog_load(self) -> None:
-        self._session = aiohttp.ClientSession()
+        # ssl=False handles networks where antivirus/VPN SSL inspection presents
+        # a self-signed certificate that aiohttp's verifier rejects by default.
+        connector = aiohttp.TCPConnector(ssl=False)
+        self._session = aiohttp.ClientSession(connector=connector)
         self._check_task = self.bot.loop.create_task(self._check_loop())
 
     async def cog_unload(self) -> None:
