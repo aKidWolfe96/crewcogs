@@ -17,8 +17,8 @@ A [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) cog that moni
 ## Installation
 
 ```
-[p]repo add <your-repo-name> https://github.com/yourusername/tcgtracker
-[p]cog install <your-repo-name> TCGTracker
+[p]repo add Crewcogs https://github.com/yourusername/tcgtracker
+[p]cog install Crewcogs TCGTracker
 [p]load TCGTracker
 ```
 
