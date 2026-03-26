@@ -1,0 +1,164 @@
+# TCGTracker
+
+A [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) cog that monitors Pokémon TCG products across major retailers by UPC and alerts your Discord server when something restocks — online or in-store.
+
+---
+
+## Features
+
+- 🔍 **Tracks by UPC** across Best Buy, Walmart, Target, GameStop, and Pokémon Center
+- 💰 **Price vs. MSRP comparison** on every alert — shows if it's above or below retail
+- 🔔 **One alert per restock cycle** — no spam; resets automatically when it goes back out of stock
+- 🏪 **In-store inventory by ZIP code** — add ZIP codes and `tcgcheck` will show nearby store stock
+- ⚙️ **Per-guild configuration** — each server has its own products, keys, and settings
+
+---
+
+## Installation
+
+```
+[p]repo add <your-repo-name> https://github.com/yourusername/tcgtracker
+[p]cog install <your-repo-name> TCGTracker
+[p]load TCGTracker
+```
+
+---
+
+## Setup
+
+### 1. Best Buy API Key *(optional but recommended)*
+Best Buy is the only retailer that requires an API key. It's free and takes about 2 minutes to get.
+
+1. Sign up at [developer.bestbuy.com](https://developer.bestbuy.com)
+2. Copy your key and run:
+```
+[p]tcgset bestbuy_key YOUR_KEY_HERE
+```
+The bot will delete your message immediately to keep the key out of chat history.
+
+> Without a Best Buy key, Best Buy will be skipped. All other retailers work without any key.
+
+### 2. Alert Channel & Role
+```
+[p]tcgset channel #restock-alerts
+[p]tcgset role @TCG Alerts
+```
+
+### 3. Add Products to Track
+```
+[p]tcgadd <upc> <msrp> <product name>
+```
+**Example:**
+```
+[p]tcgadd 820650855344 44.99 Scarlet & Violet Destined Rivals ETB
+```
+
+### 4. In-Store Checks *(optional)*
+Add ZIP codes to enable nearby store inventory lookups when running `tcgcheck`:
+```
+[p]tcgset zip 27360
+[p]tcgset zip 90210
+```
+Up to 10 ZIP codes per server. Results appear in `tcgcheck` output grouped by retailer and location.
+
+---
+
+## Commands
+
+### Settings (`[p]tcgset`)
+
+| Command | Description |
+|---|---|
+| `tcgset channel #channel` | Set the alert channel |
+| `tcgset role @role` | Set the ping role |
+| `tcgset bestbuy_key <key>` | Set Best Buy API key |
+| `tcgset interval <seconds>` | Set check frequency (min: 60, max: 86400, default: 300) |
+| `tcgset zip <zip>` | Add a ZIP code for in-store checks |
+| `tcgset unzip <zip>` | Remove a ZIP code |
+| `tcgset status` | Show current configuration |
+
+### Product Management
+
+| Command | Description |
+|---|---|
+| `[p]tcgadd <upc> <msrp> <name>` | Add a product to track |
+| `[p]tcgremove <upc>` | Stop tracking a product |
+| `[p]tcglist` | List all tracked products and their current status |
+| `[p]tcgcheck` | Manually trigger an immediate check right now |
+| `[p]tcgreset <upc>` | Reset alert cooldown so the next check will re-alert if in stock |
+
+All commands require **Admin** or **Manage Server** permissions.
+
+---
+
+## How Alerts Work
+
+When a product is found in stock that wasn't before, the bot sends an embed to your alert channel and pings the configured role:
+
+```
+💛 Best Buy — IN STOCK!
+Scarlet & Violet Destined Rivals ETB
+
+💰 Price: $44.99 ✅ At/below MSRP ($44.99)
+🔗 View Product
+
+UPC: 820650855344  |  MSRP: $44.99
+```
+
+Once alerted, the bot **won't alert again** for that retailer until the product goes out of stock and comes back — preventing duplicate pings.
+
+Use `[p]tcgreset <upc>` to manually clear the cooldown if needed.
+
+---
+
+## In-Store Results
+
+When ZIP codes are configured, running `[p]tcgcheck` also sends a separate embed per product showing nearby store inventory:
+
+```
+🏪 In-Store Availability Near ZIP 27360
+Scarlet & Violet Destined Rivals ETB · UPC 820650855344
+
+🎮 GameStop — IN STOCK (2 locations)
+• GameStop #1234 — 123 Main St, Thomasville, NC 27360 · 3.2 mi · Qty: 2
+• GameStop #5678 — 456 Oak Ave, High Point, NC 27262 · 8.1 mi
+
+🔴 No stock found at Best Buy, Walmart, or Target within 25 miles.
+```
+
+In-store checks run **only on manual `tcgcheck`** — not in the background loop — to avoid hammering retailer APIs.
+
+---
+
+## Retailer Notes
+
+| Retailer | Method | Key Required? | Notes |
+|---|---|---|---|
+| Best Buy | Official API | ✅ Yes (free) | Most reliable; same key for online + in-store |
+| Walmart | HTML scrape | ❌ No | Uses `__NEXT_DATA__` JSON; may break if Walmart changes their page structure |
+| Target | Internal Redsky API | ❌ No | Uses an unofficial but widely-known endpoint; may break if Target rotates the key |
+| GameStop | HTML scrape | ❌ No | Minimal bot protection; generally stable |
+| Pokémon Center | HTML scrape | ❌ No | Searched by **product name**, not UPC — use specific names to avoid false positives |
+
+---
+
+## Requirements
+
+- [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) 3.5.0+
+- Python 3.10+
+- `aiohttp`
+- `beautifulsoup4`
+
+These are installed automatically when you install the cog via `[p]cog install`.
+
+---
+
+## Contributing
+
+Pull requests welcome. If a retailer's scraper breaks (they do sometimes), opening an issue with the error from your bot logs is the fastest way to get it fixed.
+
+---
+
+## Disclaimer
+
+This cog scrapes or uses unofficial APIs for several retailers. It is intended for personal use to track your own purchases. Be mindful of check intervals — the default 5-minute interval is conservative for a reason. Don't set it below 60 seconds.
