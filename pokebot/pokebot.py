@@ -734,6 +734,42 @@ class PokéBot(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    # ── Inventory ─────────────────────────────────────────────────────────────
+
+    @commands.command(name="inventory", aliases=["inv", "bag"])
+    async def inventory(self, ctx: commands.Context) -> None:
+        """View your bag — balls, healing items, and credits."""
+        player = await self._get_player(ctx.guild, ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
+            return
+
+        items = player.get("items", {})
+        healing = items.get("healing", {})
+
+        # Balls
+        balls_lines = []
+        for ball_id, label in BALL_NAMES.items():
+            count = items.get(ball_id, 0)
+            emoji = next((i["emoji"] for i in SHOP_ITEMS if i["id"] == ball_id), "🔴")
+            balls_lines.append(f"{emoji} **{label}** — {count}")
+
+        # Healing items
+        heal_lines = []
+        for item_id, label in ITEM_NAMES.items():
+            count = healing.get(item_id, 0)
+            heal_lines.append(f"{label} — {count}")
+
+        embed = discord.Embed(
+            title=f"🎒 {ctx.author.display_name}'s Bag",
+            color=COLORS["blue"],
+        )
+        embed.add_field(name="💰 Credits", value=str(player.get("credits", 0)), inline=False)
+        embed.add_field(name="🎯 Poké Balls", value="\n".join(balls_lines), inline=True)
+        embed.add_field(name="💊 Healing Items", value="\n".join(heal_lines), inline=True)
+        embed.set_footer(text="Use `shop` to buy more items • `use <item>` to heal")
+        await ctx.send(embed=embed)
+
     # ── Shop ──────────────────────────────────────────────────────────────────
 
     @commands.command(name="shop")
