@@ -431,19 +431,20 @@ class PokéBot(commands.Cog):
         )
 
     async def _flee_timer(self, channel: discord.TextChannel, pokemon: dict) -> None:
-        """Wait FLEE_TIMEOUT seconds; if the Pokémon is still uncaught, it flees."""
+        """Wait FLEE_TIMEOUT seconds; if the Pokémon is still uncaught, it flees and a new one spawns shortly after."""
         await asyncio.sleep(FLEE_TIMEOUT)
 
         # Only flee if this exact spawn is still in the cache
         cached = self._spawn_cache.get(channel.id)
+        spawned_at = self._spawn_cache.get(channel.id, {}).get("spawnedAt")
         if cached and cached["pokemon"].get("name") == pokemon.get("name") \
-                  and cached.get("spawnedAt") == pokemon.get("spawnedAt", cached.get("spawnedAt")):
+                  and spawned_at == cached.get("spawnedAt"):
             self._spawn_cache.pop(channel.id, None)
             try:
                 embed = discord.Embed(
                     description=(
                         f"🌿 The wild **{pokemon['displayName']}** got bored and fled into the tall grass!\n"
-                        f"_Another Pokémon will appear in a few hours..._"
+                        f"_A new Pokémon will appear shortly..._"
                     ),
                     color=COLORS["gray"],
                 )
@@ -453,26 +454,34 @@ class PokéBot(commands.Cog):
             except discord.HTTPException:
                 pass
 
+            # Wait a short grace period then spawn a replacement immediately
+            await asyncio.sleep(random.randint(30, 120))
+            await self._spawn_wild(channel)
+
     def _cancel_flee_task(self, channel_id: int) -> None:
         task = self._flee_tasks.pop(channel_id, None)
         if task and not task.done():
             task.cancel()
 
     async def _spawn_loop(self, guild: discord.Guild) -> None:
+        import logging
+        log = logging.getLogger("red.pokebot")
         await self.bot.wait_until_ready()
         while True:
             try:
-                channel_id = await self.config.guild(guild).spawn_channel_id()
                 interval   = await self.config.guild(guild).spawn_interval()
+                channel_id = await self.config.guild(guild).spawn_channel_id()
+                jitter     = random.randint(-60, 60)
+                await asyncio.sleep(max(60, (interval or 300) + jitter))
                 if channel_id:
                     channel = guild.get_channel(channel_id)
                     if channel:
                         await self._spawn_wild(channel)
+            except asyncio.CancelledError:
+                return
             except Exception as exc:
-                # Log but don't crash the loop
-                self.bot.logger.exception(f"[PokéBot] spawn loop error in {guild.name}: {exc}")
-            jitter = random.randint(-60, 60)
-            await asyncio.sleep(max(60, (interval or 300) + jitter))
+                log.exception(f"[PokéBot] spawn loop error in {guild.name}: {exc}")
+                await asyncio.sleep(60)
 
     def _ensure_spawn_task(self, guild: discord.Guild) -> None:
         if guild.id not in self._spawn_tasks or self._spawn_tasks[guild.id].done():
