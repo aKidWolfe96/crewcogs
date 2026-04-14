@@ -133,6 +133,7 @@ class PokéBot(commands.Cog):
         self._spawn_cache:  Dict[int, dict]           = {}  # channel_id -> spawn
         self._spawn_tasks:  Dict[int, asyncio.Task]   = {}  # guild_id   -> loop task
         self._flee_tasks:   Dict[int, asyncio.Task]   = {}  # channel_id -> flee timer task
+        self._pending_respawn: Dict[int, discord.TextChannel] = {}  # guild_id -> channel waiting for activity
         self._msg_counts:   Dict[int, int]            = {}  # channel_id -> message count
 
         self.config = Config.get_conf(self, identifier=0x504F4B45424F54, force_registration=True)
@@ -444,7 +445,7 @@ class PokéBot(commands.Cog):
                 embed = discord.Embed(
                     description=(
                         f"🌿 The wild **{pokemon['displayName']}** got bored and fled into the tall grass!\n"
-                        f"_A new Pokémon will appear shortly..._"
+                        f"_A new Pokémon will appear when someone next speaks..._"
                     ),
                     color=COLORS["gray"],
                 )
@@ -454,14 +455,18 @@ class PokéBot(commands.Cog):
             except discord.HTTPException:
                 pass
 
-            # Wait a short grace period then spawn a replacement immediately
-            await asyncio.sleep(random.randint(30, 120))
-            await self._spawn_wild(channel)
+            # Mark this guild as waiting for activity before respawning
+            self._pending_respawn[channel.guild.id] = channel
 
     def _cancel_flee_task(self, channel_id: int) -> None:
         task = self._flee_tasks.pop(channel_id, None)
         if task and not task.done():
             task.cancel()
+
+    async def _delayed_respawn(self, channel: discord.TextChannel) -> None:
+        """Wait a short random delay then spawn a new Pokémon after a flee."""
+        await asyncio.sleep(random.randint(10, 60))
+        await self._spawn_wild(channel)
 
     async def _spawn_loop(self, guild: discord.Guild) -> None:
         import logging
@@ -503,7 +508,16 @@ class PokéBot(commands.Cog):
         if message.author.bot or not message.guild:
             return
         spawn_channel_id = await self.config.guild(message.guild).spawn_channel_id()
-        if not spawn_channel_id or message.channel.id != spawn_channel_id:
+        if not spawn_channel_id:
+            return
+
+        # Any message anywhere in the server triggers a pending post-flee respawn
+        if message.guild.id in self._pending_respawn:
+            channel = self._pending_respawn.pop(message.guild.id)
+            self.bot.loop.create_task(self._delayed_respawn(channel))
+
+        # Message-count trigger only watches the spawn channel
+        if message.channel.id != spawn_channel_id:
             return
         key = message.channel.id
         self._msg_counts[key] = self._msg_counts.get(key, 0) + 1
