@@ -27,7 +27,8 @@ import copy
 import math
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import zoneinfo
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -157,6 +158,7 @@ class PokéBot(commands.Cog):
                 "ultraball": 0,
                 "healing":   {},
             },
+            "lastPokestop": None,
         }
         self.config.register_guild(**default_guild)
         self.config.register_member(**default_member)
@@ -1389,6 +1391,7 @@ class PokéBot(commands.Cog):
                 f"`{prefix}buy <item> [amount]` — Buy items",
                 f"`{prefix}use <item> [slot]` — Use a healing item",
                 f"`{prefix}inventory` — View your bag & {currency} balance",
+                f"`{prefix}pokestop` — Spin for free daily items",
             ]),
             inline=False,
         )
@@ -1415,11 +1418,111 @@ class PokéBot(commands.Cog):
                 "• Winning battles earns XP and 100 " + currency,
                 f"• All earnings go straight to your server {currency} balance",
                 "• Higher-level balls have better catch rates",
+                "• Spin `pokestop` every day for free balls and items",
                 "• All 1,025 Pokémon (Gen 1–9) can appear",
             ]),
             inline=False,
         )
         embed.set_footer(text="Good luck on your journey, Trainer!")
+        await ctx.send(embed=embed)
+
+
+    # ── Pokéstop ──────────────────────────────────────────────────────────────
+
+    @commands.command(name="pokestop")
+    async def pokestop(self, ctx: commands.Context) -> None:
+        """Spin a Pokéstop for free daily items! Resets at midnight each day."""
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
+            return
+
+        # Check if already claimed today (reset at midnight US Eastern)
+        EASTERN   = zoneinfo.ZoneInfo("America/New_York")
+        now       = datetime.now(tz=EASTERN)
+        today_str = now.strftime("%Y-%m-%d")
+        last_stop = player.get("lastPokestop")
+
+        if last_stop == today_str:
+            # Calculate time until next midnight Eastern
+            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            delta    = midnight - now
+            hours, remainder = divmod(int(delta.total_seconds()), 3600)
+            minutes          = remainder // 60
+            await ctx.send(embed=error_embed(
+                f"You already spun this Pokéstop today!\n"
+                f"Come back in **{hours}h {minutes}m** when it resets at midnight Eastern."
+            ))
+            return
+
+        # Build a random reward bundle
+        reward_balls   = {}
+        reward_healing = {}
+        reward_credits = 0
+        lines          = []
+        currency       = await self._currency(ctx.guild)
+
+        # Always give at least a handful of Pokéballs
+        pb = random.randint(3, 8)
+        reward_balls["pokeball"] = pb
+        lines.append(f"🔴 {pb}× Poké Ball")
+
+        # Chance for better balls
+        if random.random() < 0.4:
+            gb = random.randint(1, 3)
+            reward_balls["greatball"] = gb
+            lines.append(f"🔵 {gb}× Great Ball")
+        if random.random() < 0.15:
+            ub = random.randint(1, 2)
+            reward_balls["ultraball"] = ub
+            lines.append(f"⚫ {ub}× Ultra Ball")
+
+        # Chance for healing items
+        if random.random() < 0.5:
+            potions = random.randint(1, 3)
+            reward_healing["potion"] = potions
+            lines.append(f"🧪 {potions}× Potion")
+        if random.random() < 0.25:
+            superpotions = random.randint(1, 2)
+            reward_healing["superpotion"] = superpotions
+            lines.append(f"💊 {superpotions}× Super Potion")
+        if random.random() < 0.1:
+            reward_healing["maxpotion"] = 1
+            lines.append("💉 1× Max Potion")
+        if random.random() < 0.08:
+            reward_healing["revive"] = 1
+            lines.append("⭐ 1× Revive")
+
+        # Small currency bonus
+        if random.random() < 0.6:
+            reward_credits = random.randint(25, 150)
+            lines.append(f"💰 {reward_credits} {currency}")
+
+        # Apply rewards to player
+        items = player.setdefault("items", {"pokeball": 0, "greatball": 0, "ultraball": 0, "healing": {}})
+        healing = items.setdefault("healing", {})
+
+        for ball, qty in reward_balls.items():
+            items[ball] = items.get(ball, 0) + qty
+        for item, qty in reward_healing.items():
+            healing[item] = healing.get(item, 0) + qty
+
+        player["lastPokestop"] = today_str
+        await self._save_player(ctx.author, player)
+
+        if reward_credits:
+            await _deposit(ctx.author, reward_credits)
+
+        embed = discord.Embed(
+            title="🏪 Pokéstop",
+            description=(
+                f"**{ctx.author.display_name}** spun a Pokéstop!\n\n"
+                + "\n".join(lines)
+                + "\n\n_Come back tomorrow for more!_"
+            ),
+            color=COLORS["blue"],
+        )
+        embed.set_footer(text="Resets daily at midnight Eastern (ET)")
         await ctx.send(embed=embed)
 
 
