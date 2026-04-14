@@ -502,6 +502,9 @@ class PokéBot(commands.Cog):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or not message.guild:
             return
+        spawn_channel_id = await self.config.guild(message.guild).spawn_channel_id()
+        if not spawn_channel_id or message.channel.id != spawn_channel_id:
+            return
         key = message.channel.id
         self._msg_counts[key] = self._msg_counts.get(key, 0) + 1
         if self._msg_counts[key] >= 15 and random.random() < 0.4:
@@ -537,12 +540,20 @@ class PokéBot(commands.Cog):
     @commands.command(name="pokespawn")
     @checks.admin_or_permissions(manage_guild=True)
     async def pokespawn(self, ctx: commands.Context) -> None:
-        """(Admin) Force spawn a wild Pokémon in this channel."""
-        await ctx.typing()
-        # Clear any existing spawn + flee timer so we can force a fresh one
-        self._cancel_flee_task(ctx.channel.id)
-        self._spawn_cache.pop(ctx.channel.id, None)
-        await self._spawn_wild(ctx.channel)
+        """(Admin) Force spawn a wild Pokémon in the configured spawn channel."""
+        channel_id = await self.config.guild(ctx.guild).spawn_channel_id()
+        if not channel_id:
+            await ctx.send(embed=error_embed("No spawn channel set! Use `pokeset spawnchannel #channel` first."))
+            return
+        channel = ctx.guild.get_channel(channel_id)
+        if not channel:
+            await ctx.send(embed=error_embed("Spawn channel not found — it may have been deleted. Use `pokeset spawnchannel` to set a new one."))
+            return
+        self._cancel_flee_task(channel.id)
+        self._spawn_cache.pop(channel.id, None)
+        await self._spawn_wild(channel)
+        if channel != ctx.channel:
+            await ctx.send(embed=success_embed(f"Spawned a wild Pokémon in {channel.mention}!"))
 
     # ── Start ─────────────────────────────────────────────────────────────────
 
