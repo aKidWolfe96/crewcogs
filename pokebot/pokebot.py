@@ -9,6 +9,8 @@ Commands (all prefixed, no slash commands):
   [p]active       – Switch active Pokémon
   [p]nickname     – Nickname a Pokémon
   [p]dex          – Pokédex lookup
+  [p]pokedex      – Your Pokédex (caught species)
+  [p]dexpage      – Browse Pokédex by page
   [p]catch        – Catch a wild Pokémon
   [p]shop         – Browse PokéMart
   [p]buy          – Buy items in bulk
@@ -159,6 +161,7 @@ class PokéBot(commands.Cog):
                 "healing":   {},
             },
             "lastPokestop": None,
+            "caughtDex":    [],
         }
         self.config.register_guild(**default_guild)
         self.config.register_member(**default_member)
@@ -248,6 +251,15 @@ class PokéBot(commands.Cog):
                     pokemon["stats"][stat] += math.floor(growth * mult)
             messages.append(f"⬆️ **{pokemon['displayName']}** leveled up to **Lv.{pokemon['level']}**!")
         return messages
+
+    def _update_dex(self, player: dict, pokemon: dict) -> bool:
+        """Record a newly caught species in the player's Pokédex. Returns True if it's a new entry."""
+        dex = player.setdefault("caughtDex", [])
+        pid = pokemon["id"]
+        if pid not in dex:
+            dex.append(pid)
+            return True
+        return False
 
     def _build_battle_embed(self, battle: dict, log_lines: Optional[List[str]] = None) -> discord.Embed:
         if log_lines is None:
@@ -660,7 +672,9 @@ class PokéBot(commands.Cog):
             embed.set_thumbnail(url=active["spriteUrl"])
 
         embed.add_field(name=f"💰 {currency}", value=str(balance), inline=True)
+        dex_count = len(player.get("caughtDex", []))
         embed.add_field(name="📦 Pokémon",     value=str(len(player["pokemon"])), inline=True)
+        embed.add_field(name="📖 Pokédex",     value=f"{dex_count}/{MAX_POKEMON}", inline=True)
         embed.add_field(name="✨ Shinies",      value=str(shinies), inline=True)
         embed.add_field(name="⚔️ Battles",     value=f"{player['wins']}W / {player['losses']}L ({win_rate}%)", inline=True)
         embed.add_field(
@@ -856,6 +870,7 @@ class PokéBot(commands.Cog):
             self._spawn_cache.pop(ctx.channel.id, None)
 
             credits_earned = 500 if pokemon.get("shiny") else (100 if pokemon["level"] >= 30 else 50)
+            is_new_dex = self._update_dex(player, pokemon)
             player["pokemon"].append({**pokemon, "caughtAt": time.time()})
             await self._save_player(ctx.author, player)
             await _deposit(ctx.author, credits_earned)
@@ -875,6 +890,13 @@ class PokéBot(commands.Cog):
                 value=f"+{credits_earned}{bonus_tag}",
                 inline=True,
             )
+            if is_new_dex:
+                dex_count = len(player.get("caughtDex", []))
+                embed.add_field(
+                    name="📖 Pokédex",
+                    value=f"New entry! ({dex_count}/{MAX_POKEMON} caught)",
+                    inline=True,
+                )
         else:
             await self._save_player(ctx.author, player)
             embed = discord.Embed(
@@ -1272,7 +1294,107 @@ class PokéBot(commands.Cog):
 
             await ctx.send(embed=embed)
 
-    # ── Leaderboard ───────────────────────────────────────────────────────────
+    # ── Pokédex ───────────────────────────────────────────────────────────────
+
+    @commands.command(name="pokedex", aliases=["pdex"])
+    async def pokedex(self, ctx: commands.Context, user: Optional[discord.Member] = None) -> None:
+        """View your Pokédex — species you've caught. Usage: `pokedex [@user]`"""
+        target = user or ctx.author
+        player = await self._get_player(target)
+        if not player:
+            msg = (
+                "You haven't started your journey yet! Use `start`."
+                if target == ctx.author
+                else f"{target.display_name} hasn't started their journey yet."
+            )
+            await ctx.send(embed=error_embed(msg))
+            return
+
+        caught_ids   = set(player.get("caughtDex", []))
+        total_caught = len(caught_ids)
+        completion   = (total_caught / MAX_POKEMON) * 100
+
+        if not caught_ids:
+            await ctx.send(embed=error_embed("No Pokémon in your Pokédex yet — go catch some!"))
+            return
+
+        # Build name map from the player's current collection
+        seen: Dict[int, str] = {}
+        for pk in player["pokemon"]:
+            if pk["id"] in caught_ids and pk["id"] not in seen:
+                seen[pk["id"]] = pk["displayName"]
+
+        all_entries  = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
+        per_page     = 30
+        total_pages  = max(1, math.ceil(total_caught / per_page))
+        chunk        = all_entries[:per_page]
+
+        filled   = round((total_caught / MAX_POKEMON) * 20)
+        prog_bar = "█" * filled + "░" * (20 - filled)
+
+        embed = discord.Embed(
+            title=f"📖 {target.display_name}'s Pokédex",
+            description=(
+                f"**{total_caught}/{MAX_POKEMON}** species caught "
+                f"({completion:.1f}% complete)\n`{prog_bar}`"
+            ),
+            color=COLORS["blue"],
+        )
+
+        col_size = 10
+        cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
+        for col in cols:
+            val = "\n".join(f"`#{pid:04d}` {name}" for pid, name in col)
+            embed.add_field(name="\u200b", value=val, inline=True)
+
+        if total_caught > per_page:
+            embed.set_footer(text=f"Showing first {per_page} entries · Use `dexpage <page>` to browse all {total_caught}")
+        else:
+            embed.set_footer(text=f"{MAX_POKEMON - total_caught} species still to find!")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="dexpage", aliases=["dp"])
+    async def dexpage(self, ctx: commands.Context, page: int = 1, user: Optional[discord.Member] = None) -> None:
+        """Browse your Pokédex by page. Usage: `dexpage [page] [@user]`"""
+        target = user or ctx.author
+        player = await self._get_player(target)
+        if not player:
+            await ctx.send(embed=error_embed("That trainer hasn't started yet!"))
+            return
+
+        caught_ids   = set(player.get("caughtDex", []))
+        total_caught = len(caught_ids)
+        if not caught_ids:
+            await ctx.send(embed=error_embed("No Pokémon in your Pokédex yet — go catch some!"))
+            return
+
+        seen: Dict[int, str] = {}
+        for pk in player["pokemon"]:
+            if pk["id"] in caught_ids:
+                seen[pk["id"]] = pk["displayName"]
+
+        all_entries = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
+        per_page    = 30
+        total_pages = max(1, math.ceil(total_caught / per_page))
+        page        = max(1, min(page, total_pages))
+        offset      = (page - 1) * per_page
+        chunk       = all_entries[offset:offset + per_page]
+
+        embed = discord.Embed(
+            title=f"📖 {target.display_name}'s Pokédex — Page {page}/{total_pages}",
+            description=f"**{total_caught}/{MAX_POKEMON}** species caught ({(total_caught / MAX_POKEMON * 100):.1f}%)",
+            color=COLORS["blue"],
+        )
+        col_size = 10
+        cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
+        for col in cols:
+            val = "\n".join(f"`#{pid:04d}` {name}" for pid, name in col)
+            embed.add_field(name="\u200b", value=val, inline=True)
+
+        embed.set_footer(text=f"Page {page}/{total_pages} · Use `dexpage <page>` to navigate · {MAX_POKEMON - total_caught} still to find!")
+        await ctx.send(embed=embed)
+
+        # ── Leaderboard ───────────────────────────────────────────────────────────
 
     @commands.command(name="pokeboard", aliases=["pb"])
     async def leaderboard(self, ctx: commands.Context, category: str = "wins") -> None:
@@ -1373,6 +1495,8 @@ class PokéBot(commands.Cog):
                 f"`{prefix}active <slot>` — Set your battle Pokémon",
                 f"`{prefix}nickname <slot> <name>` — Give a Pokémon a nickname",
                 f"`{prefix}dex <name or #>` — Look up any Pokémon",
+                f"`{prefix}pokedex [@user]` — View your Pokédex",
+                f"`{prefix}dexpage <page> [@user]` — Browse Pokédex pages",
             ]),
             inline=False,
         )
@@ -1419,6 +1543,7 @@ class PokéBot(commands.Cog):
                 f"• All earnings go straight to your server {currency} balance",
                 "• Higher-level balls have better catch rates",
                 "• Spin `pokestop` every day for free balls and items",
+                "• Check your `pokedex` — 1,025 species to complete!",
                 "• All 1,025 Pokémon (Gen 1–9) can appear",
             ]),
             inline=False,
