@@ -1,0 +1,1 @@
+from .fortniteshop import setup
