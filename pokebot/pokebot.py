@@ -583,6 +583,44 @@ class PokéBot(commands.Cog):
         if channel != ctx.channel:
             await ctx.send(embed=success_embed(f"Spawned a wild Pokémon in {channel.mention}!"))
 
+
+    @commands.command(name="pokedexsync")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def pokedexsync(self, ctx: commands.Context) -> None:
+        """(Admin) One-time migration: populate every trainer's Pokédex from their existing collection."""
+        await ctx.send(embed=discord.Embed(
+            color=COLORS["yellow"],
+            description="⏳ Syncing Pokédex for all trainers... this may take a moment.",
+        ))
+
+        synced    = 0
+        total_new = 0
+
+        for member in ctx.guild.members:
+            if member.bot:
+                continue
+            player = await self._get_player(member)
+            if not player or not player.get("pokemon"):
+                continue
+
+            dex     = set(player.get("caughtDex", []))
+            before  = len(dex)
+
+            for pk in player["pokemon"]:
+                dex.add(pk["id"])
+
+            new_entries = len(dex) - before
+            if new_entries > 0:
+                player["caughtDex"] = sorted(dex)
+                await self._save_player(member, player)
+                total_new += new_entries
+                synced    += 1
+
+        await ctx.send(embed=success_embed(
+            f"Pokédex sync complete!\n"
+            f"**{synced}** trainer(s) updated · **{total_new}** total new entries registered."
+        ))
+
     # ── Start ─────────────────────────────────────────────────────────────────
 
     @commands.command(name="start")
