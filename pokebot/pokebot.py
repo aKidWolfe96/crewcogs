@@ -94,6 +94,47 @@ BALL_NAMES   = {"pokeball": "Poké Ball", "greatball": "Great Ball", "ultraball"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Pokédex helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _dex_progress_bar(caught: int, total: int, length: int = 20) -> str:
+    """Coloured block progress bar using Discord emoji squares."""
+    filled   = round((caught / total) * length) if total else 0
+    empty    = length - filled
+    pct      = (caught / total) * 100 if total else 0
+    # Colour tier: red → orange → yellow → green → gold
+    if pct >= 100:
+        block = "🟨"
+    elif pct >= 75:
+        block = "🟩"
+    elif pct >= 50:
+        block = "🟦"
+    elif pct >= 25:
+        block = "🟧"
+    else:
+        block = "🟥"
+    return block * filled + "⬛" * empty
+
+
+DEX_RANK_TIERS = [
+    (1025, "🏆 **Pokémon Master**",   0xFFD700),
+    (900,  "🌟 **Champion**",          0xFFD700),
+    (750,  "💎 **Elite Trainer**",     0x9B59B6),
+    (500,  "🔵 **Ace Trainer**",       0x3498DB),
+    (250,  "🌿 **Rising Trainer**",    0x2ECC71),
+    (100,  "🔰 **Rookie**",            0xE67E22),
+    (0,    "🥚 **Beginner**",          0x95A5A6),
+]
+
+def _dex_rank(caught: int):
+    """Return (rank_label, embed_color) based on dex completion."""
+    for threshold, label, color in DEX_RANK_TIERS:
+        if caught >= threshold:
+            return label, color
+    return DEX_RANK_TIERS[-1][1], DEX_RANK_TIERS[-1][2]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Bank helpers  (Red economy — guild-scoped or global depending on bank setting)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1353,7 +1394,10 @@ class PokéBot(commands.Cog):
         completion   = (total_caught / MAX_POKEMON) * 100
 
         if not caught_ids:
-            await ctx.send(embed=error_embed("No Pokémon in your Pokédex yet — go catch some!"))
+            await ctx.send(embed=discord.Embed(
+                color=COLORS["orange"],
+                description="📭 No Pokémon in your Pokédex yet!\nHead out and start catching to fill it up.",
+            ))
             return
 
         # Build name map from the player's current collection
@@ -1362,33 +1406,49 @@ class PokéBot(commands.Cog):
             if pk["id"] in caught_ids and pk["id"] not in seen:
                 seen[pk["id"]] = pk["displayName"]
 
-        all_entries  = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
-        per_page     = 30
-        total_pages  = max(1, math.ceil(total_caught / per_page))
-        chunk        = all_entries[:per_page]
+        all_entries = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
+        per_page    = 30
+        chunk       = all_entries[:per_page]
 
-        filled   = round((total_caught / MAX_POKEMON) * 20)
-        prog_bar = "█" * filled + "░" * (20 - filled)
+        rank_label, rank_color = _dex_rank(total_caught)
+        prog_bar = _dex_progress_bar(total_caught, MAX_POKEMON, length=20)
+
+        # Milestone flavour text
+        remaining = MAX_POKEMON - total_caught
+        if completion >= 100:
+            flavour = "🎉 You've caught them all! Legendary!"
+        elif completion >= 75:
+            flavour = f"🔥 Almost there — just **{remaining}** left!"
+        elif completion >= 50:
+            flavour = f"💪 Halfway there — keep it up!"
+        elif completion >= 25:
+            flavour = f"🌱 Making good progress — **{remaining}** still out there!"
+        else:
+            flavour = f"🗺️ Your journey is just beginning — **{remaining}** left to discover!"
 
         embed = discord.Embed(
             title=f"📖 {target.display_name}'s Pokédex",
-            description=(
-                f"**{total_caught}/{MAX_POKEMON}** species caught "
-                f"({completion:.1f}% complete)\n`{prog_bar}`"
-            ),
-            color=COLORS["blue"],
+            color=rank_color,
+        )
+        embed.description = (
+            f"{rank_label}\n\n"
+            f"{prog_bar}\n"
+            f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}% complete\n\n"
+            f"{flavour}"
         )
 
+        # Pokémon entries in up to 3 inline columns of 10
         col_size = 10
         cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
         for col in cols:
-            val = "\n".join(f"`#{pid:04d}` {name}" for pid, name in col)
+            val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
             embed.add_field(name="\u200b", value=val, inline=True)
 
         if total_caught > per_page:
-            embed.set_footer(text=f"Showing first {per_page} entries · Use `dexpage <page>` to browse all {total_caught}")
+            embed.set_footer(text=f"Showing newest {per_page} entries · Use dexpage <page> to browse all {total_caught} · {remaining} still to find!")
         else:
-            embed.set_footer(text=f"{MAX_POKEMON - total_caught} species still to find!")
+            embed.set_footer(text=f"✨ {remaining} species still out there — keep catching!")
+
         await ctx.send(embed=embed)
 
     @commands.command(name="dexpage", aliases=["dp"])
@@ -1403,7 +1463,10 @@ class PokéBot(commands.Cog):
         caught_ids   = set(player.get("caughtDex", []))
         total_caught = len(caught_ids)
         if not caught_ids:
-            await ctx.send(embed=error_embed("No Pokémon in your Pokédex yet — go catch some!"))
+            await ctx.send(embed=discord.Embed(
+                color=COLORS["orange"],
+                description="📭 No Pokémon in your Pokédex yet — go catch some!",
+            ))
             return
 
         seen: Dict[int, str] = {}
@@ -1417,19 +1480,29 @@ class PokéBot(commands.Cog):
         page        = max(1, min(page, total_pages))
         offset      = (page - 1) * per_page
         chunk       = all_entries[offset:offset + per_page]
+        remaining   = MAX_POKEMON - total_caught
+        completion  = (total_caught / MAX_POKEMON) * 100
+
+        rank_label, rank_color = _dex_rank(total_caught)
+        prog_bar = _dex_progress_bar(total_caught, MAX_POKEMON, length=20)
 
         embed = discord.Embed(
-            title=f"📖 {target.display_name}'s Pokédex — Page {page}/{total_pages}",
-            description=f"**{total_caught}/{MAX_POKEMON}** species caught ({(total_caught / MAX_POKEMON * 100):.1f}%)",
-            color=COLORS["blue"],
+            title=f"📖 {target.display_name}'s Pokédex — Page {page} of {total_pages}",
+            color=rank_color,
         )
+        embed.description = (
+            f"{rank_label}\n"
+            f"{prog_bar}\n"
+            f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}%"
+        )
+
         col_size = 10
         cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
         for col in cols:
-            val = "\n".join(f"`#{pid:04d}` {name}" for pid, name in col)
+            val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
             embed.add_field(name="\u200b", value=val, inline=True)
 
-        embed.set_footer(text=f"Page {page}/{total_pages} · Use `dexpage <page>` to navigate · {MAX_POKEMON - total_caught} still to find!")
+        embed.set_footer(text=f"Page {page}/{total_pages} · dexpage <page> to navigate · {remaining} species still to find!")
         await ctx.send(embed=embed)
 
         # ── Leaderboard ───────────────────────────────────────────────────────────
