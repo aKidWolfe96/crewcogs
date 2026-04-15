@@ -21,7 +21,7 @@ from redbot.core.bot import Red
 log = logging.getLogger("red.FortniteShop")
 
 # ── Fortnite API endpoint ──────────────────────────────────────────────────────
-SHOP_URL = "https://fortnite-api.com/v2/shop/br/combined"
+SHOP_URL = "https://fortnite-api.com/v2/shop"
 
 # Rarity → embed colour mapping
 RARITY_COLOURS = {
