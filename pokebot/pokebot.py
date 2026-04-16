@@ -18,9 +18,9 @@ Commands (all prefixed, no slash commands):
   [p]inventory    – View your bag
   [p]battle       – Challenge another trainer
   [p]move         – Use a move in battle
-  [p]pokeboard    – Server rankings
-  [p]pokespawn    – (Admin) Force a spawn
-  [p]pokeset      – (Admin) Bot settings
+  [p]tms         – Browse TM shop
+  [p]buytm       – Buy a TM
+  [p]usetm       – Teach a TM move to a Pokémon
 """
 from __future__ import annotations
 
@@ -91,6 +91,43 @@ SHOP_ITEMS = [
 HEAL_AMOUNTS = {"potion": 20, "superpotion": 50, "maxpotion": math.inf, "revive": None}
 ITEM_NAMES   = {"potion": "🧪 Potion", "superpotion": "💊 Super Potion", "maxpotion": "💉 Max Potion", "revive": "⭐ Revive"}
 BALL_NAMES   = {"pokeball": "Poké Ball", "greatball": "Great Ball", "ultraball": "Ultra Ball"}
+
+# TM list — move name (PokéAPI slug) mapped to display info and price
+TM_LIST: Dict[str, dict] = {
+    "flamethrower":     {"name": "Flamethrower",     "type": "fire",     "price": 3000,  "desc": "A powerful Fire-type blast."},
+    "ice-beam":         {"name": "Ice Beam",          "type": "ice",      "price": 3000,  "desc": "An icy beam that may freeze."},
+    "thunderbolt":      {"name": "Thunderbolt",       "type": "electric", "price": 3000,  "desc": "A strong electric attack."},
+    "earthquake":       {"name": "Earthquake",        "type": "ground",   "price": 4000,  "desc": "Shakes the ground for big damage."},
+    "psychic":          {"name": "Psychic",           "type": "psychic",  "price": 3500,  "desc": "A strong psychic attack."},
+    "surf":             {"name": "Surf",              "type": "water",    "price": 3000,  "desc": "A surging wave attack."},
+    "shadow-ball":      {"name": "Shadow Ball",       "type": "ghost",    "price": 3000,  "desc": "A shadowy blob that may lower Sp. Def."},
+    "energy-ball":      {"name": "Energy Ball",       "type": "grass",    "price": 3000,  "desc": "Fires a green orb of nature energy."},
+    "dragon-pulse":     {"name": "Dragon Pulse",      "type": "dragon",   "price": 3500,  "desc": "A shock wave of pure draconic energy."},
+    "focus-blast":      {"name": "Focus Blast",       "type": "fighting", "price": 4000,  "desc": "A powerful, fully focused punch."},
+    "sludge-bomb":      {"name": "Sludge Bomb",       "type": "poison",   "price": 3000,  "desc": "Hurls toxic sludge at the target."},
+    "rock-slide":       {"name": "Rock Slide",        "type": "rock",     "price": 2500,  "desc": "Large rocks are hurled at the foe."},
+    "iron-head":        {"name": "Iron Head",         "type": "steel",    "price": 3000,  "desc": "Slams with a steel-hard head."},
+    "x-scissor":        {"name": "X-Scissor",         "type": "bug",      "price": 2500,  "desc": "Slashes with crossed scythes."},
+    "aerial-ace":       {"name": "Aerial Ace",        "type": "flying",   "price": 2000,  "desc": "An incredibly fast and accurate attack."},
+    "brick-break":      {"name": "Brick Break",       "type": "fighting", "price": 2500,  "desc": "A chop that smashes barriers."},
+    "dark-pulse":       {"name": "Dark Pulse",        "type": "dark",     "price": 3000,  "desc": "Emanates a horrible aura of fear."},
+    "dazzling-gleam":   {"name": "Dazzling Gleam",    "type": "fairy",    "price": 3000,  "desc": "Dazes the foe with a powerful flash."},
+    "flash-cannon":     {"name": "Flash Cannon",      "type": "steel",    "price": 3000,  "desc": "Fires a beam of light energy."},
+    "giga-drain":       {"name": "Giga Drain",        "type": "grass",    "price": 2500,  "desc": "Drains HP from the foe."},
+    "hyper-beam":       {"name": "Hyper Beam",        "type": "normal",   "price": 5000,  "desc": "The strongest Normal-type attack."},
+    "blizzard":         {"name": "Blizzard",          "type": "ice",      "price": 4500,  "desc": "A howling blizzard that may freeze."},
+    "fire-blast":       {"name": "Fire Blast",        "type": "fire",     "price": 4500,  "desc": "An inferno that may burn."},
+    "thunder":          {"name": "Thunder",           "type": "electric", "price": 4500,  "desc": "A huge lightning bolt."},
+    "solar-beam":       {"name": "Solar Beam",        "type": "grass",    "price": 4500,  "desc": "A two-turn beam of solar energy."},
+}
+
+TM_TYPE_EMOJI: Dict[str, str] = {
+    "fire": "🔥", "ice": "🧊", "electric": "⚡", "ground": "🟤",
+    "psychic": "🔮", "water": "💧", "ghost": "👻", "grass": "🌿",
+    "dragon": "🐉", "fighting": "🥊", "poison": "☠️", "rock": "🪨",
+    "steel": "⚙️", "bug": "🐛", "flying": "🌬️", "normal": "⬜",
+    "dark": "🌑", "fairy": "✨",
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -200,6 +237,7 @@ class PokéBot(commands.Cog):
                 "greatball": 0,
                 "ultraball": 0,
                 "healing":   {},
+                "tms":       [],
             },
             "lastPokestop": None,
             "caughtDex":    [],
@@ -262,6 +300,7 @@ class PokéBot(commands.Cog):
                 "greatball": 3,
                 "ultraball": 1,
                 "healing":   {},
+                "tms":       [],
             },
         }
         await self._save_player(member, player)
@@ -1054,6 +1093,7 @@ class PokéBot(commands.Cog):
 
         items   = player.get("items", {})
         healing = items.get("healing", {})
+        tms     = items.get("tms", [])
         balance  = await self._get_balance(ctx.author)
         currency = await self._currency(ctx.guild)
 
@@ -1075,7 +1115,21 @@ class PokéBot(commands.Cog):
         embed.add_field(name=f"💰 {currency}", value=str(balance), inline=False)
         embed.add_field(name="🎯 Poké Balls",   value="\n".join(balls_lines), inline=True)
         embed.add_field(name="💊 Healing Items", value="\n".join(heal_lines), inline=True)
-        embed.set_footer(text="Use `shop` to buy more items • `use <item>` to heal")
+
+        if tms:
+            tm_lines = []
+            for slug in tms:
+                tm_info = TM_LIST.get(slug)
+                if tm_info:
+                    emoji = TM_TYPE_EMOJI.get(tm_info["type"], "💿")
+                    tm_lines.append(f"{emoji} **{tm_info['name']}** `{slug}`")
+                else:
+                    tm_lines.append(f"💿 `{slug}`")
+            embed.add_field(name="💿 TMs", value="\n".join(tm_lines), inline=False)
+        else:
+            embed.add_field(name="💿 TMs", value="_None — buy TMs with `buytm <move>`_", inline=False)
+
+        embed.set_footer(text="Use `shop` to buy items • `tms` to browse TMs • `usetm` to teach moves")
         await ctx.send(embed=embed)
 
     # ── Shop ──────────────────────────────────────────────────────────────────
@@ -1693,6 +1747,15 @@ class PokéBot(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name="💿 TMs",
+            value="\n".join([
+                f"`{prefix}tms [page]` — Browse TM Shop (25 moves)",
+                f"`{prefix}buytm <move>` — Buy a TM (e.g. `buytm thunderbolt`)",
+                f"`{prefix}usetm <move> <pokemon_slot> <move_slot>` — Teach the TM",
+            ]),
+            inline=False,
+        )
+        embed.add_field(
             name="🏆 Leaderboard",
             value=f"`{prefix}pokeboard [wins|caught|shinies|balance]` — Server rankings",
             inline=False,
@@ -1718,12 +1781,201 @@ class PokéBot(commands.Cog):
                 "• Spin `pokestop` every day for free balls and items",
                 "• Check your `pokedex` — 1,025 species to complete!",
                 "• All 1,025 Pokémon (Gen 1–9) can appear",
+                "• TMs are one-use — buy with `buytm`, teach with `usetm <move> <poke_slot> <move_slot>`",
             ]),
             inline=False,
         )
         embed.set_footer(text="Good luck on your journey, Trainer!")
         await ctx.send(embed=embed)
 
+
+    # ── TMs ───────────────────────────────────────────────────────────────────
+
+    @commands.command(name="tms", aliases=["tmshop", "tmlist"])
+    async def tms(self, ctx: commands.Context, page: int = 1) -> None:
+        """Browse available TMs. Usage: `tms [page]`"""
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
+            return
+
+        currency  = await self._currency(ctx.guild)
+        balance   = await self._get_balance(ctx.author)
+        owned_tms = player.get("items", {}).get("tms", [])
+
+        all_tms   = list(TM_LIST.items())
+        per_page  = 8
+        total_pages = max(1, math.ceil(len(all_tms) / per_page))
+        page      = max(1, min(page, total_pages))
+        offset    = (page - 1) * per_page
+        chunk     = all_tms[offset:offset + per_page]
+
+        embed = discord.Embed(
+            title="💿 TM Shop",
+            description=(
+                f"Balance: **💰 {balance} {currency}**\n"
+                f"Use `buytm <move>` to purchase · `usetm <move> <slot> <move_slot>` to teach\n\u200b"
+            ),
+            color=COLORS["blue"],
+        )
+        for slug, info in chunk:
+            owned_tag = " ✅ **Owned**" if slug in owned_tms else ""
+            emoji     = TM_TYPE_EMOJI.get(info["type"], "💿")
+            embed.add_field(
+                name=f"{emoji} **{info['name']}** — {info['price']} {currency}{owned_tag}",
+                value=f"_{info['desc']}_  ·  Type: {info['type'].capitalize()}  ·  `{slug}`",
+                inline=False,
+            )
+        embed.set_footer(text=f"Page {page}/{total_pages} · tms <page> to navigate · {len(all_tms)} TMs total")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="buytm")
+    async def buytm(self, ctx: commands.Context, *, move: str) -> None:
+        """Buy a TM from the shop. Usage: `buytm <move_name>`
+        Example: `buytm thunderbolt` or `buytm ice beam`"""
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
+            return
+
+        # Normalise input to PokéAPI slug format
+        slug = move.lower().strip().replace(" ", "-")
+        tm_info = TM_LIST.get(slug)
+        if not tm_info:
+            # Try matching display name case-insensitively
+            slug = next(
+                (s for s, info in TM_LIST.items() if info["name"].lower() == move.lower().strip()),
+                None,
+            )
+            if slug:
+                tm_info = TM_LIST[slug]
+            else:
+                names = ", ".join(f"`{s}`" for s in TM_LIST)
+                await ctx.send(embed=error_embed(
+                    f"Unknown TM **{move}**.\nAvailable: {names}\nUse `tms` to browse."
+                ))
+                return
+
+        currency = await self._currency(ctx.guild)
+
+        # TMs are single-use consumables — allow buying duplicates (one per use)
+        success = await _withdraw(ctx.author, tm_info["price"])
+        if not success:
+            balance = await self._get_balance(ctx.author)
+            await ctx.send(embed=error_embed(
+                f"You need **{tm_info['price']} {currency}** for TM {tm_info['name']} "
+                f"but only have **{balance}**."
+            ))
+            return
+
+        items = player.setdefault("items", {})
+        tms   = items.setdefault("tms", [])
+        tms.append(slug)
+        await self._save_player(ctx.author, player)
+
+        balance = await self._get_balance(ctx.author)
+        emoji   = TM_TYPE_EMOJI.get(tm_info["type"], "💿")
+        embed = discord.Embed(
+            title=f"💿 Bought TM: {tm_info['name']}!",
+            description=(
+                f"{emoji} **{tm_info['name']}** added to your bag!\n"
+                f"_{tm_info['desc']}_\n\n"
+                f"Use `usetm {slug} <pokemon_slot> <move_slot>` to teach it.\n"
+                f"Remaining balance: **{balance} {currency}**"
+            ),
+            color=COLORS["green"],
+        )
+        await ctx.send(embed=embed)
+
+    @commands.command(name="usetm")
+    async def usetm(self, ctx: commands.Context, move: str, pokemon_slot: int, move_slot: int) -> None:
+        """Teach a TM move to one of your Pokémon.
+        Usage: `usetm <move> <pokemon_slot> <move_slot>`
+        Example: `usetm thunderbolt 1 3` — teach Thunderbolt to Pokémon #1, replacing move slot 3.
+        Move slots are 1–4. Use `pokemon` to see Pokémon slots."""
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
+            return
+        if self._get_battle_by_user(ctx.author.id):
+            await ctx.send(embed=error_embed("You can't use TMs during a battle!"))
+            return
+
+        slug = move.lower().strip().replace(" ", "-")
+        tm_info = TM_LIST.get(slug)
+        if not tm_info:
+            slug = next(
+                (s for s, info in TM_LIST.items() if info["name"].lower() == move.lower().strip()),
+                None,
+            )
+            if slug:
+                tm_info = TM_LIST[slug]
+            else:
+                await ctx.send(embed=error_embed(
+                    f"Unknown TM **{move}**. Use `tms` to browse available TMs."
+                ))
+                return
+
+        items = player.get("items", {})
+        tms   = items.get("tms", [])
+        if slug not in tms:
+            await ctx.send(embed=error_embed(
+                f"You don't have TM **{tm_info['name']}** in your bag!\n"
+                f"Buy it with `buytm {slug}`."
+            ))
+            return
+
+        poke_idx = pokemon_slot - 1
+        if poke_idx < 0 or poke_idx >= len(player["pokemon"]):
+            await ctx.send(embed=error_embed(
+                f"Invalid Pokémon slot. You have {len(player['pokemon'])} Pokémon (slots 1–{len(player['pokemon'])})."
+            ))
+            return
+
+        move_idx = move_slot - 1
+        poke     = player["pokemon"][poke_idx]
+        moves    = poke.get("moves", [])
+
+        if move_idx < 0 or move_idx >= 4:
+            await ctx.send(embed=error_embed("Move slot must be 1–4."))
+            return
+        # Pad moves list to 4 if the Pokémon has fewer (edge case)
+        while len(moves) < 4:
+            moves.append(None)
+
+        # Check if already knows the move
+        if slug in moves:
+            await ctx.send(embed=error_embed(
+                f"**{poke['displayName']}** already knows **{tm_info['name']}**!"
+            ))
+            return
+
+        old_move = moves[move_idx]
+        old_move_name = old_move.replace("-", " ").capitalize() if old_move else "—"
+
+        # Teach the move — consume the TM
+        moves[move_idx] = slug
+        poke["moves"]   = moves
+        tms.remove(slug)
+        await self._save_player(ctx.author, player)
+
+        emoji  = TM_TYPE_EMOJI.get(tm_info["type"], "💿")
+        embed  = discord.Embed(
+            title=f"✅ {poke['displayName']} learned {tm_info['name']}!",
+            description=(
+                f"{emoji} **{tm_info['name']}** was taught to **{poke['displayName']}**!\n"
+                f"Replaced move slot {move_slot}: ~~{old_move_name}~~ → **{tm_info['name']}**\n\n"
+                f"Current moves:\n"
+                + "\n".join(
+                    f"{i+1}. {(m.replace('-', ' ').capitalize() if m else '—')}"
+                    for i, m in enumerate(poke['moves'])
+                )
+            ),
+            color=COLORS["green"],
+        )
+        if poke.get("spriteUrl"):
+            embed.set_thumbnail(url=poke["spriteUrl"])
+        await ctx.send(embed=embed)
 
     # ── Pokéstop ──────────────────────────────────────────────────────────────
 
