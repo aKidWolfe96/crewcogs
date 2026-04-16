@@ -437,6 +437,11 @@ class PokéBot(commands.Cog):
                 wp = winner_data["pokemon"][winner_data["activePokemonIndex"]]
                 wp["xp"] = wp.get("xp", 0) + 50 * (battle["turn"] if battle else 1)
                 self._check_level_up(wp)
+                # Write battle damage back — winner keeps whatever HP they have left
+                if battle:
+                    p1_is_winner = battle["player1"]["id"] == winner_id
+                    winner_battle_poke = battle["player1"]["pokemon"] if p1_is_winner else battle["player2"]["pokemon"]
+                    wp["stats"]["hp"] = max(1, winner_battle_poke["stats"]["hp"])  # winner survives with at least 1 HP
                 await self._save_player(winner_member, winner_data)
                 await _deposit(winner_member, 100)
 
@@ -444,6 +449,12 @@ class PokéBot(commands.Cog):
             loser_data = await self._get_player(loser_member)
             if loser_data:
                 loser_data["losses"] = loser_data.get("losses", 0) + 1
+                # Write battle damage back — loser's pokemon faints at 0 HP
+                if battle:
+                    p1_is_loser = battle["player1"]["id"] == loser_id
+                    loser_battle_poke = battle["player1"]["pokemon"] if p1_is_loser else battle["player2"]["pokemon"]
+                    lp = loser_data["pokemon"][loser_data["activePokemonIndex"]]
+                    lp["stats"]["hp"] = 0  # fainted
                 await self._save_player(loser_member, loser_data)
 
     # ── Spawn & Flee System ───────────────────────────────────────────────────
@@ -544,7 +555,16 @@ class PokéBot(commands.Cog):
                 await asyncio.sleep(60)
 
     def _ensure_spawn_task(self, guild: discord.Guild) -> None:
-        if guild.id not in self._spawn_tasks or self._spawn_tasks[guild.id].done():
+        task = self._spawn_tasks.get(guild.id)
+        if task is None or task.done():
+            if task is not None and task.done() and not task.cancelled():
+                # Log if the task died unexpectedly rather than being cancelled
+                import logging
+                exc = task.exception() if not task.cancelled() else None
+                if exc:
+                    logging.getLogger("red.pokebot").error(
+                        f"[PokéBot] spawn task for {guild.name} died: {exc} — restarting"
+                    )
             self._spawn_tasks[guild.id] = self.bot.loop.create_task(self._spawn_loop(guild))
 
     # ── Listeners ─────────────────────────────────────────────────────────────
@@ -565,6 +585,8 @@ class PokéBot(commands.Cog):
         spawn_channel_id = await self.config.guild(message.guild).spawn_channel_id()
         if not spawn_channel_id:
             return
+        # Watchdog — restart the spawn loop if it has silently died
+        self._ensure_spawn_task(message.guild)
 
         # Any message anywhere in the server triggers a pending post-flee respawn
         if message.guild.id in self._pending_respawn:
@@ -838,9 +860,15 @@ class PokéBot(commands.Cog):
             ))
             return
 
+        poke = player["pokemon"][idx]
+        if poke["stats"]["hp"] <= 0:
+            await ctx.send(embed=error_embed(
+                f"**{poke['displayName']}** has fainted and can't battle! "
+                f"Use `use revive {idx + 1}` to revive it first."
+            ))
+            return
         player["activePokemonIndex"] = idx
         await self._save_player(ctx.author, player)
-        poke = player["pokemon"][idx]
         embed = pokemon_embed(poke, f"✅ Switched to {poke['displayName']}!", show_xp=True)
         await ctx.send(embed=embed)
 
@@ -938,6 +966,16 @@ class PokéBot(commands.Cog):
         shakes     = 3 if caught else random.randint(0, 2)
         shake_text = "🔴 *shake*... " * shakes
 
+        # Wild Pokémon fights back — deals damage to the active Pokémon
+        active_poke = player["pokemon"][player["activePokemonIndex"]]
+        wild_level  = pokemon["level"]
+        scratch_dmg = max(1, random.randint(
+            math.floor(wild_level * 0.5),
+            math.floor(wild_level * 1.5)
+        ))
+        active_poke["stats"]["hp"] = max(0, active_poke["stats"]["hp"] - scratch_dmg)
+        fainted_from_catch = active_poke["stats"]["hp"] <= 0
+
         async with ctx.typing():
             await asyncio.sleep(1.5)
 
@@ -947,6 +985,8 @@ class PokéBot(commands.Cog):
             # Pokémon caught — cancel flee timer and remove from spawn cache
             self._cancel_flee_task(ctx.channel.id)
             self._spawn_cache.pop(ctx.channel.id, None)
+            # Schedule a fresh spawn after a short delay so the channel never goes dead
+            self.bot.loop.create_task(self._delayed_respawn(ctx.channel))
 
             credits_earned = 500 if pokemon.get("shiny") else (100 if pokemon["level"] >= 30 else 50)
             is_new_dex = self._update_dex(player, pokemon)
@@ -958,10 +998,15 @@ class PokéBot(commands.Cog):
                 " ✨ Shiny bonus!" if pokemon.get("shiny")
                 else (" 💪 High level bonus!" if pokemon["level"] >= 30 else "")
             )
+            hp_note = (
+                f" | ⚠️ {active_poke['displayName']} fainted! Use a Revive."
+                if fainted_from_catch
+                else f" | {active_poke['displayName']} took {scratch_dmg} dmg ({active_poke['stats']['hp']}/{active_poke['stats']['maxHp']} HP)"
+            )
             embed = pokemon_embed(
                 pokemon,
                 f"{ctx.author.display_name} caught {pokemon['displayName']}{'  ✨' if pokemon.get('shiny') else ''}!",
-                footer=f"{shake_text}Gotcha! Added to your collection.",
+                footer=f"{shake_text}Gotcha! Added to your collection.{hp_note}",
             )
             embed.color = COLORS["shiny"] if pokemon.get("shiny") else COLORS["green"]
             embed.add_field(
@@ -977,11 +1022,17 @@ class PokéBot(commands.Cog):
                     inline=True,
                 )
         else:
-            await self._save_player(ctx.author, player)
+            await self._save_player(ctx.author, player)  # saves HP damage from wild pokemon
+            hp_note = (
+                f"\n⚠️ **{active_poke['displayName']}** fainted! Use `use revive` before battling."
+                if fainted_from_catch
+                else f"\n{active_poke['displayName']} took **{scratch_dmg} damage** ({active_poke['stats']['hp']}/{active_poke['stats']['maxHp']} HP remaining)"
+            )
             embed = discord.Embed(
                 title=f"Oh no! {pokemon['displayName']} broke free!",
                 description=(
-                    f"{shake_text}💨 {pokemon['displayName']} escaped!\n\n"
+                    f"{shake_text}💨 {pokemon['displayName']} escaped!\n"
+                    f"{hp_note}\n\n"
                     f"_{BALL_NAMES[ball]}s remaining: {player['items'][ball]}_"
                 ),
                 color=COLORS["red"],
@@ -1205,6 +1256,17 @@ class PokéBot(commands.Cog):
 
         challenger_poke = player["pokemon"][player["activePokemonIndex"]]
         opp_poke        = opp_data["pokemon"][opp_data["activePokemonIndex"]]
+
+        if challenger_poke["stats"]["hp"] <= 0:
+            await ctx.send(embed=error_embed(
+                f"**{challenger_poke['displayName']}** has fainted! Heal it or switch active Pokémon before battling."
+            ))
+            return
+        if opp_poke["stats"]["hp"] <= 0:
+            await ctx.send(embed=error_embed(
+                f"{opponent.display_name}'s **{opp_poke['displayName']}** has fainted — they need to heal up first!"
+            ))
+            return
 
         embed = discord.Embed(
             title="⚔️ Battle Challenge!",
