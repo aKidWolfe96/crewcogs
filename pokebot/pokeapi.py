@@ -13,6 +13,17 @@ import aiohttp
 
 MAX_POKEMON = 1025
 
+# Some Pokémon have alternate-form IDs on PokéAPI that differ from their Pokédex number.
+# Map any problem IDs to their correct API slug so fetches don't silently fail.
+FORM_OVERRIDES: Dict[int, str] = {
+    487: "giratina-altered",   # Giratina — default form slug avoids 404s
+    646: "kyurem",             # Kyurem base form
+    641: "tornadus-incarnate", # Tornadus
+    642: "thundurus-incarnate",# Thundurus
+    645: "landorus-incarnate", # Landorus
+    900: "kleavor",            # Kleavor (sometimes returns empty sprites)
+}
+
 TYPE_CHART: Dict[str, Dict[str, float]] = {
     "normal":   {"rock": 0.5, "ghost": 0, "steel": 0.5},
     "fire":     {"fire": 0.5, "water": 0.5, "grass": 2, "ice": 2, "bug": 2, "rock": 0.5, "dragon": 0.5, "steel": 2},
@@ -50,11 +61,12 @@ async def _get(session: aiohttp.ClientSession, url: str) -> Any:
 
 
 async def fetch_pokemon(session: aiohttp.ClientSession, id_or_name) -> Dict:
+    slug = resolve_pokemon_id(id_or_name)
     if CACHE_DIR:
-        cache_file = CACHE_DIR / f"{id_or_name}.json"
+        cache_file = CACHE_DIR / f"{slug}.json"
         if cache_file.exists():
             return json.loads(cache_file.read_text())
-    data = await _get(session, f"https://pokeapi.co/api/v2/pokemon/{id_or_name}")
+    data = await _get(session, f"https://pokeapi.co/api/v2/pokemon/{slug}")
     if CACHE_DIR:
         cache_file.write_text(json.dumps(data))
     return data
@@ -75,6 +87,13 @@ def get_random_pokemon_id() -> int:
     return random.randint(1, MAX_POKEMON)
 
 
+def resolve_pokemon_id(id_or_name) -> str:
+    """Return the correct PokéAPI slug for a given ID, applying form overrides."""
+    if isinstance(id_or_name, int) and id_or_name in FORM_OVERRIDES:
+        return FORM_OVERRIDES[id_or_name]
+    return str(id_or_name)
+
+
 def is_shiny() -> bool:
     return random.random() < (1 / 512)
 
@@ -85,7 +104,8 @@ async def build_pokemon_instance(
     level: Optional[int] = None,
     force_shiny: bool = False,
 ) -> Dict:
-    raw = await fetch_pokemon(session, id_or_name)
+    slug = resolve_pokemon_id(id_or_name)
+    raw = await fetch_pokemon(session, slug)
     lvl = level if level is not None else random.randint(2, 21)
     shiny = force_shiny or is_shiny()
     types = [t["type"]["name"] for t in raw["types"]]
