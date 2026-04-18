@@ -225,12 +225,15 @@ class PokéBot(commands.Cog):
         # Default shop prices — mirrors SHOP_ITEMS prices; admins can override per-guild
         _default_shop_prices = {i["id"]: i["price"] for i in SHOP_ITEMS}
 
+        _default_tm_prices = {slug: info["price"] for slug, info in TM_LIST.items()}
+
         default_guild = {
             "spawn_channel_id": None,
             "spawn_interval":   300,
             "flee_timeout":     14400,   # seconds — default 4 hours
             "max_pokemon":      500,     # collection cap per trainer
             "shop_prices":      _default_shop_prices,
+            "tm_prices":        _default_tm_prices,
         }
         # NOTE: credits field removed — balance lives in Red's bank now.
         default_member = {
@@ -285,6 +288,12 @@ class PokéBot(commands.Cog):
         """Return the guild's current shop prices, falling back to defaults."""
         stored = await self.config.guild(guild).shop_prices()
         defaults = {i["id"]: i["price"] for i in SHOP_ITEMS}
+        return {**defaults, **stored}
+
+    async def _get_tm_prices(self, guild: discord.Guild) -> dict:
+        """Return the guild's current TM prices, falling back to defaults."""
+        stored = await self.config.guild(guild).tm_prices()
+        defaults = {slug: info["price"] for slug, info in TM_LIST.items()}
         return {**defaults, **stored}
 
 
@@ -734,6 +743,71 @@ class PokéBot(commands.Cog):
         )
         embed.set_footer(text="Use `pokeset setprice <item> <price>` to change · `pokeset resetprices` to reset all")
         await ctx.send(embed=embed)
+
+    @pokeset.command(name="settmprice")
+    async def pokeset_settmprice(self, ctx: commands.Context, tm: str, price: int) -> None:
+        """Set a custom price for a TM. Usage: `pokeset settmprice <tm_slug> <price>`
+        Example: `pokeset settmprice flamethrower 2000`
+        Use `showtmprices` to see all TM slugs."""
+        slug = tm.lower().strip()
+        # Accept both slug and display name
+        tm_info = TM_LIST.get(slug) or next(
+            (info for s, info in TM_LIST.items() if info["name"].lower() == slug or s == slug),
+            None,
+        )
+        if not tm_info:
+            # Re-resolve slug from display name match
+            slug = next(
+                (s for s, info in TM_LIST.items() if info["name"].lower() == tm.lower()),
+                None,
+            )
+            if slug:
+                tm_info = TM_LIST[slug]
+        if not tm_info or not slug:
+            await ctx.send(embed=error_embed(
+                f"Unknown TM **{tm}**. Use `pokeset showtmprices` to see valid TM slugs."
+            ))
+            return
+        price = max(1, price)
+        tm_prices = await self._get_tm_prices(ctx.guild)
+        tm_prices[slug] = price
+        await self.config.guild(ctx.guild).tm_prices.set(tm_prices)
+        emoji = TM_TYPE_EMOJI.get(tm_info["type"], "💿")
+        currency = await _currency_name(ctx.guild)
+        await ctx.send(embed=success_embed(
+            f"Price for {emoji} **TM {tm_info['name']}** set to **{price}** {currency}."
+        ))
+
+    @pokeset.command(name="resettmprices")
+    async def pokeset_resettmprices(self, ctx: commands.Context) -> None:
+        """Reset all TM prices back to their defaults."""
+        defaults = {slug: info["price"] for slug, info in TM_LIST.items()}
+        await self.config.guild(ctx.guild).tm_prices.set(defaults)
+        await ctx.send(embed=success_embed("All TM prices have been reset to defaults."))
+
+    @pokeset.command(name="showtmprices")
+    async def pokeset_showtmprices(self, ctx: commands.Context) -> None:
+        """Show current TM prices for this server."""
+        tm_prices = await self._get_tm_prices(ctx.guild)
+        defaults  = {slug: info["price"] for slug, info in TM_LIST.items()}
+        currency  = await _currency_name(ctx.guild)
+        lines = []
+        for slug, info in TM_LIST.items():
+            emoji    = TM_TYPE_EMOJI.get(info["type"], "💿")
+            current  = tm_prices.get(slug, info["price"])
+            modified = " ✏️" if current != defaults[slug] else ""
+            lines.append(f"{emoji} **{info['name']}** (`{slug}`) — {current} {currency}{modified}")
+        # Split into pages of 10 to avoid embed length limits
+        page_size = 10
+        pages = [lines[i:i+page_size] for i in range(0, len(lines), page_size)]
+        for idx, page in enumerate(pages, 1):
+            embed = discord.Embed(
+                title=f"💿 TM Prices ({idx}/{len(pages)})",
+                description="\n".join(page) + "\n\n_✏️ = modified from default_",
+                color=COLORS["blue"],
+            )
+            embed.set_footer(text="Use `pokeset settmprice <slug> <price>` to change · `pokeset resettmprices` to reset all")
+            await ctx.send(embed=embed)
 
     @commands.command(name="pokespawn")
     @checks.admin_or_permissions(manage_guild=True)
@@ -2034,6 +2108,7 @@ class PokéBot(commands.Cog):
         currency  = await _currency_name(ctx.guild)
         balance   = await _get_balance(ctx.author)
         owned_tms = player.get("items", {}).get("tms", [])
+        tm_prices = await self._get_tm_prices(ctx.guild)
 
         all_tms   = list(TM_LIST.items())
         per_page  = 8
@@ -2053,8 +2128,9 @@ class PokéBot(commands.Cog):
         for slug, info in chunk:
             owned_tag = " ✅ **Owned**" if slug in owned_tms else ""
             emoji     = TM_TYPE_EMOJI.get(info["type"], "💿")
+            price     = tm_prices.get(slug, info["price"])
             embed.add_field(
-                name=f"{emoji} **{info['name']}** — {info['price']} {currency}{owned_tag}",
+                name=f"{emoji} **{info['name']}** — {price} {currency}{owned_tag}",
                 value=f"_{info['desc']}_  ·  Type: {info['type'].capitalize()}  ·  `{slug}`",
                 inline=False,
             )
@@ -2089,13 +2165,15 @@ class PokéBot(commands.Cog):
                 return
 
         currency = await _currency_name(ctx.guild)
+        tm_prices = await self._get_tm_prices(ctx.guild)
+        price = tm_prices.get(slug, tm_info["price"])
 
         # TMs are single-use consumables — allow buying duplicates (one per use)
-        success = await _withdraw(ctx.author, tm_info["price"])
+        success = await _withdraw(ctx.author, price)
         if not success:
             balance = await _get_balance(ctx.author)
             await ctx.send(embed=error_embed(
-                f"You need **{tm_info['price']} {currency}** for TM {tm_info['name']} "
+                f"You need **{price} {currency}** for TM {tm_info['name']} "
                 f"but only have **{balance}**."
             ))
             return
