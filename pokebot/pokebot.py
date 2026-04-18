@@ -97,32 +97,45 @@ ITEM_NAMES   = {"potion": "🧪 Potion", "superpotion": "💊 Super Potion", "ma
 BALL_NAMES   = {"pokeball": "Poké Ball", "greatball": "Great Ball", "ultraball": "Ultra Ball"}
 
 # TM list — move name (PokéAPI slug) mapped to display info and price
+# Prices are tiered 300–1000 by move power/utility (least → best):
+#   300  — Basic utility moves
+#   450  — Solid mid-tier moves
+#   600  — Strong standard moves
+#   750  — Premium coverage moves
+#   900  — High-power moves
+#  1000  — Top-tier / signature moves
 TM_LIST: Dict[str, dict] = {
-    "flamethrower":     {"name": "Flamethrower",     "type": "fire",     "price": 3000,  "desc": "A powerful Fire-type blast."},
-    "ice-beam":         {"name": "Ice Beam",          "type": "ice",      "price": 3000,  "desc": "An icy beam that may freeze."},
-    "thunderbolt":      {"name": "Thunderbolt",       "type": "electric", "price": 3000,  "desc": "A strong electric attack."},
-    "earthquake":       {"name": "Earthquake",        "type": "ground",   "price": 4000,  "desc": "Shakes the ground for big damage."},
-    "psychic":          {"name": "Psychic",           "type": "psychic",  "price": 3500,  "desc": "A strong psychic attack."},
-    "surf":             {"name": "Surf",              "type": "water",    "price": 3000,  "desc": "A surging wave attack."},
-    "shadow-ball":      {"name": "Shadow Ball",       "type": "ghost",    "price": 3000,  "desc": "A shadowy blob that may lower Sp. Def."},
-    "energy-ball":      {"name": "Energy Ball",       "type": "grass",    "price": 3000,  "desc": "Fires a green orb of nature energy."},
-    "dragon-pulse":     {"name": "Dragon Pulse",      "type": "dragon",   "price": 3500,  "desc": "A shock wave of pure draconic energy."},
-    "focus-blast":      {"name": "Focus Blast",       "type": "fighting", "price": 4000,  "desc": "A powerful, fully focused punch."},
-    "sludge-bomb":      {"name": "Sludge Bomb",       "type": "poison",   "price": 3000,  "desc": "Hurls toxic sludge at the target."},
-    "rock-slide":       {"name": "Rock Slide",        "type": "rock",     "price": 2500,  "desc": "Large rocks are hurled at the foe."},
-    "iron-head":        {"name": "Iron Head",         "type": "steel",    "price": 3000,  "desc": "Slams with a steel-hard head."},
-    "x-scissor":        {"name": "X-Scissor",         "type": "bug",      "price": 2500,  "desc": "Slashes with crossed scythes."},
-    "aerial-ace":       {"name": "Aerial Ace",        "type": "flying",   "price": 2000,  "desc": "An incredibly fast and accurate attack."},
-    "brick-break":      {"name": "Brick Break",       "type": "fighting", "price": 2500,  "desc": "A chop that smashes barriers."},
-    "dark-pulse":       {"name": "Dark Pulse",        "type": "dark",     "price": 3000,  "desc": "Emanates a horrible aura of fear."},
-    "dazzling-gleam":   {"name": "Dazzling Gleam",    "type": "fairy",    "price": 3000,  "desc": "Dazes the foe with a powerful flash."},
-    "flash-cannon":     {"name": "Flash Cannon",      "type": "steel",    "price": 3000,  "desc": "Fires a beam of light energy."},
-    "giga-drain":       {"name": "Giga Drain",        "type": "grass",    "price": 2500,  "desc": "Drains HP from the foe."},
-    "hyper-beam":       {"name": "Hyper Beam",        "type": "normal",   "price": 5000,  "desc": "The strongest Normal-type attack."},
-    "blizzard":         {"name": "Blizzard",          "type": "ice",      "price": 4500,  "desc": "A howling blizzard that may freeze."},
-    "fire-blast":       {"name": "Fire Blast",        "type": "fire",     "price": 4500,  "desc": "An inferno that may burn."},
-    "thunder":          {"name": "Thunder",           "type": "electric", "price": 4500,  "desc": "A huge lightning bolt."},
-    "solar-beam":       {"name": "Solar Beam",        "type": "grass",    "price": 4500,  "desc": "A two-turn beam of solar energy."},
+    # ── 300 — Basic ───────────────────────────────────────────────────────────
+    "aerial-ace":       {"name": "Aerial Ace",        "type": "flying",   "price": 300,   "desc": "An incredibly fast and accurate attack."},
+    "brick-break":      {"name": "Brick Break",       "type": "fighting", "price": 300,   "desc": "A chop that smashes barriers."},
+    "x-scissor":        {"name": "X-Scissor",         "type": "bug",      "price": 300,   "desc": "Slashes with crossed scythes."},
+    "rock-slide":       {"name": "Rock Slide",        "type": "rock",     "price": 300,   "desc": "Large rocks are hurled at the foe."},
+    "giga-drain":       {"name": "Giga Drain",        "type": "grass",    "price": 300,   "desc": "Drains HP from the foe."},
+    # ── 450 — Mid-tier ────────────────────────────────────────────────────────
+    "sludge-bomb":      {"name": "Sludge Bomb",       "type": "poison",   "price": 450,   "desc": "Hurls toxic sludge at the target."},
+    "energy-ball":      {"name": "Energy Ball",       "type": "grass",    "price": 450,   "desc": "Fires a green orb of nature energy."},
+    "surf":             {"name": "Surf",              "type": "water",    "price": 450,   "desc": "A surging wave attack."},
+    "shadow-ball":      {"name": "Shadow Ball",       "type": "ghost",    "price": 450,   "desc": "A shadowy blob that may lower Sp. Def."},
+    "dark-pulse":       {"name": "Dark Pulse",        "type": "dark",     "price": 450,   "desc": "Emanates a horrible aura of fear."},
+    "dazzling-gleam":   {"name": "Dazzling Gleam",    "type": "fairy",    "price": 450,   "desc": "Dazes the foe with a powerful flash."},
+    "flash-cannon":     {"name": "Flash Cannon",      "type": "steel",    "price": 450,   "desc": "Fires a beam of light energy."},
+    "iron-head":        {"name": "Iron Head",         "type": "steel",    "price": 450,   "desc": "Slams with a steel-hard head."},
+    # ── 600 — Strong ──────────────────────────────────────────────────────────
+    "flamethrower":     {"name": "Flamethrower",      "type": "fire",     "price": 600,   "desc": "A powerful Fire-type blast."},
+    "ice-beam":         {"name": "Ice Beam",          "type": "ice",      "price": 600,   "desc": "An icy beam that may freeze."},
+    "thunderbolt":      {"name": "Thunderbolt",       "type": "electric", "price": 600,   "desc": "A strong electric attack."},
+    "psychic":          {"name": "Psychic",           "type": "psychic",  "price": 600,   "desc": "A strong psychic attack."},
+    "dragon-pulse":     {"name": "Dragon Pulse",      "type": "dragon",   "price": 600,   "desc": "A shock wave of pure draconic energy."},
+    # ── 750 — Premium ─────────────────────────────────────────────────────────
+    "focus-blast":      {"name": "Focus Blast",       "type": "fighting", "price": 750,   "desc": "A powerful, fully focused punch."},
+    "earthquake":       {"name": "Earthquake",        "type": "ground",   "price": 750,   "desc": "Shakes the ground for big damage."},
+    # ── 900 — High-power ──────────────────────────────────────────────────────
+    "blizzard":         {"name": "Blizzard",          "type": "ice",      "price": 900,   "desc": "A howling blizzard that may freeze."},
+    "fire-blast":       {"name": "Fire Blast",        "type": "fire",     "price": 900,   "desc": "An inferno that may burn."},
+    "thunder":          {"name": "Thunder",           "type": "electric", "price": 900,   "desc": "A huge lightning bolt."},
+    "solar-beam":       {"name": "Solar Beam",        "type": "grass",    "price": 900,   "desc": "A two-turn beam of solar energy."},
+    # ── 1000 — Top-tier ───────────────────────────────────────────────────────
+    "hyper-beam":       {"name": "Hyper Beam",        "type": "normal",   "price": 1000,  "desc": "The strongest Normal-type attack."},
 }
 
 TM_TYPE_EMOJI: Dict[str, str] = {
