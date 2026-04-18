@@ -49,7 +49,7 @@ from .embeds import (
 from .pokeapi import (
     MAX_POKEMON, build_pokemon_instance, calculate_type_effectiveness,
     catch_rate, effectiveness_label, fetch_move_data, fetch_pokemon,
-    get_random_pokemon_id, set_cache_dir,
+    get_random_pokemon_id, resolve_pokemon_id, set_cache_dir,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -513,7 +513,8 @@ class PokéBot(commands.Cog):
         pokemon_id = get_random_pokemon_id()
         try:
             pokemon = await build_pokemon_instance(self._session, pokemon_id)
-        except Exception:
+        except Exception as exc:
+            log.warning(f"[PokéBot] Failed to fetch Pokémon ID {pokemon_id}: {exc}")
             return
 
         spawn_id = str(uuid.uuid4())
