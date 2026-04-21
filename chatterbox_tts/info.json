@@ -1,0 +1,10 @@
+{
+  "author": ["aKidWolfe"],
+  "name": "ChatterboxTTS",
+  "description": "Sends text to a local Chatterbox TTS server and plays it in your voice channel. Pauses and resumes Red's Audio cog automatically.",
+  "install_msg": "Use `[p]tts <message>` while in a voice channel. Make sure your Chatterbox server is running at 192.168.1.227:8000.",
+  "requirements": [],
+  "tags": ["tts", "voice", "audio", "chatterbox"],
+  "hidden": false,
+  "type": "COG"
+}
