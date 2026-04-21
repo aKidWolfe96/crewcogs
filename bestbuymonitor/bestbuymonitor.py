@@ -84,33 +84,52 @@ async def fetch_product(session: aiohttp.ClientSession, sku: str) -> dict | None
     except Exception:
         return None
 
-async def fetch_product_name(session: aiohttp.ClientSession, sku: str) -> str:
-    """Scrape the product name from the Best Buy product page."""
+async def fetch_product_info(session: aiohttp.ClientSession, sku: str) -> tuple:
+    """
+    Scrape the product name and image URL from the Best Buy product page.
+    Returns (name, image_url) -- image_url may be None if not found.
+    """
+    name = f"SKU {sku}"
+    image_url = None
+
+    # Best Buy CDN image URL pattern
+    cdn_image = f"https://pisces.bbystatic.com/image2/BestBuy_US/images/products/{sku[:4]}/{sku}_sd.jpg"
+
     url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
     try:
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             text = await resp.text()
-            match = re.search(r'"name"\s*:\s*"([^"]{5,})"', text)
-            if match:
-                return match.group(1)
+            name_match = re.search(r'"name"\s*:\s*"([^"]{5,})"', text)
+            if name_match:
+                name = name_match.group(1)
+            img_match = re.search(r'"href"\s*:\s*"(https://pisces\.bbystatic\.com[^"]+)"', text)
+            if img_match:
+                image_url = img_match.group(1)
     except Exception:
         pass
-    return f"SKU {sku}"
 
-def build_alert_embed(name: str, sku: str, status: str, url: str) -> discord.Embed:
+    if not image_url:
+        image_url = cdn_image
+
+    return name, image_url
+
+
+def build_alert_embed(name, sku, status, url, image_url=None):
     in_stock = status.lower() in ("add_to_cart", "available", "purchasable")
     color = discord.Color.green() if in_stock else discord.Color.red()
-    emoji = "🟢" if in_stock else "🔴"
+    emoji = "\U0001f7e2" if in_stock else "\U0001f534"
     embed = discord.Embed(
         title=f"{emoji} Best Buy Restock Alert",
         description=f"**[{name}]({url})**",
         color=color,
         timestamp=datetime.utcnow(),
     )
-    embed.add_field(name="Status", value="✅ In Stock — Buy Now!" if in_stock else "❌ Out of Stock", inline=True)
+    embed.add_field(name="Status", value="\u2705 In Stock \u2014 Buy Now!" if in_stock else "\u274c Out of Stock", inline=True)
     embed.add_field(name="SKU", value=sku, inline=True)
     embed.add_field(name="Link", value=f"[Open on Best Buy]({url})", inline=False)
-    embed.set_footer(text="Best Buy Monitor • bestbuy.com")
+    embed.set_footer(text="Best Buy Monitor \u2022 bestbuy.com")
+    if image_url:
+        embed.set_thumbnail(url=image_url)
     return embed
 
 
@@ -199,7 +218,8 @@ class BestBuyMonitor(commands.Cog):
 
         if just_restocked:
             ping = self._build_ping(channel.guild, ping_target)
-            embed = build_alert_embed(name, sku, current_status, url)
+            image_url = info.get("image_url")
+            embed = build_alert_embed(name, sku, current_status, url, image_url)
             try:
                 await channel.send(content=ping, embed=embed)
             except discord.Forbidden:
@@ -300,7 +320,7 @@ class BestBuyMonitor(commands.Cog):
 
         async with ctx.typing():
             msg = await ctx.send(f"🔍 Looking up SKU `{sku}`...")
-            name = await fetch_product_name(self._session, sku)
+            name, image_url = await fetch_product_info(self._session, sku)
             btn = await fetch_product(self._session, sku)
 
         raw = json.dumps(btn) if btn else ""
@@ -311,20 +331,23 @@ class BestBuyMonitor(commands.Cog):
             products[sku] = {
                 "url": url,
                 "name": name,
+                "image_url": image_url,
                 "last_status": current_status,
             }
 
         in_stock = current_status in {"ADD_TO_CART", "PURCHASABLE", "AVAILABLE"}
-        status_str = "✅ Currently IN STOCK" if in_stock else "❌ Currently out of stock"
+        status_str = "\u2705 Currently IN STOCK" if in_stock else "\u274c Currently out of stock"
 
         embed = discord.Embed(
-            title="📦 Product Added to Monitor",
+            title="\U0001f4e6 Product Added to Monitor",
             description=f"**[{name}]({url})**",
             color=discord.Color.blue(),
         )
         embed.add_field(name="SKU", value=sku, inline=True)
         embed.add_field(name="Current Status", value=status_str, inline=True)
         embed.set_footer(text="You'll be alerted when this item restocks.")
+        if image_url:
+            embed.set_thumbnail(url=image_url)
         await msg.edit(content=None, embed=embed)
 
     # --- Remove product ---
