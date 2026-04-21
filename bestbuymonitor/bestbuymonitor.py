@@ -17,9 +17,31 @@ HEADERS = {
 }
 
 def extract_sku(url: str) -> str | None:
-    """Pull the SKU from a Best Buy product URL."""
-    match = re.search(r"/(\d{7,})/", url)
-    return match.group(1) if match else None
+    """Pull the SKU from a Best Buy product URL.
+
+    Handles multiple formats:
+    - /site/product-name/1234567.p        (standard)
+    - /site/product-name/1234567.p?...    (with query string)
+    - /sku/1234567                        (sku/ path)
+    - /product/product-name/SKU/1234567  (product/ path)
+    - bare SKU passed directly            (just digits)
+    """
+    # If it's just a plain number, use it directly
+    if re.fullmatch(r"\d{6,}", url.strip()):
+        return url.strip()
+
+    patterns = [
+        r"/sku/(\d{6,})",           # /sku/12513873
+        r"/(\d{6,})\.p",            # /1234567.p
+        r"/(\d{6,})\?",             # /1234567?...
+        r"/(\d{6,})$",              # ends with digits
+        r"[=/](\d{6,})",            # fallback: = or / followed by digits
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
 
 async def fetch_product(session: aiohttp.ClientSession, sku: str) -> dict | None:
     """
