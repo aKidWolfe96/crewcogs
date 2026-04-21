@@ -3,8 +3,21 @@ import aiohttp
 import asyncio
 import tempfile
 import os
-from redbot.core import commands
+from redbot.core import commands, Config
 from redbot.core.bot import Red
+
+CONFIG = Config.get_conf(None, identifier=5544332211)
+CONFIG.register_guild(voice_id="Ryan.wav")
+
+VOICES = [
+    "Abigail.wav", "Adrian.wav", "Alexander.wav", "Alice.wav",
+    "Austin.wav", "Axel.wav", "Connor.wav", "Cora.wav",
+    "Elena.wav", "Eli.wav", "Emily.wav", "Everett.wav",
+    "Gabriel.wav", "Gianna.wav", "Henry.wav", "Ian.wav",
+    "Jade.wav", "Jeremiah.wav", "Jordan.wav", "Julian.wav",
+    "Layla.wav", "Leonardo.wav", "Michael.wav", "Miles.wav",
+    "Olivia.wav", "Ryan.wav", "Taylor.wav", "Thomas.wav"
+]
 
 
 class ChatterboxTTS(commands.Cog):
@@ -34,6 +47,25 @@ class ChatterboxTTS(commands.Cog):
 
         if guild_id not in self._workers or self._workers[guild_id].done():
             self._workers[guild_id] = asyncio.create_task(self._worker(guild_id))
+
+    @commands.command()
+    @commands.guild_only()
+    async def ttsvoice(self, ctx, *, voice: str = None):
+        """Set or check the TTS voice. Use [p]ttsvoice list to see all options."""
+        if voice is None or voice.lower() == "list":
+            names = ", ".join(v.replace(".wav", "") for v in VOICES)
+            return await ctx.send(f"**Available voices:**\n{names}\n\nUse `[p]ttsvoice <name>` to set one.")
+
+        # Accept with or without .wav
+        filename = voice if voice.endswith(".wav") else voice + ".wav"
+
+        # Case-insensitive match
+        match = next((v for v in VOICES if v.lower() == filename.lower()), None)
+        if not match:
+            return await ctx.send(f"Voice `{voice}` not found. Use `[p]ttsvoice list` to see all options.")
+
+        await CONFIG.guild(ctx.guild).voice_id.set(match)
+        await ctx.send(f"TTS voice set to **{match.replace('.wav', '')}**.")
 
     async def _worker(self, guild_id):
         queue = self._tts_queue[guild_id]
@@ -92,7 +124,7 @@ class ChatterboxTTS(commands.Cog):
             await asyncio.sleep(0.3)
 
         vc = await channel.connect()
-        audio_path = await self._fetch_tts(text)
+        audio_path = await self._fetch_tts(ctx, text)
 
         done_event = asyncio.Event()
 
@@ -117,8 +149,13 @@ class ChatterboxTTS(commands.Cog):
         if audio_was_paused:
             await self._resume_audio(ctx, channel)
 
-    async def _fetch_tts(self, text):
-        payload = {"text": text}
+    async def _fetch_tts(self, ctx, text):
+        voice_id = await CONFIG.guild(ctx.guild).voice_id()
+        payload = {
+            "text": text,
+            "voice_mode": "predefined",
+            "predefined_voice_id": voice_id
+        }
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 self.CHATTERBOX_URL,
