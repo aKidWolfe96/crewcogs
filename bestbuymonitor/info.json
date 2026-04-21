@@ -1,0 +1,14 @@
+{
+    "name": "BestBuyMonitor",
+    "short": "Monitor Best Buy products for restock alerts",
+    "description": "Tracks Best Buy product pages and posts to a Discord channel when items come back in stock. Supports configurable alert channel, ping target (everyone/here/role), check interval, and per-product watchlists.",
+    "end_user_data_statement": "This cog stores Best Buy product URLs, SKUs, and stock status per guild.",
+    "author": ["you"],
+    "install_msg": "Thanks for installing BestBuyMonitor!\n\nGet started:\n1. `[p]bbm setchannel #your-channel`\n2. `[p]bbm setping everyone` (or a role, or none)\n3. `[p]bbm add <bestbuy product url>`\n\nType `[p]bbm` for all commands.",
+    "requirements": ["aiohttp"],
+    "tags": ["bestbuy", "restock", "monitor", "pokemon", "stock", "alert"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
