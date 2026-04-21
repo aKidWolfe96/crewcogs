@@ -160,7 +160,7 @@ class ChatterboxTTS(commands.Cog):
             async with session.post(
                 self.CHATTERBOX_URL,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=300),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
