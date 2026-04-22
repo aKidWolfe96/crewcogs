@@ -494,6 +494,16 @@ class BestBuyMonitor(commands.Cog):
 
         results = []
 
+        import traceback
+        import ssl
+
+        # Test 0: basic connectivity
+        try:
+            async with self._session.get("https://httpbin.org/get", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                results.append(f"**Basic connectivity (httpbin)**\nStatus: `{resp.status}` — session is working")
+        except Exception as e:
+            results.append(f"**Basic connectivity (httpbin)**\nFailed: `{type(e).__name__}: {e}`\n```{traceback.format_exc()[-300:]}```")
+
         # Test 1: tcfb endpoint
         try:
             paths = [[
@@ -511,25 +521,28 @@ class BestBuyMonitor(commands.Cog):
             url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
             async with self._session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 text = await resp.text()
-                results.append(f"**tcfb endpoint**\nStatus: `{resp.status}`\nBody: ```{text[:300]}```")
+                results.append(f"**tcfb endpoint**\nStatus: `{resp.status}`\nBody: ```{text[:400]}```")
         except Exception as e:
-            results.append(f"**tcfb endpoint**\nException: `{e}`")
+            results.append(f"**tcfb endpoint**\nFailed: `{type(e).__name__}: {e}`\n```{traceback.format_exc()[-400:]}```")
 
-        # Test 2: product page
+        # Test 2: product page with ssl=False fallback
         try:
             page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
-            async with self._session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            async with self._session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), ssl=ssl_ctx) as resp:
                 text = await resp.text()
                 btn_matches = re.findall(r'"buttonState"\s*:\s*"([^"]+)"', text)
                 results.append(
-                    f"**Product page scrape**\n"
+                    f"**Product page (ssl relaxed)**\n"
                     f"Status: `{resp.status}`\n"
                     f"Page length: `{len(text)} chars`\n"
                     f"buttonState matches: `{btn_matches[:5] if btn_matches else 'none found'}`\n"
-                    f"First 200 chars: ```{text[:200]}```"
+                    f"First 300 chars:\n```{text[:300]}```"
                 )
         except Exception as e:
-            results.append(f"**Product page scrape**\nException: `{e}`")
+            results.append(f"**Product page (ssl relaxed)**\nFailed: `{type(e).__name__}: {e}`\n```{traceback.format_exc()[-400:]}```")
 
         for chunk in results:
-            await ctx.send(chunk[:1900])
+            await ctx.send(chunk[:1990])
