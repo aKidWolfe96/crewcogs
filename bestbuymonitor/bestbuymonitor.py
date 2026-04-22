@@ -63,81 +63,84 @@ REQUESTS_HEADERS = {
 }
 
 
-def _sync_fetch_status(sku: str) -> str:
+def _sync_fetch_status(sku: str) -> dict:
     """
-    Synchronous Best Buy stock check using requests.
-    Runs in a thread executor to avoid blocking the event loop.
-    Uses a session with cookies to mimic a real browser visit.
+    Synchronous Best Buy stock + price check using requests.
+    Returns dict with keys: status, price
     """
     import urllib.parse
 
     session = requests.Session()
     session.headers.update(REQUESTS_HEADERS)
 
-    # Step 1: Hit homepage to get session cookies like a real browser
-    try:
-        session.get("https://www.bestbuy.com/", timeout=15, verify=True)
-    except Exception:
-        pass
+    status = "UNKNOWN"
+    price = None
 
-    # Step 2: Try the tcfb buttonstate endpoint
-    try:
-        paths = json.dumps([[
-            "shop", "buttonstate", "v5", "item", "skus",
-            int(sku), "conditions", "NONE",
-            "destinationZipCode", "55423",
-            "storeId", " ",
-            "context", "cyp",
-            "addAll", "false"
-        ]])
-        params = urllib.parse.urlencode({"paths": paths, "method": "get"})
-        url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
-        resp = session.get(url, timeout=15, headers={**REQUESTS_HEADERS, "Accept": "application/json"})
-        if resp.status_code == 200:
-            data = resp.json()
-            skus_node = (
-                data.get("jsonGraph", {})
-                .get("shop", {})
-                .get("buttonstate", {})
-                .get("v5", {})
-                .get("item", {})
-                .get("skus", {})
-            )
-            sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
-            raw = str(sku_node)
-            match = re.search(r"buttonState[^:]*:[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
-            if match:
-                return match.group(1).upper()
-    except Exception:
-        pass
-
-    # Step 3: Fallback — scrape the product search page
     try:
         page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
-        resp = session.get(page_url, timeout=20)
+        resp = session.get(page_url, timeout=45)
         text = resp.text
+
+        # Extract status
         if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
-            return "ADD_TO_CART"
-        if '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
-            return "SOLD_OUT"
-        if '"buttonState":"COMING_SOON"' in text:
-            return "COMING_SOON"
-        if '"buttonState":"PRE_ORDER"' in text:
-            return "PRE_ORDER"
-        match = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
-        if match:
-            return match.group(1).upper()
-        if 'data-button-state="ADD_TO_CART"' in text:
-            return "ADD_TO_CART"
-        if 'data-button-state="SOLD_OUT"' in text:
-            return "SOLD_OUT"
+            status = "ADD_TO_CART"
+        elif '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
+            status = "SOLD_OUT"
+        elif '"buttonState":"COMING_SOON"' in text:
+            status = "COMING_SOON"
+        elif '"buttonState":"PRE_ORDER"' in text:
+            status = "PRE_ORDER"
+        else:
+            m = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
+            if m:
+                status = m.group(1).upper()
+            elif 'data-button-state="ADD_TO_CART"' in text:
+                status = "ADD_TO_CART"
+            elif 'data-button-state="SOLD_OUT"' in text:
+                status = "SOLD_OUT"
+
+        # Extract price
+        price_match = re.search(r'"currentPrice"\s*:\s*([0-9]+\.?[0-9]*)', text)
+        if price_match:
+            price = float(price_match.group(1))
+        if price is None:
+            price_match = re.search(r'"salePrice"\s*:\s*([0-9]+\.?[0-9]*)', text)
+            if price_match:
+                price = float(price_match.group(1))
     except Exception:
         pass
 
-    return "UNKNOWN"
+    # Fallback: tcfb endpoint for status only
+    if status == "UNKNOWN":
+        try:
+            paths = json.dumps([[
+                "shop", "buttonstate", "v5", "item", "skus",
+                int(sku), "conditions", "NONE",
+                "destinationZipCode", "55423",
+                "storeId", " ", "context", "cyp", "addAll", "false"
+            ]])
+            params = urllib.parse.urlencode({"paths": paths, "method": "get"})
+            url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
+            resp = session.get(url, timeout=45, headers={**REQUESTS_HEADERS, "Accept": "application/json"})
+            if resp.status_code == 200:
+                data = resp.json()
+                skus_node = (
+                    data.get("jsonGraph", {})
+                    .get("shop", {}).get("buttonstate", {})
+                    .get("v5", {}).get("item", {}).get("skus", {})
+                )
+                sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
+                raw = str(sku_node)
+                m = re.search(r"buttonState[^:]*:[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
+                if m:
+                    status = m.group(1).upper()
+        except Exception:
+            pass
+
+    return {"status": status, "price": price}
 
 
-async def fetch_product(sku: str) -> str:
+async def fetch_product(sku: str) -> dict:
     """Async wrapper — runs the sync requests call in a thread executor."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, functools.partial(_sync_fetch_status, sku))
@@ -202,7 +205,7 @@ async def fetch_product_info(sku: str) -> tuple:
     return name, image_url
 
 
-def build_alert_embed(name, sku, status, url, image_url=None):
+def build_alert_embed(name, sku, status, url, image_url=None, price=None):
     in_stock = status.lower() in ("add_to_cart", "available", "purchasable")
     color = discord.Color.green() if in_stock else discord.Color.red()
     emoji = "\U0001f7e2" if in_stock else "\U0001f534"
@@ -213,6 +216,7 @@ def build_alert_embed(name, sku, status, url, image_url=None):
         timestamp=datetime.utcnow(),
     )
     embed.add_field(name="Status", value="\u2705 In Stock \u2014 Buy Now!" if in_stock else "\u274c Out of Stock", inline=True)
+    embed.add_field(name="Price", value=f"${price:.2f}" if price else "N/A", inline=True)
     embed.add_field(name="SKU", value=sku, inline=True)
     embed.add_field(name="Link", value=f"[Open on Best Buy]({url})", inline=False)
     embed.set_footer(text="Best Buy Monitor \u2022 bestbuy.com")
@@ -277,9 +281,9 @@ class BestBuyMonitor(commands.Cog):
                 await asyncio.sleep(2)  # small delay between SKU checks
 
     async def _check_product(self, guild_id, channel, sku, info, ping_target):
-        current_status = await fetch_product(sku)
-        if not current_status:
-            current_status = "UNKNOWN"
+        result = await fetch_product(sku)
+        current_status = result.get("status", "UNKNOWN")
+        current_price = result.get("price")
 
         last_status = info.get("last_status", "")
         url = info.get("url", f"https://www.bestbuy.com/site/{sku}.p")
@@ -296,7 +300,7 @@ class BestBuyMonitor(commands.Cog):
         if just_restocked:
             ping = self._build_ping(channel.guild, ping_target)
             image_url = info.get("image_url")
-            embed = build_alert_embed(name, sku, current_status, url, image_url)
+            embed = build_alert_embed(name, sku, current_status, url, image_url, current_price)
             try:
                 await channel.send(content=ping, embed=embed)
             except discord.Forbidden:
@@ -306,6 +310,8 @@ class BestBuyMonitor(commands.Cog):
         async with self.config.guild_from_id(guild_id).products() as p:
             if sku in p:
                 p[sku]["last_status"] = current_status
+                if current_price is not None:
+                    p[sku]["last_price"] = current_price
 
     def _build_ping(self, guild: discord.Guild, ping_target) -> str | None:
         if ping_target is None:
@@ -398,7 +404,9 @@ class BestBuyMonitor(commands.Cog):
         async with ctx.typing():
             msg = await ctx.send(f"🔍 Looking up SKU `{sku}`...")
             name, image_url = await fetch_product_info(sku)
-            current_status = await fetch_product(sku)
+            result = await fetch_product(sku)
+            current_status = result.get("status", "UNKNOWN")
+            current_price = result.get("price")
 
         async with self.config.guild(ctx.guild).products() as products:
             products[sku] = {
@@ -406,6 +414,7 @@ class BestBuyMonitor(commands.Cog):
                 "name": name,
                 "image_url": image_url,
                 "last_status": current_status,
+                "last_price": current_price,
             }
 
         in_stock = current_status in {"ADD_TO_CART", "PURCHASABLE", "AVAILABLE"}
@@ -489,27 +498,49 @@ class BestBuyMonitor(commands.Cog):
         if not products:
             return await ctx.send("No products being monitored.")
 
-        msg = await ctx.send(f"🔄 Checking {len(products)} product(s)...")
-        results = []
+        await ctx.send(f"🔄 Checking {len(products)} product(s)...")
         for sku, info in products.items():
-            status = await fetch_product(sku)
+            result = await fetch_product(sku)
+            status = result.get("status", "UNKNOWN")
+            price = result.get("price") or info.get("last_price")
+            name = info.get("name", f"SKU {sku}")
+            url = info.get("url", f"https://www.bestbuy.com/site/{sku}.p")
+            image_url = info.get("image_url")
             in_stock = status in {"ADD_TO_CART", "PURCHASABLE", "AVAILABLE"}
-            emoji = "🟢" if in_stock else "🔴"
-            name = info.get("name", sku)
-            results.append(f"{emoji} **{name}** — `{status}`")
 
             async with self.config.guild(ctx.guild).products() as p:
                 if sku in p:
                     p[sku]["last_status"] = status
-            await asyncio.sleep(1)
+                    if price is not None:
+                        p[sku]["last_price"] = price
 
-        embed = discord.Embed(
-            title="📊 Manual Stock Check Results",
-            description="\n".join(results),
-            color=discord.Color.blue(),
-            timestamp=datetime.utcnow(),
-        )
-        await msg.edit(content=None, embed=embed)
+            color = discord.Color.green() if in_stock else discord.Color.red()
+            emoji = "\U0001f7e2" if in_stock else "\U0001f534"
+            status_str = "\u2705 In Stock" if in_stock else "\u274c Out of Stock"
+            if status == "COMING_SOON":
+                status_str = "\U0001f551 Coming Soon"
+                color = discord.Color.orange()
+                emoji = "\U0001f7e0"
+            elif status == "PRE_ORDER":
+                status_str = "\U0001f4e6 Pre-Order"
+                color = discord.Color.blurple()
+                emoji = "\U0001f7e3"
+
+            embed = discord.Embed(
+                title=f"{emoji} {name}",
+                url=url,
+                color=color,
+                timestamp=datetime.utcnow(),
+            )
+            embed.add_field(name="Status", value=status_str, inline=True)
+            embed.add_field(name="Price", value=f"${price:.2f}" if price else "N/A", inline=True)
+            embed.add_field(name="SKU", value=f"`{sku}`", inline=True)
+            embed.add_field(name="Link", value=f"[Open on Best Buy]({url})", inline=False)
+            if image_url:
+                embed.set_thumbnail(url=image_url)
+            embed.set_footer(text="Best Buy Monitor \u2022 bestbuy.com")
+            await ctx.send(embed=embed)
+            await asyncio.sleep(1)
 
     # --- Set interval ---
 
