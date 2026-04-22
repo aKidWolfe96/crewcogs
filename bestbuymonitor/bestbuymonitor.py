@@ -3,6 +3,8 @@ import aiohttp
 import asyncio
 import re
 import json
+import requests
+import functools
 from datetime import datetime
 from redbot.core import commands, Config
 from redbot.core.bot import Red
@@ -43,89 +45,131 @@ def extract_sku(url: str) -> str | None:
             return match.group(1)
     return None
 
-def _make_session() -> aiohttp.ClientSession:
-    """Create a fresh aiohttp session with Windows-compatible connector."""
-    connector = aiohttp.TCPConnector(
-        limit=5,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        force_close=True,       # Don't reuse connections — fixes WinError 121
-        enable_cleanup_closed=True,
-    )
-    return aiohttp.ClientSession(
-        connector=connector,
-        timeout=aiohttp.ClientTimeout(total=20, connect=10),
-    )
+REQUESTS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 
-async def fetch_product(sku: str) -> str:
+def _sync_fetch_status(sku: str) -> str:
     """
-    Check Best Buy online stock status for a SKU.
-    Creates a fresh session each call to avoid Windows asyncio stale connection issues.
-    Returns a status string: ADD_TO_CART, SOLD_OUT, COMING_SOON, PRE_ORDER, or UNKNOWN.
+    Synchronous Best Buy stock check using requests.
+    Runs in a thread executor to avoid blocking the event loop.
+    Uses a session with cookies to mimic a real browser visit.
     """
     import urllib.parse
 
-    # Primary: internal buttonstate endpoint
+    session = requests.Session()
+    session.headers.update(REQUESTS_HEADERS)
+
+    # Step 1: Hit homepage to get session cookies like a real browser
     try:
-        async with _make_session() as session:
-            paths = [[
-                "shop", "buttonstate", "v5", "item", "skus",
-                int(sku), "conditions", "NONE",
-                "destinationZipCode", "55423",
-                "storeId", " ",
-                "context", "cyp",
-                "addAll", "false"
-            ]]
-            params = urllib.parse.urlencode({
-                "paths": json.dumps(paths),
-                "method": "get"
-            })
-            url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
-            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    skus_node = (
-                        data.get("jsonGraph", {})
-                        .get("shop", {})
-                        .get("buttonstate", {})
-                        .get("v5", {})
-                        .get("item", {})
-                        .get("skus", {})
-                    )
-                    sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
-                    raw = str(sku_node)
-                    match = re.search(r"buttonState[^:]*:[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
-                    if match:
-                        return match.group(1).upper()
+        session.get("https://www.bestbuy.com/", timeout=15, verify=True)
     except Exception:
         pass
 
-    # Fallback: scrape product page
+    # Step 2: Try the tcfb buttonstate endpoint
     try:
-        async with _make_session() as session:
-            page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
-            async with session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                text = await resp.text()
-                if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
-                    return "ADD_TO_CART"
-                if '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
-                    return "SOLD_OUT"
-                if '"buttonState":"COMING_SOON"' in text:
-                    return "COMING_SOON"
-                if '"buttonState":"PRE_ORDER"' in text:
-                    return "PRE_ORDER"
-                match = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
-                if match:
-                    return match.group(1).upper()
-                if 'data-button-state="ADD_TO_CART"' in text:
-                    return "ADD_TO_CART"
-                if 'data-button-state="SOLD_OUT"' in text:
-                    return "SOLD_OUT"
+        paths = json.dumps([[
+            "shop", "buttonstate", "v5", "item", "skus",
+            int(sku), "conditions", "NONE",
+            "destinationZipCode", "55423",
+            "storeId", " ",
+            "context", "cyp",
+            "addAll", "false"
+        ]])
+        params = urllib.parse.urlencode({"paths": paths, "method": "get"})
+        url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
+        resp = session.get(url, timeout=15, headers={**REQUESTS_HEADERS, "Accept": "application/json"})
+        if resp.status_code == 200:
+            data = resp.json()
+            skus_node = (
+                data.get("jsonGraph", {})
+                .get("shop", {})
+                .get("buttonstate", {})
+                .get("v5", {})
+                .get("item", {})
+                .get("skus", {})
+            )
+            sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
+            raw = str(sku_node)
+            match = re.search(r"buttonState[^:]*:[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+    except Exception:
+        pass
+
+    # Step 3: Fallback — scrape the product search page
+    try:
+        page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+        resp = session.get(page_url, timeout=20)
+        text = resp.text
+        if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
+            return "ADD_TO_CART"
+        if '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
+            return "SOLD_OUT"
+        if '"buttonState":"COMING_SOON"' in text:
+            return "COMING_SOON"
+        if '"buttonState":"PRE_ORDER"' in text:
+            return "PRE_ORDER"
+        match = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
+        if match:
+            return match.group(1).upper()
+        if 'data-button-state="ADD_TO_CART"' in text:
+            return "ADD_TO_CART"
+        if 'data-button-state="SOLD_OUT"' in text:
+            return "SOLD_OUT"
     except Exception:
         pass
 
     return "UNKNOWN"
+
+
+async def fetch_product(sku: str) -> str:
+    """Async wrapper — runs the sync requests call in a thread executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, functools.partial(_sync_fetch_status, sku))
+
+
+def _sync_fetch_info(sku: str) -> tuple:
+    """Synchronous product name + image fetch using requests."""
+    name = f"SKU {sku}"
+    image_url = f"https://pisces.bbystatic.com/image2/BestBuy_US/images/products/{sku[:4]}/{sku}_sd.jpg"
+
+    session = requests.Session()
+    session.headers.update(REQUESTS_HEADERS)
+    try:
+        url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+        resp = session.get(url, timeout=15)
+        text = resp.text
+        name_match = re.search(r'"name"\s*:\s*"([^"]{5,})"', text)
+        if name_match:
+            name = name_match.group(1)
+        img_match = re.search(r'"href"\s*:\s*"(https://pisces\.bbystatic\.com[^"]+)"', text)
+        if img_match:
+            image_url = img_match.group(1)
+    except Exception:
+        pass
+
+    return name, image_url
+
+
+async def fetch_product_info(sku: str) -> tuple:
+    """Async wrapper — runs the sync requests call in a thread executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, functools.partial(_sync_fetch_info, sku))
 
 async def fetch_product_info(sku: str) -> tuple:
     """
@@ -498,61 +542,65 @@ class BestBuyMonitor(commands.Cog):
         """
         import urllib.parse
         import traceback
-        import ssl
 
         await ctx.send(f"Running debug check on SKU {sku}...")
 
-        def safe(text, limit=300):
-            # Strip backticks to prevent Discord formatting issues
-            return text.replace("`", "'")[:limit]
+        def safe(text, limit=400):
+            return str(text).replace("`", "'")[:limit]
 
-        # Test 0: basic connectivity
-        try:
-            async with _make_session() as sess:
-             async with sess.get("https://httpbin.org/get", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                await ctx.send(f"CONNECTIVITY: OK (status {resp.status})")
-        except Exception as e:
-            tb = safe(traceback.format_exc())
-            await ctx.send("CONNECTIVITY FAILED\nType: " + type(e).__name__ + "\nMsg: " + safe(str(e)) + "\nTrace:\n" + tb)
+        def sync_debug(sku):
+            import urllib.parse
+            results = []
 
-        # Test 1: tcfb endpoint
-        try:
-            paths = [[
-                "shop", "buttonstate", "v5", "item", "skus",
-                int(sku), "conditions", "NONE",
-                "destinationZipCode", "55423",
-                "storeId", " ",
-                "context", "cyp",
-                "addAll", "false"
-            ]]
-            params = urllib.parse.urlencode({
-                "paths": json.dumps(paths),
-                "method": "get"
-            })
-            url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
-            async with _make_session() as sess:
-             async with sess.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                text = await resp.text()
-                await ctx.send(f"TCFB ENDPOINT: status={resp.status} body={safe(text)}")
-        except Exception as e:
-            tb = safe(traceback.format_exc())
-            await ctx.send("TCFB FAILED\nType: " + type(e).__name__ + "\nMsg: " + safe(str(e)) + "\nTrace:\n" + tb)
+            # Test 0: basic connectivity
+            try:
+                r = requests.get("https://httpbin.org/get", timeout=10, headers=REQUESTS_HEADERS)
+                results.append(f"CONNECTIVITY: OK status={r.status_code}")
+            except Exception as e:
+                results.append(f"CONNECTIVITY FAILED: {type(e).__name__}: {safe(str(e))}")
 
-        # Test 2: product page, ssl relaxed
-        try:
-            page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
-            ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-            async with _make_session() as sess:
-             async with sess.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), ssl=ssl_ctx) as resp:
-                text = await resp.text()
+            # Test 1: Homepage cookies
+            try:
+                session = requests.Session()
+                session.headers.update(REQUESTS_HEADERS)
+                r = session.get("https://www.bestbuy.com/", timeout=15)
+                cookies = list(session.cookies.keys())
+                results.append(f"HOMEPAGE: status={r.status_code} cookies={cookies} length={len(r.text)}")
+            except Exception as e:
+                results.append(f"HOMEPAGE FAILED: {type(e).__name__}: {safe(str(e))}")
+
+            # Test 2: tcfb endpoint
+            try:
+                paths = json.dumps([[
+                    "shop", "buttonstate", "v5", "item", "skus",
+                    int(sku), "conditions", "NONE",
+                    "destinationZipCode", "55423",
+                    "storeId", " ", "context", "cyp", "addAll", "false"
+                ]])
+                params = urllib.parse.urlencode({"paths": paths, "method": "get"})
+                url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
+                r = session.get(url, timeout=15)
+                results.append(f"TCFB: status={r.status_code} body={safe(r.text)}")
+            except Exception as e:
+                results.append(f"TCFB FAILED: {type(e).__name__}: {safe(str(e))}")
+
+            # Test 3: product search page
+            try:
+                page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+                r = session.get(page_url, timeout=20)
+                text = r.text
                 btn_matches = re.findall(r'"buttonState"\s*:\s*"([^"]+)"', text)
-                msg = ("PRODUCT PAGE: status=" + str(resp.status) +
-                       " length=" + str(len(text)) + "\n" +
-                       "buttonState matches: " + str(btn_matches[:5] if btn_matches else "none") + "\n" +
-                       "First 300 chars: " + safe(text))
-                await ctx.send(msg[:1990])
-        except Exception as e:
-            tb = safe(traceback.format_exc())
-            await ctx.send("PRODUCT PAGE FAILED\nType: " + type(e).__name__ + "\nMsg: " + safe(str(e)) + "\nTrace:\n" + tb)
+                results.append(
+                    f"PRODUCT PAGE: status={r.status_code} length={len(text)}\n"
+                    f"buttonState matches: {btn_matches[:5] if btn_matches else 'none'}\n"
+                    f"First 300 chars: {safe(text, 300)}"
+                )
+            except Exception as e:
+                results.append(f"PRODUCT PAGE FAILED: {type(e).__name__}: {safe(str(e))}")
+
+            return results
+
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, functools.partial(sync_debug, sku))
+        for r in results:
+            await ctx.send(r[:1990])
