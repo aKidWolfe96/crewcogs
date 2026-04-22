@@ -487,22 +487,23 @@ class BestBuyMonitor(commands.Cog):
 
         Example: `[p]tcgc debug 6562319`
         """
-        await ctx.send(f"🔍 Running debug check on SKU `{sku}`...")
-
         import urllib.parse
         import traceback
-
-        results = []
-
-        import traceback
         import ssl
+
+        await ctx.send(f"Running debug check on SKU {sku}...")
+
+        def safe(text, limit=300):
+            # Strip backticks to prevent Discord formatting issues
+            return text.replace("`", "'")[:limit]
 
         # Test 0: basic connectivity
         try:
             async with self._session.get("https://httpbin.org/get", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                results.append(f"**Basic connectivity (httpbin)**\nStatus: `{resp.status}` — session is working")
+                await ctx.send(f"CONNECTIVITY: OK (status {resp.status})")
         except Exception as e:
-            results.append(f"**Basic connectivity (httpbin)**\nFailed: `{type(e).__name__}: {e}`\n```{traceback.format_exc()[-300:]}```")
+            tb = safe(traceback.format_exc())
+            await ctx.send("CONNECTIVITY FAILED\nType: " + type(e).__name__ + "\nMsg: " + safe(str(e)) + "\nTrace:\n" + tb)
 
         # Test 1: tcfb endpoint
         try:
@@ -521,11 +522,12 @@ class BestBuyMonitor(commands.Cog):
             url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
             async with self._session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 text = await resp.text()
-                results.append(f"**tcfb endpoint**\nStatus: `{resp.status}`\nBody: ```{text[:400]}```")
+                await ctx.send(f"TCFB ENDPOINT: status={resp.status} body={safe(text)}")
         except Exception as e:
-            results.append(f"**tcfb endpoint**\nFailed: `{type(e).__name__}: {e}`\n```{traceback.format_exc()[-400:]}```")
+            tb = safe(traceback.format_exc())
+            await ctx.send("TCFB FAILED\nType: " + type(e).__name__ + "\nMsg: " + safe(str(e)) + "\nTrace:\n" + tb)
 
-        # Test 2: product page with ssl=False fallback
+        # Test 2: product page, ssl relaxed
         try:
             page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
             ssl_ctx = ssl.create_default_context()
@@ -534,15 +536,11 @@ class BestBuyMonitor(commands.Cog):
             async with self._session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), ssl=ssl_ctx) as resp:
                 text = await resp.text()
                 btn_matches = re.findall(r'"buttonState"\s*:\s*"([^"]+)"', text)
-                results.append(
-                    f"**Product page (ssl relaxed)**\n"
-                    f"Status: `{resp.status}`\n"
-                    f"Page length: `{len(text)} chars`\n"
-                    f"buttonState matches: `{btn_matches[:5] if btn_matches else 'none found'}`\n"
-                    f"First 300 chars:\n```{text[:300]}```"
-                )
+                msg = ("PRODUCT PAGE: status=" + str(resp.status) +
+                       " length=" + str(len(text)) + "\n" +
+                       "buttonState matches: " + str(btn_matches[:5] if btn_matches else "none") + "\n" +
+                       "First 300 chars: " + safe(text))
+                await ctx.send(msg[:1990])
         except Exception as e:
-            results.append(f"**Product page (ssl relaxed)**\nFailed: `{type(e).__name__}: {e}`\n```{traceback.format_exc()[-400:]}```")
-
-        for chunk in results:
-            await ctx.send(chunk[:1990])
+            tb = safe(traceback.format_exc())
+            await ctx.send("PRODUCT PAGE FAILED\nType: " + type(e).__name__ + "\nMsg: " + safe(str(e)) + "\nTrace:\n" + tb)
