@@ -43,79 +43,91 @@ def extract_sku(url: str) -> str | None:
             return match.group(1)
     return None
 
-async def fetch_product(session: aiohttp.ClientSession, sku: str) -> str:
+def _make_session() -> aiohttp.ClientSession:
+    """Create a fresh aiohttp session with Windows-compatible connector."""
+    connector = aiohttp.TCPConnector(
+        limit=5,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        force_close=True,       # Don't reuse connections — fixes WinError 121
+        enable_cleanup_closed=True,
+    )
+    return aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=20, connect=10),
+    )
+
+
+async def fetch_product(sku: str) -> str:
     """
     Check Best Buy online stock status for a SKU.
-    Uses the internal tcfb buttonstate endpoint with correct URL format,
-    then falls back to scraping the product page if that fails.
-    Returns a status string: ADD_TO_CART, SOLD_OUT, COMING_SOON, or UNKNOWN.
+    Creates a fresh session each call to avoid Windows asyncio stale connection issues.
+    Returns a status string: ADD_TO_CART, SOLD_OUT, COMING_SOON, PRE_ORDER, or UNKNOWN.
     """
-    # Primary: internal buttonstate endpoint (correct unencoded format)
+    import urllib.parse
+
+    # Primary: internal buttonstate endpoint
     try:
-        import urllib.parse
-        paths = [[
-            "shop", "buttonstate", "v5", "item", "skus",
-            int(sku), "conditions", "NONE",
-            "destinationZipCode", "55423",
-            "storeId", " ",
-            "context", "cyp",
-            "addAll", "false"
-        ]]
-        params = urllib.parse.urlencode({
-            "paths": str(paths).replace("'", '"'),
-            "method": "get"
-        })
-        url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                # Walk the nested jsonGraph response
-                skus_node = (
-                    data.get("jsonGraph", {})
-                    .get("shop", {})
-                    .get("buttonstate", {})
-                    .get("v5", {})
-                    .get("item", {})
-                    .get("skus", {})
-                )
-                # SKU key may be int or string in response
-                sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
-                raw = str(sku_node)
-                match = re.search(r"buttonState[^:]*:\s*[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
-                if match:
-                    return match.group(1).upper()
+        async with _make_session() as session:
+            paths = [[
+                "shop", "buttonstate", "v5", "item", "skus",
+                int(sku), "conditions", "NONE",
+                "destinationZipCode", "55423",
+                "storeId", " ",
+                "context", "cyp",
+                "addAll", "false"
+            ]]
+            params = urllib.parse.urlencode({
+                "paths": json.dumps(paths),
+                "method": "get"
+            })
+            url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
+            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    skus_node = (
+                        data.get("jsonGraph", {})
+                        .get("shop", {})
+                        .get("buttonstate", {})
+                        .get("v5", {})
+                        .get("item", {})
+                        .get("skus", {})
+                    )
+                    sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
+                    raw = str(sku_node)
+                    match = re.search(r"buttonState[^:]*:[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
+                    if match:
+                        return match.group(1).upper()
     except Exception:
         pass
 
-    # Fallback: scrape the product page directly
+    # Fallback: scrape product page
     try:
-        page_url = f"https://www.bestbuy.com/site/product/{sku}.p"
-        async with session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            text = await resp.text()
-            # Look for fulfillment/button state signals in page JSON
-            if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
-                return "ADD_TO_CART"
-            if '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
-                return "SOLD_OUT"
-            if '"buttonState":"COMING_SOON"' in text:
-                return "COMING_SOON"
-            if '"buttonState":"PRE_ORDER"' in text:
-                return "PRE_ORDER"
-            # Broader search across all JSON blobs on the page
-            match = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
-            if match:
-                return match.group(1).upper()
-            # Last resort: check if add to cart button exists in HTML
-            if 'data-button-state="ADD_TO_CART"' in text:
-                return "ADD_TO_CART"
-            if 'data-button-state="SOLD_OUT"' in text:
-                return "SOLD_OUT"
+        async with _make_session() as session:
+            page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+            async with session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                text = await resp.text()
+                if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
+                    return "ADD_TO_CART"
+                if '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
+                    return "SOLD_OUT"
+                if '"buttonState":"COMING_SOON"' in text:
+                    return "COMING_SOON"
+                if '"buttonState":"PRE_ORDER"' in text:
+                    return "PRE_ORDER"
+                match = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
+                if match:
+                    return match.group(1).upper()
+                if 'data-button-state="ADD_TO_CART"' in text:
+                    return "ADD_TO_CART"
+                if 'data-button-state="SOLD_OUT"' in text:
+                    return "SOLD_OUT"
     except Exception:
         pass
 
     return "UNKNOWN"
 
-async def fetch_product_info(session: aiohttp.ClientSession, sku: str) -> tuple:
+async def fetch_product_info(sku: str) -> tuple:
     """
     Scrape the product name and image URL from the Best Buy product page.
     Returns (name, image_url) -- image_url may be None if not found.
@@ -128,7 +140,8 @@ async def fetch_product_info(session: aiohttp.ClientSession, sku: str) -> tuple:
 
     url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
     try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with _make_session() as session:
+         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             text = await resp.text()
             name_match = re.search(r'"name"\s*:\s*"([^"]{5,})"', text)
             if name_match:
@@ -177,17 +190,13 @@ class BestBuyMonitor(commands.Cog):
             check_interval=300,     # seconds between checks (default 5 min)
         )
         self._task: asyncio.Task | None = None
-        self._session: aiohttp.ClientSession | None = None
 
     async def cog_load(self):
-        self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._monitor_loop())
 
     async def cog_unload(self):
         if self._task:
             self._task.cancel()
-        if self._session:
-            await self._session.close()
 
     # ------------------------------------------------------------------ #
     #  Background loop                                                     #
@@ -224,7 +233,7 @@ class BestBuyMonitor(commands.Cog):
                 await asyncio.sleep(2)  # small delay between SKU checks
 
     async def _check_product(self, guild_id, channel, sku, info, ping_target):
-        current_status = await fetch_product(self._session, sku)
+        current_status = await fetch_product(sku)
         if not current_status:
             current_status = "UNKNOWN"
 
@@ -344,8 +353,8 @@ class BestBuyMonitor(commands.Cog):
 
         async with ctx.typing():
             msg = await ctx.send(f"🔍 Looking up SKU `{sku}`...")
-            name, image_url = await fetch_product_info(self._session, sku)
-            current_status = await fetch_product(self._session, sku)
+            name, image_url = await fetch_product_info(sku)
+            current_status = await fetch_product(sku)
 
         async with self.config.guild(ctx.guild).products() as products:
             products[sku] = {
@@ -439,7 +448,7 @@ class BestBuyMonitor(commands.Cog):
         msg = await ctx.send(f"🔄 Checking {len(products)} product(s)...")
         results = []
         for sku, info in products.items():
-            status = await fetch_product(self._session, sku)
+            status = await fetch_product(sku)
             in_stock = status in {"ADD_TO_CART", "PURCHASABLE", "AVAILABLE"}
             emoji = "🟢" if in_stock else "🔴"
             name = info.get("name", sku)
@@ -499,7 +508,8 @@ class BestBuyMonitor(commands.Cog):
 
         # Test 0: basic connectivity
         try:
-            async with self._session.get("https://httpbin.org/get", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with _make_session() as sess:
+             async with sess.get("https://httpbin.org/get", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 await ctx.send(f"CONNECTIVITY: OK (status {resp.status})")
         except Exception as e:
             tb = safe(traceback.format_exc())
@@ -520,7 +530,8 @@ class BestBuyMonitor(commands.Cog):
                 "method": "get"
             })
             url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
-            async with self._session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with _make_session() as sess:
+             async with sess.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 text = await resp.text()
                 await ctx.send(f"TCFB ENDPOINT: status={resp.status} body={safe(text)}")
         except Exception as e:
@@ -533,7 +544,8 @@ class BestBuyMonitor(commands.Cog):
             ssl_ctx = ssl.create_default_context()
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
-            async with self._session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), ssl=ssl_ctx) as resp:
+            async with _make_session() as sess:
+             async with sess.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), ssl=ssl_ctx) as resp:
                 text = await resp.text()
                 btn_matches = re.findall(r'"buttonState"\s*:\s*"([^"]+)"', text)
                 msg = ("PRODUCT PAGE: status=" + str(resp.status) +
