@@ -4,7 +4,6 @@ import asyncio
 import tempfile
 import os
 from redbot.core import commands, Config
-from redbot.core.bot import Red
 
 CONFIG = Config.get_conf(None, identifier=5544332211)
 CONFIG.register_guild(voice_id="Ryan.wav")
@@ -32,12 +31,19 @@ class ChatterboxTTS(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    async def tts(self, ctx, *, text: str):
-        """Speak text in your voice channel via Chatterbox TTS."""
-        if not ctx.author.voice or not ctx.author.voice.channel:
-            return await ctx.send("You need to be in a voice channel first.")
+    async def tts(self, ctx, channel: discord.VoiceChannel = None, *, text: str):
+        """Speak text in a voice channel via Chatterbox TTS.
 
-        channel = ctx.author.voice.channel
+        Usage:
+          [p]tts <text>                  — speaks in your current voice channel
+          [p]tts #channel <text>         — speaks in the specified voice channel
+        """
+        # If no channel was specified, use the author's current voice channel
+        if channel is None:
+            if not ctx.author.voice or not ctx.author.voice.channel:
+                return await ctx.send("You need to be in a voice channel, or specify one like `!tts #channel your message`.")
+            channel = ctx.author.voice.channel
+
         guild_id = ctx.guild.id
 
         if guild_id not in self._tts_queue:
@@ -56,10 +62,7 @@ class ChatterboxTTS(commands.Cog):
             names = ", ".join(v.replace(".wav", "") for v in VOICES)
             return await ctx.send(f"**Available voices:**\n{names}\n\nUse `[p]ttsvoice <name>` to set one.")
 
-        # Accept with or without .wav
         filename = voice if voice.endswith(".wav") else voice + ".wav"
-
-        # Case-insensitive match
         match = next((v for v in VOICES if v.lower() == filename.lower()), None)
         if not match:
             return await ctx.send(f"Voice `{voice}` not found. Use `[p]ttsvoice list` to see all options.")
@@ -160,7 +163,7 @@ class ChatterboxTTS(commands.Cog):
             async with session.post(
                 self.CHATTERBOX_URL,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=300),
+                timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
