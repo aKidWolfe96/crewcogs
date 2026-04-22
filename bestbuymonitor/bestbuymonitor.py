@@ -579,54 +579,41 @@ class BestBuyMonitor(commands.Cog):
             return str(text).replace("`", "'")[:limit]
 
         def sync_debug(sku):
-            import urllib.parse
             results = []
 
-            # Test 0: basic connectivity
-            try:
-                r = requests.get("https://httpbin.org/get", timeout=10, headers=REQUESTS_HEADERS)
-                results.append(f"CONNECTIVITY: OK status={r.status_code}")
-            except Exception as e:
-                results.append(f"CONNECTIVITY FAILED: {type(e).__name__}: {safe(str(e))}")
-
-            # Test 1: Homepage cookies
+            # Use exact same method as the working fetcher — fresh session, go direct
             try:
                 session = requests.Session()
                 session.headers.update(REQUESTS_HEADERS)
-                r = session.get("https://www.bestbuy.com/", timeout=15)
-                cookies = list(session.cookies.keys())
-                results.append(f"HOMEPAGE: status={r.status_code} cookies={cookies} length={len(r.text)}")
-            except Exception as e:
-                results.append(f"HOMEPAGE FAILED: {type(e).__name__}: {safe(str(e))}")
-
-            # Test 2: tcfb endpoint
-            try:
-                paths = json.dumps([[
-                    "shop", "buttonstate", "v5", "item", "skus",
-                    int(sku), "conditions", "NONE",
-                    "destinationZipCode", "55423",
-                    "storeId", " ", "context", "cyp", "addAll", "false"
-                ]])
-                params = urllib.parse.urlencode({"paths": paths, "method": "get"})
-                url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
-                r = session.get(url, timeout=15)
-                results.append(f"TCFB: status={r.status_code} body={safe(r.text)}")
-            except Exception as e:
-                results.append(f"TCFB FAILED: {type(e).__name__}: {safe(str(e))}")
-
-            # Test 3: product search page
-            try:
                 page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
-                r = session.get(page_url, timeout=20)
+                r = session.get(page_url, timeout=45)
                 text = r.text
+
+                # Show all buttonState values found
                 btn_matches = re.findall(r'"buttonState"\s*:\s*"([^"]+)"', text)
+                # Show price matches
+                price_matches = re.findall(r'"currentPrice"\s*:\s*([0-9.]+)', text)
+                sale_matches = re.findall(r'"salePrice"\s*:\s*([0-9.]+)', text)
+                # Check each status string
+                checks = {
+                    "ADD_TO_CART in text": '"buttonState":"ADD_TO_CART"' in text,
+                    "fulfillmentCode ADD_TO_CART": '"fulfillmentCode":"ADD_TO_CART"' in text,
+                    "SOLD_OUT in text": '"buttonState":"SOLD_OUT"' in text,
+                    "isOutOfStock true": '"isOutOfStock":true' in text,
+                    "data-button-state ADD_TO_CART": 'data-button-state="ADD_TO_CART"' in text,
+                    "data-button-state SOLD_OUT": 'data-button-state="SOLD_OUT"' in text,
+                }
+
                 results.append(
-                    f"PRODUCT PAGE: status={r.status_code} length={len(text)}\n"
-                    f"buttonState matches: {btn_matches[:5] if btn_matches else 'none'}\n"
-                    f"First 300 chars: {safe(text, 300)}"
+                    f"PAGE: status={r.status_code} length={len(text)}\n"
+                    f"buttonState values: {btn_matches[:8] if btn_matches else 'NONE FOUND'}\n"
+                    f"currentPrice: {price_matches[:3] if price_matches else 'none'}\n"
+                    f"salePrice: {sale_matches[:3] if sale_matches else 'none'}\n"
+                    f"String checks: {checks}"
                 )
+                results.append(f"First 400 chars of page: {safe(text, 400)}")
             except Exception as e:
-                results.append(f"PRODUCT PAGE FAILED: {type(e).__name__}: {safe(str(e))}")
+                results.append(f"FETCH FAILED: {type(e).__name__}: {safe(str(e))}")
 
             return results
 
