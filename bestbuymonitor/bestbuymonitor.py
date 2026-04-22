@@ -478,3 +478,58 @@ class BestBuyMonitor(commands.Cog):
     async def tcgc_settings(self, ctx: commands.Context):
         """Show current monitor settings."""
         await self.tcgc_list(ctx)
+
+    # --- Debug ---
+
+    @tcgc.command(name="debug")
+    async def tcgc_debug(self, ctx: commands.Context, sku: str):
+        """Show raw response from Best Buy for a SKU to diagnose issues.
+
+        Example: `[p]tcgc debug 6562319`
+        """
+        await ctx.send(f"🔍 Running debug check on SKU `{sku}`...")
+
+        import urllib.parse
+        import traceback
+
+        results = []
+
+        # Test 1: tcfb endpoint
+        try:
+            paths = [[
+                "shop", "buttonstate", "v5", "item", "skus",
+                int(sku), "conditions", "NONE",
+                "destinationZipCode", "55423",
+                "storeId", " ",
+                "context", "cyp",
+                "addAll", "false"
+            ]]
+            params = urllib.parse.urlencode({
+                "paths": json.dumps(paths),
+                "method": "get"
+            })
+            url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
+            async with self._session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                text = await resp.text()
+                results.append(f"**tcfb endpoint**\nStatus: `{resp.status}`\nBody: ```{text[:300]}```")
+        except Exception as e:
+            results.append(f"**tcfb endpoint**\nException: `{e}`")
+
+        # Test 2: product page
+        try:
+            page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+            async with self._session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                text = await resp.text()
+                btn_matches = re.findall(r'"buttonState"\s*:\s*"([^"]+)"', text)
+                results.append(
+                    f"**Product page scrape**\n"
+                    f"Status: `{resp.status}`\n"
+                    f"Page length: `{len(text)} chars`\n"
+                    f"buttonState matches: `{btn_matches[:5] if btn_matches else 'none found'}`\n"
+                    f"First 200 chars: ```{text[:200]}```"
+                )
+        except Exception as e:
+            results.append(f"**Product page scrape**\nException: `{e}`")
+
+        for chunk in results:
+            await ctx.send(chunk[:1900])
