@@ -498,7 +498,8 @@ class BestBuyMonitor(commands.Cog):
         if not products:
             return await ctx.send("No products being monitored.")
 
-        await ctx.send(f"🔄 Checking {len(products)} product(s)...")
+        msg = await ctx.send(f"🔄 Checking {len(products)} product(s)...")
+        lines = []
         for sku, info in products.items():
             result = await fetch_product(sku)
             status = result.get("status", "UNKNOWN")
@@ -514,33 +515,31 @@ class BestBuyMonitor(commands.Cog):
                     if price is not None:
                         p[sku]["last_price"] = price
 
-            color = discord.Color.green() if in_stock else discord.Color.red()
-            emoji = "\U0001f7e2" if in_stock else "\U0001f534"
-            status_str = "\u2705 In Stock" if in_stock else "\u274c Out of Stock"
             if status == "COMING_SOON":
-                status_str = "\U0001f551 Coming Soon"
-                color = discord.Color.orange()
                 emoji = "\U0001f7e0"
+                status_str = "Coming Soon"
             elif status == "PRE_ORDER":
-                status_str = "\U0001f4e6 Pre-Order"
-                color = discord.Color.blurple()
                 emoji = "\U0001f7e3"
+                status_str = "Pre-Order"
+            elif in_stock:
+                emoji = "\U0001f7e2"
+                status_str = "In Stock"
+            else:
+                emoji = "\U0001f534"
+                status_str = "Out of Stock"
 
-            embed = discord.Embed(
-                title=f"{emoji} {name}",
-                url=url,
-                color=color,
-                timestamp=datetime.utcnow(),
-            )
-            embed.add_field(name="Status", value=status_str, inline=True)
-            embed.add_field(name="Price", value=f"${price:.2f}" if price else "N/A", inline=True)
-            embed.add_field(name="SKU", value=f"`{sku}`", inline=True)
-            embed.add_field(name="Link", value=f"[Open on Best Buy]({url})", inline=False)
-            if image_url:
-                embed.set_thumbnail(url=image_url)
-            embed.set_footer(text="Best Buy Monitor \u2022 bestbuy.com")
-            await ctx.send(embed=embed)
+            price_str = f"${price:.2f}" if price else "N/A"
+            lines.append(f"{emoji} **[{name}]({url})**\n\u00a0\u00a0\u00a0Status: {status_str} • Price: {price_str} • SKU: `{sku}`")
             await asyncio.sleep(1)
+
+        embed = discord.Embed(
+            title="📊 Stock Check Results",
+            description="\n\n".join(lines),
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow(),
+        )
+        embed.set_footer(text="Best Buy Monitor \u2022 bestbuy.com")
+        await msg.edit(content=None, embed=embed)
 
     # --- Set interval ---
 
