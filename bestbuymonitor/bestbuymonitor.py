@@ -43,46 +43,77 @@ def extract_sku(url: str) -> str | None:
             return match.group(1)
     return None
 
-async def fetch_product(session: aiohttp.ClientSession, sku: str) -> dict | None:
+async def fetch_product(session: aiohttp.ClientSession, sku: str) -> str:
     """
-    Hit Best Buy's internal fulfillment API (no key required) to get
-    stock + product info for a given SKU.
+    Check Best Buy online stock status for a SKU.
+    Uses the internal tcfb buttonstate endpoint with correct URL format,
+    then falls back to scraping the product page if that fails.
+    Returns a status string: ADD_TO_CART, SOLD_OUT, COMING_SOON, or UNKNOWN.
     """
-    url = (
-        f"https://www.bestbuy.com/api/tcfb/model.json"
-        f"?paths=%5B%5B%22shop%22%2C%22buttonstate%22%2C%22v5%22%2C%22item%22%2C%22skus%22%2C{sku}%2C%22conditions%22%2C%22NONE%22%2C%22destinationZipCode%22%2C%2255423%22%2C%22storeId%22%2C%22+%22%2C%22context%22%2C%22cyp%22%2C%22addAll%22%2C%22false%22%5D%5D"
-        f"&method=get"
-    )
+    # Primary: internal buttonstate endpoint (correct unencoded format)
     try:
+        import urllib.parse
+        paths = [[
+            "shop", "buttonstate", "v5", "item", "skus",
+            int(sku), "conditions", "NONE",
+            "destinationZipCode", "55423",
+            "storeId", " ",
+            "context", "cyp",
+            "addAll", "false"
+        ]]
+        params = urllib.parse.urlencode({
+            "paths": str(paths).replace("'", '"'),
+            "method": "get"
+        })
+        url = f"https://www.bestbuy.com/api/tcfb/model.json?{params}"
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json(content_type=None)
-            btn = (
-                data.get("jsonGraph", {})
-                .get("shop", {})
-                .get("buttonstate", {})
-                .get("v5", {})
-                .get("item", {})
-                .get("skus", {})
-                .get(sku, {})
-                .get("conditions", {})
-                .get("NONE", {})
-            )
-            # Walk through nested $type/value structure
-            def unwrap(node):
-                if isinstance(node, dict):
-                    if "$type" in node:
-                        return node.get("value")
-                    return {k: unwrap(v) for k, v in node.items()}
-                return node
-
-            btn = unwrap(btn)
-            if not btn:
-                return None
-            return btn
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                # Walk the nested jsonGraph response
+                skus_node = (
+                    data.get("jsonGraph", {})
+                    .get("shop", {})
+                    .get("buttonstate", {})
+                    .get("v5", {})
+                    .get("item", {})
+                    .get("skus", {})
+                )
+                # SKU key may be int or string in response
+                sku_node = skus_node.get(sku) or skus_node.get(int(sku)) or {}
+                raw = str(sku_node)
+                match = re.search(r"buttonState[^:]*:\s*[^A-Z]*([A-Z_]+)", raw, re.IGNORECASE)
+                if match:
+                    return match.group(1).upper()
     except Exception:
-        return None
+        pass
+
+    # Fallback: scrape the product page directly
+    try:
+        page_url = f"https://www.bestbuy.com/site/product/{sku}.p"
+        async with session.get(page_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            text = await resp.text()
+            # Look for fulfillment/button state signals in page JSON
+            if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
+                return "ADD_TO_CART"
+            if '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
+                return "SOLD_OUT"
+            if '"buttonState":"COMING_SOON"' in text:
+                return "COMING_SOON"
+            if '"buttonState":"PRE_ORDER"' in text:
+                return "PRE_ORDER"
+            # Broader search across all JSON blobs on the page
+            match = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
+            if match:
+                return match.group(1).upper()
+            # Last resort: check if add to cart button exists in HTML
+            if 'data-button-state="ADD_TO_CART"' in text:
+                return "ADD_TO_CART"
+            if 'data-button-state="SOLD_OUT"' in text:
+                return "SOLD_OUT"
+    except Exception:
+        pass
+
+    return "UNKNOWN"
 
 async def fetch_product_info(session: aiohttp.ClientSession, sku: str) -> tuple:
     """
@@ -193,16 +224,9 @@ class BestBuyMonitor(commands.Cog):
                 await asyncio.sleep(2)  # small delay between SKU checks
 
     async def _check_product(self, guild_id, channel, sku, info, ping_target):
-        btn = await fetch_product(self._session, sku)
-        if not btn:
-            return
-
-        # Best Buy button state key tells us availability
-        button_state = btn.get("destinationZipCode", {})
-        # Flatten — look for buttonState key anywhere in the response
-        raw = json.dumps(btn)
-        state_match = re.search(r'"buttonState"\s*:\s*"([^"]+)"', raw)
-        current_status = state_match.group(1) if state_match else "UNKNOWN"
+        current_status = await fetch_product(self._session, sku)
+        if not current_status:
+            current_status = "UNKNOWN"
 
         last_status = info.get("last_status", "")
         url = info.get("url", f"https://www.bestbuy.com/site/{sku}.p")
@@ -321,11 +345,7 @@ class BestBuyMonitor(commands.Cog):
         async with ctx.typing():
             msg = await ctx.send(f"🔍 Looking up SKU `{sku}`...")
             name, image_url = await fetch_product_info(self._session, sku)
-            btn = await fetch_product(self._session, sku)
-
-        raw = json.dumps(btn) if btn else ""
-        state_match = re.search(r'"buttonState"\s*:\s*"([^"]+)"', raw)
-        current_status = state_match.group(1) if state_match else "UNKNOWN"
+            current_status = await fetch_product(self._session, sku)
 
         async with self.config.guild(ctx.guild).products() as products:
             products[sku] = {
@@ -419,10 +439,7 @@ class BestBuyMonitor(commands.Cog):
         msg = await ctx.send(f"🔄 Checking {len(products)} product(s)...")
         results = []
         for sku, info in products.items():
-            btn = await fetch_product(self._session, sku)
-            raw = json.dumps(btn) if btn else ""
-            state_match = re.search(r'"buttonState"\s*:\s*"([^"]+)"', raw)
-            status = state_match.group(1) if state_match else "UNKNOWN"
+            status = await fetch_product(self._session, sku)
             in_stock = status in {"ADD_TO_CART", "PURCHASABLE", "AVAILABLE"}
             emoji = "🟢" if in_stock else "🔴"
             name = info.get("name", sku)
