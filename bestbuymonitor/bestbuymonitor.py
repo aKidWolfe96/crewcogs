@@ -79,34 +79,41 @@ def _sync_fetch_status(sku: str) -> dict:
     try:
         page_url = f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
         resp = session.get(page_url, timeout=45)
+        resp.encoding = "utf-8"
         text = resp.text
 
-        # Extract status
-        if '"buttonState":"ADD_TO_CART"' in text or '"fulfillmentCode":"ADD_TO_CART"' in text:
-            status = "ADD_TO_CART"
-        elif '"buttonState":"SOLD_OUT"' in text or '"isOutOfStock":true' in text:
-            status = "SOLD_OUT"
-        elif '"buttonState":"COMING_SOON"' in text:
-            status = "COMING_SOON"
-        elif '"buttonState":"PRE_ORDER"' in text:
-            status = "PRE_ORDER"
+        # Find the product block specific to our SKU
+        # Search page may contain multiple products — anchor to our SKU first
+        sku_match = re.search(rf'"skuId"\s*:\s*"{sku}"', text)
+        if sku_match:
+            # Search forward from SKU position for buttonState and price
+            block = text[sku_match.start():sku_match.start() + 5000]
         else:
-            m = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', text)
-            if m:
-                status = m.group(1).upper()
-            elif 'data-button-state="ADD_TO_CART"' in text:
-                status = "ADD_TO_CART"
-            elif 'data-button-state="SOLD_OUT"' in text:
-                status = "SOLD_OUT"
+            # Fallback: search whole page
+            block = text
 
-        # Extract price
-        price_match = re.search(r'"currentPrice"\s*:\s*([0-9]+\.?[0-9]*)', text)
-        if price_match:
-            price = float(price_match.group(1))
-        if price is None:
-            price_match = re.search(r'"salePrice"\s*:\s*([0-9]+\.?[0-9]*)', text)
-            if price_match:
-                price = float(price_match.group(1))
+        # Extract status
+        m = re.search(r'"buttonState"\s*:\s*"([A-Z_]+)"', block)
+        if m:
+            status = m.group(1).upper()
+        elif 'data-button-state="ADD_TO_CART"' in block:
+            status = "ADD_TO_CART"
+        elif 'data-button-state="SOLD_OUT"' in block:
+            status = "SOLD_OUT"
+
+        # Extract price — anchored to same SKU block
+        for price_pattern in [
+            r'"price"\s*:\s*([0-9]+\.?[0-9]+)',
+            r'"regularPrice"\s*:\s*([0-9]+\.?[0-9]+)',
+            r'"currentPrice"\s*:\s*([0-9]+\.?[0-9]+)',
+            r'"salePrice"\s*:\s*([0-9]+\.?[0-9]+)',
+        ]:
+            pm = re.search(price_pattern, block)
+            if pm:
+                val = float(pm.group(1))
+                if val > 0:
+                    price = val
+                    break
     except Exception:
         pass
 
