@@ -1964,7 +1964,6 @@ class PokéBot(commands.Cog):
     # ── Shop ──────────────────────────────────────────────────────────────────
 
     @commands.command(name="shop")
-    @commands.command(name="shop")
     async def shop(self, ctx: commands.Context) -> None:
         """Browse the PokéMart."""
         player = await self._get_player(ctx.author)
