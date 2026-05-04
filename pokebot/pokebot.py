@@ -338,6 +338,8 @@ class PokéBot(commands.Cog):
         self._pending_respawn: Dict[int, discord.TextChannel] = {}  # guild_id -> channel waiting for activity
         self._msg_counts:   Dict[int, int]            = {}  # channel_id -> message count
         self._trades:       Dict[int, dict]           = {}  # target_user_id -> pending trade offer
+        self._raids:        Dict[int, dict]           = {}  # guild_id   -> active raid
+        self._raid_tasks:   Dict[int, asyncio.Task]   = {}  # guild_id   -> raid loop task
 
         self.config = Config.get_conf(self, identifier=0x504F4B45424F54, force_registration=True)
 
@@ -392,6 +394,8 @@ class PokéBot(commands.Cog):
         for task in self._spawn_tasks.values():
             task.cancel()
         for task in self._flee_tasks.values():
+            task.cancel()
+        for task in self._raid_tasks.values():
             task.cancel()
         if self._session:
             await self._session.close()
@@ -2665,14 +2669,29 @@ class PokéBot(commands.Cog):
                     inline=False,
                 )
             elif pg == 3:
-                embed.title = "📖 PokéBot — Battling & Trading"
+                embed.title = "📖 PokéBot — Battling, Raids & Trading"
                 embed.add_field(
                     name="⚔️ Battling",
                     value="\n".join([
-                        f"`{prefix}battle @user` — Challenge someone to a battle",
+                        f"`{prefix}battle @user` — Challenge someone to a 1v1 battle",
                         f"`{prefix}move <move_name>` — Use a move in your current battle",
                         f"• Winner earns 100 {currency} + full XP",
                         "• Loser earns 30% consolation XP · 3-min AFK timeout",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🔴 Raids",
+                    value="\n".join([
+                        f"`{prefix}raidjoin` — Join the active raid with your active Pokémon",
+                        f"`{prefix}raidstatus` — Check boss HP, party, and turn count",
+                        f"`{prefix}raidstart [pokemon]` — *(Admin)* Start a raid boss",
+                        f"`{prefix}raidcancel` — *(Admin)* Cancel the active raid",
+                        "• Raids are co-op — all joined trainers attack the boss automatically each turn",
+                        "• Boss fights back! If everyone faints, the raid is lost",
+                        "• Victory: guaranteed catch attempt, XP & credits scaled by your damage",
+                        "• ⭐–⭐⭐⭐⭐⭐ star tiers: higher = tougher boss, better rewards",
+                        "• Shiny bosses have a boosted catch chance for all participants",
                     ]),
                     inline=False,
                 )
@@ -3307,6 +3326,988 @@ class PokéBot(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # RAID SYSTEM
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Legendary / rare boss pool ────────────────────────────────────────────
+    # Weighted: "legendary" entries appear more often than "mythical" ones.
+    # Pseudo-legendaries give variety for lower-star raids.
+    RAID_BOSS_POOL: List[Dict] = [
+        # ── Legendary birds / beasts / titans (frequent) ──────────────────────
+        {"id": 144,  "name": "Articuno",   "tier": "legendary"},
+        {"id": 145,  "name": "Zapdos",     "tier": "legendary"},
+        {"id": 146,  "name": "Moltres",    "tier": "legendary"},
+        {"id": 243,  "name": "Raikou",     "tier": "legendary"},
+        {"id": 244,  "name": "Entei",      "tier": "legendary"},
+        {"id": 245,  "name": "Suicune",    "tier": "legendary"},
+        {"id": 377,  "name": "Regirock",   "tier": "legendary"},
+        {"id": 378,  "name": "Regice",     "tier": "legendary"},
+        {"id": 379,  "name": "Registeel",  "tier": "legendary"},
+        {"id": 380,  "name": "Latias",     "tier": "legendary"},
+        {"id": 381,  "name": "Latios",     "tier": "legendary"},
+        {"id": 480,  "name": "Uxie",       "tier": "legendary"},
+        {"id": 481,  "name": "Mesprit",    "tier": "legendary"},
+        {"id": 482,  "name": "Azelf",      "tier": "legendary"},
+        {"id": 638,  "name": "Cobalion",   "tier": "legendary"},
+        {"id": 639,  "name": "Terrakion",  "tier": "legendary"},
+        {"id": 640,  "name": "Virizion",   "tier": "legendary"},
+        {"id": 716,  "name": "Xerneas",    "tier": "legendary"},
+        {"id": 717,  "name": "Yveltal",    "tier": "legendary"},
+        {"id": 772,  "name": "Type: Null", "name": "type-null", "tier": "legendary"},
+        {"id": 785,  "name": "Tapu Koko",  "name": "tapu-koko",  "tier": "legendary"},
+        {"id": 786,  "name": "Tapu Lele",  "name": "tapu-lele",  "tier": "legendary"},
+        {"id": 787,  "name": "Tapu Bulu",  "name": "tapu-bulu",  "tier": "legendary"},
+        {"id": 788,  "name": "Tapu Fini",  "name": "tapu-fini",  "tier": "legendary"},
+        # ── Greater legendaries (medium frequency) ────────────────────────────
+        {"id": 150,  "name": "mewtwo",     "tier": "greater"},
+        {"id": 249,  "name": "lugia",      "tier": "greater"},
+        {"id": 250,  "name": "ho-oh",      "tier": "greater"},
+        {"id": 382,  "name": "kyogre",     "tier": "greater"},
+        {"id": 383,  "name": "groudon",    "tier": "greater"},
+        {"id": 384,  "name": "rayquaza",   "tier": "greater"},
+        {"id": 483,  "name": "dialga",     "tier": "greater"},
+        {"id": 484,  "name": "palkia",     "tier": "greater"},
+        {"id": 485,  "name": "heatran",    "tier": "greater"},
+        {"id": 488,  "name": "cresselia",  "tier": "greater"},
+        {"id": 643,  "name": "reshiram",   "tier": "greater"},
+        {"id": 644,  "name": "zekrom",     "tier": "greater"},
+        {"id": 718,  "name": "zygarde",    "tier": "greater"},
+        {"id": 800,  "name": "necrozma",   "tier": "greater"},
+        {"id": 888,  "name": "zacian",     "tier": "greater"},
+        {"id": 889,  "name": "zamazenta",  "tier": "greater"},
+        {"id": 890,  "name": "eternatus",  "tier": "greater"},
+        {"id": 905,  "name": "enamorus",   "name": "enamorus-incarnate", "tier": "greater"},
+        # ── Mythicals (rare) ──────────────────────────────────────────────────
+        {"id": 151,  "name": "mew",        "tier": "mythical"},
+        {"id": 251,  "name": "celebi",     "tier": "mythical"},
+        {"id": 385,  "name": "jirachi",    "tier": "mythical"},
+        {"id": 491,  "name": "darkrai",    "tier": "mythical"},
+        {"id": 492,  "name": "shaymin",    "tier": "mythical"},
+        {"id": 494,  "name": "victini",    "tier": "mythical"},
+        {"id": 647,  "name": "keldeo",     "tier": "mythical"},
+        {"id": 720,  "name": "hoopa",      "tier": "mythical"},
+        {"id": 801,  "name": "magearna",   "tier": "mythical"},
+        {"id": 802,  "name": "marshadow",  "tier": "mythical"},
+        {"id": 807,  "name": "zeraora",    "tier": "mythical"},
+        {"id": 898,  "name": "calyrex",    "tier": "mythical"},
+        # ── Pseudo-legendaries (common, give variety) ─────────────────────────
+        {"id": 149,  "name": "dragonite",  "tier": "pseudo"},
+        {"id": 248,  "name": "tyranitar",  "tier": "pseudo"},
+        {"id": 373,  "name": "salamence",  "tier": "pseudo"},
+        {"id": 376,  "name": "metagross",  "tier": "pseudo"},
+        {"id": 445,  "name": "garchomp",   "tier": "pseudo"},
+        {"id": 635,  "name": "hydreigon",  "tier": "pseudo"},
+        {"id": 681,  "name": "aegislash",  "tier": "pseudo"},
+        {"id": 784,  "name": "kommo-o",    "tier": "pseudo"},
+        {"id": 887,  "name": "dragapult",  "tier": "pseudo"},
+        {"id": 996,  "name": "baxcalibur", "tier": "pseudo"},
+    ]
+
+    # Tier weights for random selection
+    _RAID_TIER_WEIGHTS = {"pseudo": 35, "legendary": 40, "greater": 18, "mythical": 7}
+
+    def _pick_random_raid_boss(self) -> Dict:
+        """Pick a random boss from the pool using tier weights."""
+        weighted: List[Dict] = []
+        for entry in self.RAID_BOSS_POOL:
+            w = self._RAID_TIER_WEIGHTS.get(entry["tier"], 10)
+            weighted.extend([entry] * w)
+        return random.choice(weighted)
+
+    # ── Raid helpers ──────────────────────────────────────────────────────────
+
+    def _raid_star_tier(self, level: int) -> Tuple[int, str]:
+        """Return (stars, label) based on boss level."""
+        if level >= 90: return 5, "⭐⭐⭐⭐⭐"
+        if level >= 75: return 4, "⭐⭐⭐⭐"
+        if level >= 60: return 3, "⭐⭐⭐"
+        if level >= 50: return 2, "⭐⭐"
+        return 1, "⭐"
+
+    def _raid_balls_awarded(self, stars: int, alive: bool) -> int:
+        """Number of Raid Balls given on victory. Survivors get +1."""
+        base = {1: 2, 2: 3, 3: 4, 4: 5, 5: 6}[stars]
+        return base + (1 if alive else 0)
+
+    def _build_raid_embed(self, raid: dict, extra_lines: Optional[List[str]] = None) -> discord.Embed:
+        boss         = raid["boss"]
+        stars, star_label = self._raid_star_tier(boss["level"])
+        hp_current   = raid["boss_hp"]
+        hp_max       = raid["boss_hp_max"]
+        bar          = hp_bar(hp_current, hp_max)
+        participants = raid["participants"]
+
+        color_map = {1: COLORS["green"], 2: COLORS["blue"], 3: COLORS["purple"],
+                     4: COLORS["orange"], 5: COLORS["shiny"]}
+        embed = discord.Embed(
+            title=f"{'✨ ' if boss.get('shiny') else ''}🔴 RAID BOSS — {boss['displayName']} {star_label}",
+            color=color_map.get(stars, COLORS["red"]),
+        )
+        if boss.get("spriteUrl"):
+            embed.set_thumbnail(url=boss["spriteUrl"])
+
+        embed.add_field(
+            name="Boss HP",
+            value=f"{bar}  **{hp_current:,} / {hp_max:,}**",
+            inline=False,
+        )
+        embed.add_field(
+            name="Level / Type",
+            value=f"Lv.{boss['level']} | {' / '.join(t.capitalize() for t in boss['types'])}",
+            inline=True,
+        )
+        embed.add_field(name="Turn", value=str(raid.get("turn", 0)), inline=True)
+        embed.add_field(name="Trainers", value=str(len(participants)), inline=True)
+
+        if participants:
+            p_lines = []
+            for p in participants:
+                poke   = p["pokemon"]
+                alive  = poke["stats"]["hp"] > 0
+                status = f"HP {poke['stats']['hp']}/{poke['stats']['maxHp']}" if alive else "💀 Fainted"
+                dmg    = p.get("damage_dealt", 0)
+                heal_cd = f" _(heal ready)_" if p.get("heal_cooldown", 0) == 0 else ""
+                p_lines.append(
+                    f"{'✅' if alive else '❌'} **{p['username']}** — "
+                    f"{poke['displayName']} Lv.{poke['level']} | {status} | 💥 {dmg:,} dmg{heal_cd}"
+                )
+            embed.add_field(name="👥 Raid Party", value="\n".join(p_lines), inline=False)
+
+        if extra_lines:
+            embed.add_field(name="📋 Turn Log", value="\n".join(extra_lines[-8:]), inline=False)
+
+        return embed
+
+    async def _run_raid(self, guild: discord.Guild, channel: discord.TextChannel) -> None:
+        """Main raid loop — join window then auto-battle."""
+        raid = self._raids.get(guild.id)
+        if not raid:
+            return
+
+        # ── Join window ───────────────────────────────────────────────────────
+        await asyncio.sleep(120)
+
+        raid = self._raids.get(guild.id)
+        if not raid:
+            return
+
+        if not raid["participants"]:
+            self._raids.pop(guild.id, None)
+            try:
+                await channel.send(embed=discord.Embed(
+                    color=COLORS["gray"],
+                    description=f"🏃 Nobody joined the raid — **{raid['boss']['displayName']}** fled!",
+                ))
+            except discord.HTTPException:
+                pass
+            return
+
+        boss        = raid["boss"]
+        n_trainers  = len(raid["participants"])
+        stars, _    = self._raid_star_tier(boss["level"])
+
+        # ── Scale boss HP to party size so 3–4 players can always win ─────────
+        # Base multipliers are tuned for a solo player, then scaled up linearly
+        # with a small bonus per extra trainer so it gets slightly tougher but
+        # never disproportionate.
+        solo_mult   = {1: 3, 2: 4, 3: 6, 4: 8, 5: 11}[stars]
+        party_mult  = solo_mult + (n_trainers - 1) * 1.5
+        boss_hp_max = math.floor(boss["stats"]["maxHp"] * party_mult)
+        raid["boss_hp"]     = boss_hp_max
+        raid["boss_hp_max"] = boss_hp_max
+
+        await channel.send(embed=discord.Embed(
+            color=COLORS["red"],
+            description=(
+                f"⚔️ **The raid battle begins!** {n_trainers} trainer(s) vs "
+                f"**{boss['displayName']}** (Lv.{boss['level']})!\n\n"
+                f"Boss HP scaled to your party: **{boss_hp_max:,}**\n\n"
+                f"The boss attacks every turn. Use `raidswap <slot>` if your Pokémon faints, "
+                f"or `raidheal <item>` to heal mid-raid!"
+            ),
+        ))
+
+        # ── Battle loop ───────────────────────────────────────────────────────
+        MAX_TURNS  = 50
+        TURN_DELAY = 5
+
+        for turn in range(1, MAX_TURNS + 1):
+            await asyncio.sleep(TURN_DELAY)
+            raid = self._raids.get(guild.id)
+            if not raid:
+                return
+
+            turn_log: List[str] = [f"**— Turn {turn} —**"]
+            raid["turn"] = turn
+
+            # Tick down heal cooldowns
+            for p in raid["participants"]:
+                if p.get("heal_cooldown", 0) > 0:
+                    p["heal_cooldown"] -= 1
+
+            alive_participants = [p for p in raid["participants"] if p["pokemon"]["stats"]["hp"] > 0]
+            if not alive_participants:
+                break
+
+            # ── Each survivor attacks ──────────────────────────────────────────
+            for participant in alive_participants:
+                poke  = participant["pokemon"]
+                moves = [m for m in poke.get("moves", []) if m]
+                if not moves:
+                    turn_log.append(f"⚠️ {poke['displayName']} has no usable moves!")
+                    continue
+
+                # Cache best move per participant to avoid re-fetching every turn
+                if not participant.get("best_move"):
+                    best_move, best_power = moves[0], 0
+                    for move_name in moves:
+                        try:
+                            md = await fetch_move_data(self._session, move_name)
+                            pw = md.get("power") or 0
+                            if pw > best_power:
+                                best_power = pw
+                                best_move  = move_name
+                        except Exception:
+                            pass
+                    participant["best_move"] = best_move
+
+                move_name = participant["best_move"]
+                try:
+                    move_data = await fetch_move_data(self._session, move_name)
+                except Exception:
+                    turn_log.append(f"⚠️ {poke['displayName']}'s {move_name} failed!")
+                    continue
+
+                power     = move_data.get("power") or 40
+                move_type = move_data["type"]["name"]
+                accuracy  = move_data.get("accuracy") or 100
+
+                if random.random() * 100 > accuracy:
+                    turn_log.append(f"💨 {poke['displayName']} used **{move_name.replace('-', ' ')}** — missed!")
+                    continue
+
+                atk      = poke["stats"].get("attack") or poke["stats"].get("special-attack") or 50
+                lvl      = poke["level"]
+                type_eff = calculate_type_effectiveness(move_type, boss["types"])
+                stab     = 1.5 if move_type in poke["types"] else 1.0
+                crit     = 1.5 if random.random() < 0.0625 else 1.0
+                rand_m   = 0.85 + random.random() * 0.15
+                boss_def = min(raid["boss_defense"], 80)
+
+                damage = max(1, math.floor(
+                    (((2 * lvl / 5 + 2) * power * atk / boss_def) / 50 + 2)
+                    * stab * type_eff * rand_m * crit
+                ))
+
+                raid["boss_hp"] = max(0, raid["boss_hp"] - damage)
+                participant["damage_dealt"] = participant.get("damage_dealt", 0) + damage
+
+                eff_txt  = effectiveness_label(type_eff)
+                crit_txt = " ⚡ Crit!" if crit > 1 else ""
+                turn_log.append(
+                    f"🎯 **{participant['username']}**'s {poke['displayName']} → "
+                    f"**{move_name.replace('-', ' ')}**{crit_txt} {eff_txt} **{damage:,}** dmg"
+                )
+
+                if raid["boss_hp"] <= 0:
+                    break
+
+            # ── Victory check ──────────────────────────────────────────────────
+            if raid["boss_hp"] <= 0:
+                embed = self._build_raid_embed(raid, turn_log)
+                embed.color = COLORS["yellow"]
+                embed.title = f"🏆 RAID VICTORY — {boss['displayName']} defeated!"
+                await channel.send(embed=embed)
+                await self._resolve_raid_victory(guild, channel, raid)
+                self._raids.pop(guild.id, None)
+                return
+
+            # ── Boss counterattack ─────────────────────────────────────────────
+            # Hits the trainer with the highest current HP (targets the strongest)
+            target_p    = max(alive_participants, key=lambda p: p["pokemon"]["stats"]["hp"])
+            target_poke = target_p["pokemon"]
+            boss_atk    = raid["boss_attack"]
+            target_def  = target_poke["stats"].get("defense") or 40
+            boss_damage = max(1, math.floor(
+                (((2 * boss["level"] / 5 + 2) * 80 * boss_atk / target_def) / 50 + 2)
+                * (0.85 + random.random() * 0.15)
+            ))
+            target_poke["stats"]["hp"] = max(0, target_poke["stats"]["hp"] - boss_damage)
+            fainted_str = (
+                f" 💀 **{target_p['username']}'s {target_poke['displayName']} fainted!** "
+                f"Use `raidswap <slot>` to send in another Pokémon!"
+                if target_poke["stats"]["hp"] <= 0 else ""
+            )
+            turn_log.append(
+                f"🔴 **{boss['displayName']}** attacks "
+                f"**{target_p['username']}'s {target_poke['displayName']}** — "
+                f"**{boss_damage:,}** dmg!{fainted_str}"
+            )
+
+            embed = self._build_raid_embed(raid, turn_log)
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+            if all(p["pokemon"]["stats"]["hp"] <= 0 for p in raid["participants"]):
+                break
+
+        # ── Defeat / timeout ──────────────────────────────────────────────────
+        raid = self._raids.pop(guild.id, None)
+        if not raid:
+            return
+
+        total_dmg = sum(p.get("damage_dealt", 0) for p in raid["participants"])
+        pct       = (total_dmg / max(raid["boss_hp_max"], 1)) * 100
+        await channel.send(embed=discord.Embed(
+            color=COLORS["red"],
+            title=f"💀 RAID DEFEAT — {boss['displayName']} wins!",
+            description=(
+                f"All trainers fainted! **{boss['displayName']}** escapes.\n\n"
+                f"**Total damage:** {total_dmg:,} / {raid['boss_hp_max']:,} HP ({pct:.1f}%)\n\n"
+                f"Everyone earns consolation XP — train harder and challenge it again!"
+            ),
+        ))
+        # Consolation XP for everyone
+        for participant in raid["participants"]:
+            member = guild.get_member(participant["member_id"])
+            if not member:
+                continue
+            p_data = await self._get_player(member)
+            if not p_data:
+                continue
+            poke = p_data["pokemon"][p_data["activePokemonIndex"]]
+            poke["xp"] = poke.get("xp", 0) + max(30, math.floor(participant.get("damage_dealt", 0) / 10))
+            self._check_level_up(poke)
+            await self._save_player(member, p_data)
+
+    async def _resolve_raid_victory(
+        self, guild: discord.Guild, channel: discord.TextChannel, raid: dict
+    ) -> None:
+        """Award rewards — multiple Raid Ball throws — to every participant."""
+        boss      = raid["boss"]
+        currency  = await bank.get_currency_name(guild)
+        total_dmg = max(1, sum(p.get("damage_dealt", 0) for p in raid["participants"]))
+        stars, _  = self._raid_star_tier(boss["level"])
+
+        # Shiny reveal on victory
+        shiny_chance   = {1: 1/100, 2: 1/75, 3: 1/50, 4: 1/30, 5: 1/20}[stars]
+        boss_is_shiny  = random.random() < shiny_chance
+        if boss_is_shiny:
+            boss["shiny"] = True
+
+        lines = []
+        for participant in raid["participants"]:
+            member = guild.get_member(participant["member_id"])
+            if not member:
+                continue
+            p_data = await self._get_player(member)
+            if not p_data:
+                continue
+
+            poke    = p_data["pokemon"][p_data["activePokemonIndex"]]
+            alive   = participant["pokemon"]["stats"]["hp"] > 0
+            contrib = participant.get("damage_dealt", 0) / total_dmg
+
+            # XP
+            xp_gain    = math.floor(100 + boss["level"] * 2 + contrib * 300)
+            poke["xp"] = poke.get("xp", 0) + xp_gain
+            lvl_msgs   = self._check_level_up(poke)
+
+            # Credits
+            base_credits = stars * 200
+            bonus        = math.floor(contrib * stars * 400)
+            credits      = base_credits + bonus
+            await self._save_player(member, p_data)
+            try:
+                await _deposit(member, credits)
+            except Exception:
+                pass
+
+            # ── Multiple Raid Ball throws ──────────────────────────────────────
+            n_balls      = self._raid_balls_awarded(stars, alive)
+            base_catch   = 0.55 + contrib * 0.20          # 55–75% base
+            shiny_bonus  = 0.05 if boss_is_shiny else 0
+            per_ball     = min(base_catch + shiny_bonus, 0.85)
+
+            caught_count = 0
+            throw_lines  = []
+            for throw_num in range(1, n_balls + 1):
+                if random.random() < per_ball:
+                    caught_count += 1
+                    throw_lines.append(f"  🔵 Ball {throw_num}: ✅ **Caught!**")
+                else:
+                    throw_lines.append(f"  🔵 Ball {throw_num}: 💨 Broke free...")
+
+            # Add caught copies to collection (one per successful throw)
+            max_pokemon = await self.config.guild(guild).max_pokemon()
+            actually_added = 0
+            for _ in range(caught_count):
+                if len(p_data["pokemon"]) < max_pokemon:
+                    boss_copy               = copy.deepcopy(boss)
+                    boss_copy["shiny"]      = boss_is_shiny
+                    boss_copy["stats"]["hp"]= boss_copy["stats"]["maxHp"]
+                    boss_copy["caughtAt"]   = time.time()
+                    p_data["pokemon"].append(boss_copy)
+                    self._update_dex(p_data, boss_copy)
+                    actually_added += 1
+            if actually_added:
+                await self._save_player(member, p_data)
+
+            caught_str = (
+                f"🎉 **Caught {actually_added}× {boss['displayName']}{'  ✨' if boss_is_shiny else ''}!**"
+                if actually_added
+                else f"😔 {boss['displayName']} wasn't caught this time."
+            )
+            lvl_str = f"\n  ⬆️ {lvl_msgs[0]}" if lvl_msgs else ""
+
+            lines.append(
+                f"{'✅' if alive else '💀'} **{participant['username']}** — "
+                f"+{xp_gain} XP · +{credits} {currency} · {n_balls} Raid Ball(s)\n"
+                + "\n".join(throw_lines)
+                + f"\n  {caught_str}{lvl_str}"
+            )
+
+            if len(lvl_msgs) > 1:
+                try:
+                    await channel.send(embed=discord.Embed(
+                        description="\n".join(lvl_msgs[1:]), color=COLORS["green"]
+                    ))
+                except discord.HTTPException:
+                    pass
+
+        shiny_announce = "\n\n✨ **The boss was SHINY — boosted catch chances for everyone!**" if boss_is_shiny else ""
+        embed = discord.Embed(
+            title="🏆 Raid Rewards",
+            description="\n\n".join(lines) + shiny_announce,
+            color=COLORS["yellow"],
+        )
+        if boss.get("spriteUrl"):
+            embed.set_thumbnail(url=boss["spriteUrl"])
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    # ── Raid commands ─────────────────────────────────────────────────────────
+
+    @commands.command(name="raidstart", aliases=["startraid"])
+    @checks.admin_or_permissions(manage_guild=True)
+    async def raidstart(self, ctx: commands.Context, *, pokemon_name: str = "") -> None:
+        """(Admin) Start a raid in the spawn channel. Usage: `raidstart [pokemon name]`
+        Omit the name for a random legendary or rare boss."""
+        if ctx.guild.id in self._raids:
+            await ctx.send(embed=error_embed("A raid is already active! Use `raidstatus` to check on it."))
+            return
+
+        channel_id = await self.config.guild(ctx.guild).spawn_channel_id()
+        if not channel_id:
+            await ctx.send(embed=error_embed("No spawn channel set! Use `pokeset spawnchannel #channel` first."))
+            return
+        channel = ctx.guild.get_channel(channel_id)
+        if not channel:
+            await ctx.send(embed=error_embed("Spawn channel not found — reconfigure with `pokeset spawnchannel`."))
+            return
+
+        async with ctx.typing():
+            if pokemon_name.strip():
+                slug = pokemon_name.lower().strip().replace(" ", "-")
+                try:
+                    boss = await build_pokemon_instance(
+                        self._session, slug, level=random.randint(60, 100),
+                    )
+                except Exception:
+                    await ctx.send(embed=error_embed(f"Couldn't find **{pokemon_name}**. Check the spelling!"))
+                    return
+            else:
+                # Pick from the legendary/rare pool
+                pick  = self._pick_random_raid_boss()
+                slug  = pick.get("name", str(pick["id"]))
+                level = random.randint(70, 100) if pick["tier"] in ("greater", "mythical") else random.randint(55, 90)
+                try:
+                    boss = await build_pokemon_instance(self._session, slug, level=level)
+                except Exception:
+                    # Fallback to random if this particular slug fails
+                    boss = await build_pokemon_instance(
+                        self._session, get_random_pokemon_id(), level=random.randint(55, 100)
+                    )
+
+        stars, star_label = self._raid_star_tier(boss["level"])
+        tier_label = {
+            "pseudo": "Rare", "legendary": "Legendary",
+            "greater": "Greater Legendary", "mythical": "Mythical",
+        }.get(next((e["tier"] for e in self.RAID_BOSS_POOL if e.get("name") == slug), ""), "Boss")
+
+        # Placeholder HP — scaled to party size once battle starts
+        placeholder_hp = boss["stats"]["maxHp"] * {1:3,2:4,3:6,4:8,5:11}[stars]
+
+        boss_attack  = boss["stats"].get("attack") or boss["stats"].get("special-attack") or 80
+        boss_defense = boss["stats"].get("defense") or 60
+
+        raid = {
+            "boss":         boss,
+            "boss_hp":      placeholder_hp,
+            "boss_hp_max":  placeholder_hp,
+            "boss_attack":  boss_attack,
+            "boss_defense": boss_defense,
+            "participants": [],
+            "turn":         0,
+            "channel_id":   channel.id,
+            "started_at":   time.time(),
+        }
+        self._raids[ctx.guild.id] = raid
+
+        balls_preview = self._raid_balls_awarded(stars, alive=True)
+        embed = discord.Embed(
+            title=f"🔴 RAID BATTLE — {boss['displayName']} appeared! {star_label}",
+            description=(
+                f"**{tier_label}** · Lv.{boss['level']}\n"
+                f"Type: {' / '.join(t.capitalize() for t in boss['types'])}\n\n"
+                f"⏳ **Join window: 2 minutes** — type `raidjoin` to enter!\n\n"
+                f"**On victory:** {balls_preview}–{balls_preview + 1} Raid Balls per trainer\n"
+                f"_Boss HP will scale to however many trainers join._"
+            ),
+            color={1:COLORS["green"],2:COLORS["blue"],3:COLORS["purple"],4:COLORS["orange"],5:COLORS["shiny"]}[stars],
+        )
+        if boss.get("spriteUrl"):
+            embed.set_image(url=boss["spriteUrl"])
+        embed.set_footer(text=f"{star_label} · Higher stars = tougher boss & better rewards!")
+        await channel.send(embed=embed)
+
+        if channel != ctx.channel:
+            await ctx.send(embed=success_embed(f"Raid started in {channel.mention}!"))
+
+        task = self.bot.loop.create_task(self._run_raid(ctx.guild, channel))
+        self._raid_tasks[ctx.guild.id] = task
+
+    @commands.command(name="raidjoin", aliases=["joinraid"])
+    async def raidjoin(self, ctx: commands.Context) -> None:
+        """Join the active raid with your active Pokémon during the 2-minute window."""
+        raid = self._raids.get(ctx.guild.id)
+        if not raid:
+            await ctx.send(embed=error_embed("There's no active raid right now!"))
+            return
+        if raid["turn"] > 0:
+            await ctx.send(embed=error_embed("The raid has already started — you can only join during the 2-minute window!"))
+            return
+
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey with `start` before joining raids!"))
+            return
+        if any(p["member_id"] == ctx.author.id for p in raid["participants"]):
+            await ctx.send(embed=error_embed("You've already joined this raid!"))
+            return
+
+        active_poke = player["pokemon"][player["activePokemonIndex"]]
+        if active_poke["stats"]["hp"] <= 0:
+            healthy = next((i + 1 for i, p in enumerate(player["pokemon"]) if p["stats"]["hp"] > 0), None)
+            hint = f"Try `active {healthy}` to switch first." if healthy else "Use `use revive` to revive a Pokémon first."
+            await ctx.send(embed=error_embed(f"**{active_poke['displayName']}** has fainted!\n{hint}"))
+            return
+
+        raid["participants"].append({
+            "member_id":    ctx.author.id,
+            "username":     ctx.author.display_name,
+            "pokemon":      copy.deepcopy(active_poke),
+            "damage_dealt": 0,
+            "heal_cooldown": 0,
+            "best_move":    None,
+        })
+
+        boss = raid["boss"]
+        await ctx.send(embed=discord.Embed(
+            color=COLORS["green"],
+            description=(
+                f"✅ **{ctx.author.display_name}** joined with "
+                f"**{active_poke['displayName']}** (Lv.{active_poke['level']})!\n"
+                f"_{len(raid['participants'])} trainer(s) ready._"
+            ),
+        ))
+
+    @commands.command(name="raidswap")
+    async def raidswap(self, ctx: commands.Context, slot: int) -> None:
+        """Swap your fainted raid Pokémon for another. Usage: `raidswap <slot>`
+        Only usable during an active raid when your current Pokémon has fainted."""
+        raid = self._raids.get(ctx.guild.id)
+        if not raid or raid["turn"] == 0:
+            await ctx.send(embed=error_embed("No active raid battle right now."))
+            return
+
+        participant = next((p for p in raid["participants"] if p["member_id"] == ctx.author.id), None)
+        if not participant:
+            await ctx.send(embed=error_embed("You're not in this raid!"))
+            return
+        if participant["pokemon"]["stats"]["hp"] > 0:
+            await ctx.send(embed=error_embed(
+                f"**{participant['pokemon']['displayName']}** is still healthy — "
+                f"you can only swap in a Pokémon after yours faints!"
+            ))
+            return
+
+        player = await self._get_player(ctx.author)
+        if not player:
+            return
+
+        idx = slot - 1
+        if idx < 0 or idx >= len(player["pokemon"]):
+            await ctx.send(embed=error_embed(f"Invalid slot. You have {len(player['pokemon'])} Pokémon."))
+            return
+
+        new_poke = player["pokemon"][idx]
+        if new_poke["stats"]["hp"] <= 0:
+            await ctx.send(embed=error_embed(f"**{new_poke['displayName']}** has fainted too! Pick a healthy one."))
+            return
+
+        old_name = participant["pokemon"]["displayName"]
+        participant["pokemon"]   = copy.deepcopy(new_poke)
+        participant["best_move"] = None   # recalculate best move for the new Pokémon
+
+        await ctx.send(embed=discord.Embed(
+            color=COLORS["blue"],
+            description=(
+                f"🔄 **{ctx.author.display_name}** swapped **{old_name}** → "
+                f"**{new_poke['displayName']}** (Lv.{new_poke['level']}, "
+                f"HP {new_poke['stats']['hp']}/{new_poke['stats']['maxHp']})!"
+            ),
+        ))
+
+    @commands.command(name="raidheal")
+    async def raidheal(self, ctx: commands.Context, item: str = "potion") -> None:
+        """Use a healing item on your raid Pokémon. Usage: `raidheal [item]`
+        Heals your Pokémon in the raid without touching your stored HP.
+        Can only be used once every 2 turns per trainer."""
+        raid = self._raids.get(ctx.guild.id)
+        if not raid or raid["turn"] == 0:
+            await ctx.send(embed=error_embed("No active raid battle right now."))
+            return
+
+        participant = next((p for p in raid["participants"] if p["member_id"] == ctx.author.id), None)
+        if not participant:
+            await ctx.send(embed=error_embed("You're not in this raid!"))
+            return
+        if participant["pokemon"]["stats"]["hp"] <= 0:
+            await ctx.send(embed=error_embed(
+                f"**{participant['pokemon']['displayName']}** has fainted — use `raidswap <slot>` instead!"
+            ))
+            return
+
+        cooldown = participant.get("heal_cooldown", 0)
+        if cooldown > 0:
+            await ctx.send(embed=error_embed(f"Healing is on cooldown for **{cooldown}** more turn(s)!"))
+            return
+
+        item_slug = item.lower().replace(" ", "").replace("-", "")
+        if item_slug not in HEAL_AMOUNTS:
+            await ctx.send(embed=error_embed(f"Unknown item. Valid: {', '.join(HEAL_AMOUNTS.keys())}"))
+            return
+
+        player = await self._get_player(ctx.author)
+        if not player:
+            return
+
+        count = player["items"].get("healing", {}).get(item_slug, 0)
+        if count <= 0:
+            await ctx.send(embed=error_embed(
+                f"You don't have any {ITEM_NAMES[item_slug]}! Buy some with `shop`."
+            ))
+            return
+
+        poke      = participant["pokemon"]
+        heal_amt  = HEAL_AMOUNTS[item_slug]
+
+        if item_slug == "revive":
+            await ctx.send(embed=error_embed("Revives can't be used mid-raid — swap in a different Pokémon instead."))
+            return
+
+        old_hp = poke["stats"]["hp"]
+        if math.isinf(heal_amt):
+            poke["stats"]["hp"] = poke["stats"]["maxHp"]
+        else:
+            poke["stats"]["hp"] = min(poke["stats"]["maxHp"], poke["stats"]["hp"] + int(heal_amt))
+        healed = poke["stats"]["hp"] - old_hp
+
+        # Consume the item from the player's real inventory
+        player["items"]["healing"][item_slug] -= 1
+        await self._save_player(ctx.author, player)
+
+        # Apply 2-turn cooldown
+        participant["heal_cooldown"] = 2
+
+        bar = hp_bar(poke["stats"]["hp"], poke["stats"]["maxHp"])
+        await ctx.send(embed=discord.Embed(
+            color=COLORS["green"],
+            description=(
+                f"💊 **{ctx.author.display_name}** used {ITEM_NAMES[item_slug]} on "
+                f"**{poke['displayName']}** — restored **{healed} HP**!\n"
+                f"HP: {bar} {poke['stats']['hp']}/{poke['stats']['maxHp']}\n"
+                f"_(Healing available again in 2 turns)_"
+            ),
+        ))
+
+    @commands.command(name="raidstatus", aliases=["raidinfo"])
+    async def raidstatus(self, ctx: commands.Context) -> None:
+        """Check the current raid — boss HP, party status, turn count."""
+        raid = self._raids.get(ctx.guild.id)
+        if not raid:
+            await ctx.send(embed=error_embed("No raid is active right now."))
+            return
+        embed = self._build_raid_embed(raid)
+        if raid["turn"] == 0:
+            embed.set_footer(text="⏳ Waiting for trainers — type `raidjoin` to enter!")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="raidcancel")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def raidcancel(self, ctx: commands.Context) -> None:
+        """(Admin) Cancel the current raid immediately."""
+        if ctx.guild.id not in self._raids:
+            await ctx.send(embed=error_embed("No raid is active right now."))
+            return
+        self._raids.pop(ctx.guild.id, None)
+        task = self._raid_tasks.pop(ctx.guild.id, None)
+        if task and not task.done():
+            task.cancel()
+        await ctx.send(embed=success_embed("Raid cancelled."))
+        """Return (stars, label) based on boss level."""
+        if level >= 90:  return 5, "⭐⭐⭐⭐⭐"
+        if level >= 75:  return 4, "⭐⭐⭐⭐"
+        if level >= 60:  return 3, "⭐⭐⭐"
+        if level >= 50:  return 2, "⭐⭐"
+        return 1, "⭐"
+
+    def _build_raid_embed(self, raid: dict, extra_lines: Optional[List[str]] = None) -> discord.Embed:
+        boss        = raid["boss"]
+        stars, star_label = self._raid_star_tier(boss["level"])
+        hp_current  = raid["boss_hp"]
+        hp_max      = raid["boss_hp_max"]
+        bar         = hp_bar(hp_current, hp_max)
+        participants = raid["participants"]   # list of {member_id, username, pokemon, damage_dealt}
+
+        color_map = {1: COLORS["green"], 2: COLORS["blue"], 3: COLORS["purple"],
+                     4: COLORS["orange"], 5: COLORS["shiny"]}
+        embed = discord.Embed(
+            title=f"{'✨ ' if boss.get('shiny') else ''}🔴 RAID BOSS — {boss['displayName']} {star_label}",
+            color=color_map.get(stars, COLORS["red"]),
+        )
+        if boss.get("spriteUrl"):
+            embed.set_thumbnail(url=boss["spriteUrl"])
+
+        embed.add_field(
+            name="Boss HP",
+            value=f"{bar}  **{hp_current:,} / {hp_max:,}**",
+            inline=False,
+        )
+        embed.add_field(
+            name="Level / Type",
+            value=f"Lv.{boss['level']} | {' / '.join(t.capitalize() for t in boss['types'])}",
+            inline=True,
+        )
+        embed.add_field(name="Turn", value=str(raid.get("turn", 0)), inline=True)
+        embed.add_field(name="Trainers", value=str(len(participants)), inline=True)
+
+        if participants:
+            p_lines = []
+            for p in participants:
+                poke  = p["pokemon"]
+                alive = poke["stats"]["hp"] > 0
+                status = f"HP {poke['stats']['hp']}/{poke['stats']['maxHp']}" if alive else "💀 Fainted"
+                dmg    = p.get("damage_dealt", 0)
+                p_lines.append(
+                    f"{'✅' if alive else '❌'} **{p['username']}** — "
+                    f"{poke['displayName']} Lv.{poke['level']} | {status} | 💥 {dmg:,} dmg"
+                )
+            embed.add_field(name="👥 Raid Party", value="\n".join(p_lines), inline=False)
+
+        if extra_lines:
+            embed.add_field(name="📋 Turn Log", value="\n".join(extra_lines[-8:]), inline=False)
+
+        return embed
+
+    async def _run_raid(self, guild: discord.Guild, channel: discord.TextChannel) -> None:
+        """Main raid loop — runs after the join window closes."""
+        raid = self._raids.get(guild.id)
+        if not raid:
+            return
+
+        # ── Join window ───────────────────────────────────────────────────────
+        join_seconds = 120
+        await asyncio.sleep(join_seconds)
+
+        raid = self._raids.get(guild.id)
+        if not raid:
+            return   # was cancelled
+
+        if not raid["participants"]:
+            self._raids.pop(guild.id, None)
+            try:
+                await channel.send(embed=discord.Embed(
+                    color=COLORS["gray"],
+                    description=(
+                        f"🏃 Nobody joined the raid in time — "
+                        f"**{raid['boss']['displayName']}** fled!"
+                    ),
+                ))
+            except discord.HTTPException:
+                pass
+            return
+
+        boss = raid["boss"]
+        await channel.send(embed=discord.Embed(
+            color=COLORS["red"],
+            description=(
+                f"⚔️ **The raid battle begins!** {len(raid['participants'])} trainer(s) vs "
+                f"**{boss['displayName']}** (Lv.{boss['level']})!\n"
+                f"The boss will attack every turn — defeat it before everyone faints!"
+            ),
+        ))
+
+        # ── Battle loop ───────────────────────────────────────────────────────
+        MAX_TURNS = 40
+        turn_delay = 4   # seconds between turns so it reads naturally
+
+        for turn in range(1, MAX_TURNS + 1):
+            await asyncio.sleep(turn_delay)
+            raid = self._raids.get(guild.id)
+            if not raid:
+                return
+
+            turn_log: List[str] = [f"**— Turn {turn} —**"]
+            raid["turn"] = turn
+
+            alive_participants = [p for p in raid["participants"] if p["pokemon"]["stats"]["hp"] > 0]
+            if not alive_participants:
+                break   # everyone fainted — handle defeat below
+
+            # Each surviving trainer attacks with their strongest move
+            for participant in alive_participants:
+                poke  = participant["pokemon"]
+                moves = [m for m in poke.get("moves", []) if m]
+                if not moves:
+                    turn_log.append(f"⚠️ {participant['username']}'s {poke['displayName']} has no moves!")
+                    continue
+
+                # Pick the move we have data for with the highest power
+                best_move = moves[0]
+                best_power = 0
+                for move_name in moves:
+                    try:
+                        md = await fetch_move_data(self._session, move_name)
+                        pw = md.get("power") or 0
+                        if pw > best_power:
+                            best_power = pw
+                            best_move  = move_name
+                    except Exception:
+                        pass
+
+                try:
+                    move_data = await fetch_move_data(self._session, best_move)
+                except Exception:
+                    turn_log.append(f"⚠️ {poke['displayName']}'s {best_move} failed!")
+                    continue
+
+                power     = move_data.get("power") or 40
+                move_type = move_data["type"]["name"]
+                accuracy  = move_data.get("accuracy") or 100
+
+                if random.random() * 100 > accuracy:
+                    turn_log.append(f"💨 {poke['displayName']} used **{best_move.replace('-', ' ')}** but missed!")
+                    continue
+
+                atk      = poke["stats"].get("attack") or poke["stats"].get("special-attack") or 50
+                lvl      = poke["level"]
+                type_eff = calculate_type_effectiveness(move_type, boss["types"])
+                stab     = 1.5 if move_type in poke["types"] else 1.0
+                crit     = 1.5 if random.random() < 0.0625 else 1.0
+                rand_m   = 0.85 + random.random() * 0.15
+                # Boss defense is capped at 80 so it doesn't become untouchable
+                boss_def = min(raid["boss_defense"], 80)
+
+                damage = max(1, math.floor(
+                    (((2 * lvl / 5 + 2) * power * atk / boss_def) / 50 + 2)
+                    * stab * type_eff * rand_m * crit
+                ))
+
+                raid["boss_hp"] = max(0, raid["boss_hp"] - damage)
+                participant["damage_dealt"] = participant.get("damage_dealt", 0) + damage
+
+                eff_txt = effectiveness_label(type_eff)
+                crit_txt = " ⚡ Critical!" if crit > 1 else ""
+                turn_log.append(
+                    f"🎯 {poke['displayName']} → **{best_move.replace('-', ' ')}**"
+                    f"{crit_txt} {eff_txt} — **{damage:,}** dmg"
+                )
+
+                if raid["boss_hp"] <= 0:
+                    break
+
+            if raid["boss_hp"] <= 0:
+                # ── Victory ───────────────────────────────────────────────────
+                embed = self._build_raid_embed(raid, turn_log)
+                embed.color = COLORS["yellow"]
+                embed.title = f"🏆 RAID VICTORY — {boss['displayName']} defeated!"
+                await channel.send(embed=embed)
+                await self._resolve_raid_victory(guild, channel, raid)
+                self._raids.pop(guild.id, None)
+                return
+
+            # ── Boss counterattack ─────────────────────────────────────────────
+            # Boss picks a random alive target and deals damage scaled by its level
+            target_p = random.choice(alive_participants)
+            target_poke = target_p["pokemon"]
+            boss_atk    = raid["boss_attack"]
+            target_def  = target_poke["stats"].get("defense") or 40
+            boss_damage = max(1, math.floor(
+                (((2 * boss["level"] / 5 + 2) * 80 * boss_atk / target_def) / 50 + 2)
+                * (0.85 + random.random() * 0.15)
+            ))
+            target_poke["stats"]["hp"] = max(0, target_poke["stats"]["hp"] - boss_damage)
+            fainted_str = " 💀 *Fainted!*" if target_poke["stats"]["hp"] <= 0 else ""
+            turn_log.append(
+                f"🔴 **{boss['displayName']}** attacks **{target_p['username']}'s "
+                f"{target_poke['displayName']}** — **{boss_damage:,}** dmg!{fainted_str}"
+            )
+
+            # Post turn embed
+            embed = self._build_raid_embed(raid, turn_log)
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+            # Check if all participants fainted
+            if all(p["pokemon"]["stats"]["hp"] <= 0 for p in raid["participants"]):
+                break
+
+        # ── Defeat or timeout ─────────────────────────────────────────────────
+        raid = self._raids.pop(guild.id, None)
+        if raid:
+            total_dmg = sum(p.get("damage_dealt", 0) for p in raid["participants"])
+            await channel.send(embed=discord.Embed(
+                color=COLORS["red"],
+                title=f"💀 RAID DEFEAT — {boss['displayName']} wins!",
+                description=(
+                    f"All trainers fainted! **{boss['displayName']}** escapes.\n\n"
+                    f"**Total damage dealt:** {total_dmg:,} / {raid['boss_hp_max']:,} HP\n"
+                    f"_({(total_dmg/raid['boss_hp_max']*100):.1f}% of boss HP removed)_\n\n"
+                    f"Everyone earns consolation XP. Train harder and try again!"
+                ),
+            ))
+            # Consolation XP for all participants
+            for participant in raid["participants"]:
+                member = guild.get_member(participant["member_id"])
+                if not member:
+                    continue
+                p_data = await self._get_player(member)
+                if not p_data:
+                    continue
+                poke = p_data["pokemon"][p_data["activePokemonIndex"]]
+                poke["xp"] = poke.get("xp", 0) + 30
+                self._check_level_up(poke)
+                await self._save_player(member, p_data)
 
 async def setup(bot: Red) -> None:
     await bot.add_cog(PokéBot(bot))
