@@ -90,11 +90,26 @@ SHOP_ITEMS = [
     {"id": "superpotion", "name": "Super Potion", "emoji": "💊", "desc": "Heals 50 HP",                     "price": 200, "category": "healing"},
     {"id": "maxpotion",   "name": "Max Potion",   "emoji": "💉", "desc": "Fully restores HP",               "price": 500, "category": "healing"},
     {"id": "revive",      "name": "Revive",       "emoji": "⭐", "desc": "Revives fainted Pokémon to ½ HP", "price": 400, "category": "healing"},
+    # ── Berries ───────────────────────────────────────────────────────────────
+    {"id": "razzberry",   "name": "Razz Berry",   "emoji": "🍓", "desc": "Raises catch rate by 1.5× on next throw",          "price": 80,  "category": "berries"},
+    {"id": "nanabberry",  "name": "Nanab Berry",  "emoji": "🍌", "desc": "Protects your Pokémon from catch-attempt damage",   "price": 60,  "category": "berries"},
+    {"id": "pinapberry",  "name": "Pinap Berry",  "emoji": "🍍", "desc": "Doubles candy (credits) earned on a successful catch","price": 100, "category": "berries"},
 ]
 
 HEAL_AMOUNTS = {"potion": 20, "superpotion": 50, "maxpotion": math.inf, "revive": None}
 ITEM_NAMES   = {"potion": "🧪 Potion", "superpotion": "💊 Super Potion", "maxpotion": "💉 Max Potion", "revive": "⭐ Revive"}
 BALL_NAMES   = {"pokeball": "Poké Ball", "greatball": "Great Ball", "ultraball": "Ultra Ball"}
+BERRY_NAMES  = {"razzberry": "🍓 Razz Berry", "nanabberry": "🍌 Nanab Berry", "pinapberry": "🍍 Pinap Berry"}
+
+# Berry effects applied during a catch attempt.
+#   razzberry  — multiplies catch_rate by 1.5×
+#   nanabberry — suppresses damage to the trainer's active Pokémon on a failed throw
+#   pinapberry — doubles the credit reward on a successful catch
+BERRY_EFFECTS = {
+    "razzberry":  {"catch_mult": 1.5, "no_damage": False, "credit_mult": 1},
+    "nanabberry": {"catch_mult": 1.0, "no_damage": True,  "credit_mult": 1},
+    "pinapberry": {"catch_mult": 1.0, "no_damage": False, "credit_mult": 2},
+}
 
 # TM list — move name (PokéAPI slug) mapped to display info and price
 # Prices are tiered 300–1000 by move power/utility (least → best):
@@ -215,6 +230,96 @@ async def _currency_name(guild: discord.Guild) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Paginated UI View
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PaginatedView(discord.ui.View):
+    """Generic prev/next button view for any paginated embed.
+
+    Parameters
+    ----------
+    build_page : async callable(page: int) -> discord.Embed
+        Called whenever the user clicks a button to get the new embed.
+    total_pages : int
+        Total number of pages (1-indexed).
+    initial_page : int
+        The page that was already sent (so buttons start in the right state).
+    author_id : int
+        Only this Discord user can interact with the buttons.
+    timeout : float
+        Seconds of inactivity before the view stops listening (buttons go grey).
+    """
+
+    def __init__(
+        self,
+        build_page,          # Callable[[int], Awaitable[discord.Embed]]
+        total_pages: int,
+        initial_page: int = 1,
+        author_id: int = 0,
+        timeout: float = 120.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.build_page  = build_page
+        self.total_pages = total_pages
+        self.page        = initial_page
+        self.author_id   = author_id
+        self._update_buttons()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _update_buttons(self) -> None:
+        self.btn_first.disabled    = self.page <= 1
+        self.btn_prev.disabled     = self.page <= 1
+        self.btn_next.disabled     = self.page >= self.total_pages
+        self.btn_last.disabled     = self.page >= self.total_pages
+        self.btn_counter.label     = f"{self.page} / {self.total_pages}"
+
+    async def _go(self, interaction: discord.Interaction, new_page: int) -> None:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "These buttons aren't yours!", ephemeral=True
+            )
+            return
+        self.page = max(1, min(new_page, self.total_pages))
+        self._update_buttons()
+        embed = await self.build_page(self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self) -> None:
+        """Disable all buttons when the view times out."""
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        # message ref may not exist if the view was never attached
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    # ── buttons ───────────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary, custom_id="pg_first")
+    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="pg_prev")
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, self.page - 1)
+
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.secondary, custom_id="pg_counter", disabled=True)
+    async def btn_counter(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()   # non-interactive; just a label
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="pg_next")
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, self.page + 1)
+
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary, custom_id="pg_last")
+    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, self.total_pages)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Cog
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -232,6 +337,7 @@ class PokéBot(commands.Cog):
         self._flee_tasks:   Dict[int, asyncio.Task]   = {}  # channel_id -> flee timer task
         self._pending_respawn: Dict[int, discord.TextChannel] = {}  # guild_id -> channel waiting for activity
         self._msg_counts:   Dict[int, int]            = {}  # channel_id -> message count
+        self._trades:       Dict[int, dict]           = {}  # target_user_id -> pending trade offer
 
         self.config = Config.get_conf(self, identifier=0x504F4B45424F54, force_registration=True)
 
@@ -263,9 +369,11 @@ class PokéBot(commands.Cog):
                 "ultraball": 0,
                 "healing":   {},
                 "tms":       [],
+                "berries":   {},
             },
-            "lastPokestop": None,
-            "caughtDex":    [],
+            "lastPokestop":  None,
+            "pokestopStreak": 0,
+            "caughtDex":     [],
         }
         self.config.register_guild(**default_guild)
         self.config.register_member(**default_member)
@@ -325,9 +433,11 @@ class PokéBot(commands.Cog):
                 "ultraball": 1,
                 "healing":   {},
                 "tms":       [],
+                "berries":   {},
             },
-            "lastPokestop": None,
-            "caughtDex":    [starter["id"]],
+            "lastPokestop":   None,
+            "pokestopStreak": 0,
+            "caughtDex":      [starter["id"]],
         }
         await self._save_player(member, player)
         # Give starter credits via bank
@@ -342,21 +452,140 @@ class PokéBot(commands.Cog):
                 return bid, battle
         return None
 
+    # ── XP helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _xp_for_level(level: int) -> int:
+        """XP required to reach the *next* level from `level`.
+
+        Uses a medium-speed curve that mirrors the "Medium Fast" group from
+        the main series games (total XP = n³), but expressed as per-level
+        cost so existing low-level Pokémon aren't instantly broken.
+
+        Lv 1→2  :   30 XP   (a couple of catches)
+        Lv 5→6  :  110 XP
+        Lv 10→11:  330 XP
+        Lv 20→21: 1 230 XP
+        Lv 30→31: 2 730 XP  (first-stage → second-stage threshold ~Lv 16)
+        Lv 50→51: 7 550 XP
+        """
+        return math.floor(3 * level ** 2 + 10 * level + 20)
+
+    @staticmethod
+    def _xp_bar(current: int, needed: int, length: int = 10) -> str:
+        filled = round((current / needed) * length) if needed else length
+        return "▰" * filled + "▱" * (length - filled)
+
     def _check_level_up(self, pokemon: dict) -> List[str]:
+        """Apply banked XP, level the Pokémon up, grow stats, return messages."""
+        # Back-fill xpToNext for Pokémon created before this formula existed
+        if pokemon.get("xpToNext", 0) < 30:
+            pokemon["xpToNext"] = self._xp_for_level(pokemon["level"])
+
         messages = []
         while pokemon["xp"] >= pokemon["xpToNext"]:
             pokemon["xp"]      -= pokemon["xpToNext"]
             pokemon["level"]   += 1
-            pokemon["xpToNext"] = pokemon["level"] ** 2 * 10
-            growth = math.floor(pokemon["level"] * 0.5)
+            pokemon["xpToNext"] = self._xp_for_level(pokemon["level"])
+
+            growth = math.floor(pokemon["level"] * 0.6)
             pokemon["stats"]["maxHp"] += growth
-            pokemon["stats"]["hp"] = min(pokemon["stats"]["hp"] + growth, pokemon["stats"]["maxHp"])
+            pokemon["stats"]["hp"]     = min(
+                pokemon["stats"]["hp"] + growth, pokemon["stats"]["maxHp"]
+            )
             for stat in ("attack", "defense", "speed"):
                 if stat in pokemon["stats"]:
                     mult = {"attack": 0.8, "defense": 0.6, "speed": 0.7}[stat]
                     pokemon["stats"][stat] += math.floor(growth * mult)
-            messages.append(f"⬆️ **{pokemon['displayName']}** leveled up to **Lv.{pokemon['level']}**!")
+
+            messages.append(
+                f"⬆️ **{pokemon['displayName']}** leveled up to **Lv.{pokemon['level']}**! "
+                f"_(next level in {pokemon['xpToNext']} XP)_"
+            )
         return messages
+
+    async def _fetch_evolution_target(self, pokemon: dict) -> Optional[dict]:
+        """Return {name, id, min_level} of the next evolution, or None if fully evolved / no data."""
+        try:
+            raw      = await fetch_pokemon(self._session, pokemon["name"])
+            species_url = raw["species"]["url"]
+            async with self._session.get(species_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                r.raise_for_status()
+                species = await r.json()
+
+            chain_url = species["evolution_chain"]["url"]
+            # Check file cache first
+            cache_key = None
+            if hasattr(self, '_evo_cache'):
+                cache_key = chain_url
+                if chain_url in self._evo_cache:
+                    chain_data = self._evo_cache[chain_url]
+                else:
+                    async with self._session.get(chain_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        r.raise_for_status()
+                        chain_data = await r.json()
+                    self._evo_cache[chain_url] = chain_data
+            else:
+                self._evo_cache: Dict[str, dict] = {}
+                async with self._session.get(chain_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    r.raise_for_status()
+                    chain_data = await r.json()
+                self._evo_cache[chain_url] = chain_data
+
+            # Walk the chain looking for our Pokémon, then return its next evolution
+            def _find_next(node: dict, target_name: str) -> Optional[dict]:
+                if node["species"]["name"] == target_name:
+                    if node["evolves_to"]:
+                        nxt   = node["evolves_to"][0]
+                        deets = nxt["evolution_details"][0] if nxt["evolution_details"] else {}
+                        return {
+                            "name":      nxt["species"]["name"],
+                            "min_level": deets.get("min_level"),   # None for item/trade evos
+                        }
+                    return None  # Already fully evolved
+                for child in node["evolves_to"]:
+                    result = _find_next(child, target_name)
+                    if result is not None:
+                        return result
+                return None
+
+            return _find_next(chain_data["chain"], pokemon["name"])
+        except Exception as exc:
+            log.warning(f"[PokéBot] evolution fetch failed for {pokemon['name']}: {exc}")
+            return None
+
+    def _evolution_eligible(self, pokemon: dict, evo_target: dict) -> bool:
+        """True if the Pokémon meets the level threshold to evolve."""
+        min_lvl = evo_target.get("min_level")
+        if min_lvl is None:
+            # Item/trade evolution — allow at level 20 as a reasonable proxy
+            # (players can't trade items in this bot yet)
+            min_lvl = 20
+        return pokemon["level"] >= min_lvl
+
+    async def _notify_evo_if_ready(
+        self, ctx: commands.Context, player: dict, poke_idx: int
+    ) -> None:
+        """Send a one-time evolution-available notice if the Pokémon just became eligible."""
+        poke = player["pokemon"][poke_idx]
+        # Only check if not already flagged
+        if poke.get("evoNotified"):
+            return
+        evo = await self._fetch_evolution_target(poke)
+        if evo and self._evolution_eligible(poke, evo):
+            poke["evoNotified"] = True
+            await self._save_player(ctx.author, player)
+            min_lvl = evo["min_level"] or 20
+            await ctx.send(embed=discord.Embed(
+                title="✨ Evolution Available!",
+                description=(
+                    f"**{poke['displayName']}** can evolve into "
+                    f"**{evo['name'].capitalize()}** (reached Lv.{min_lvl})!\n\n"
+                    f"Use `evolve {poke_idx + 1}` to evolve it, or keep it as-is — "
+                    f"the choice is yours!"
+                ),
+                color=COLORS["yellow"],
+            ))
 
     def _update_dex(self, player: dict, pokemon: dict) -> bool:
         """Record a newly caught species in the player's Pokédex. Returns True if it's a new entry."""
@@ -492,38 +721,105 @@ class PokéBot(commands.Cog):
         battle_id: str,
         winner_id: int,
         loser_id: int,
-    ) -> None:
-        battle = self._battles.pop(battle_id, None)
+        channel: Optional[discord.TextChannel] = None,
+    ) -> List[str]:
+        """Conclude a battle. Returns list of level-up announcement strings."""
+        battle   = self._battles.pop(battle_id, None)
+        lvl_msgs: List[str] = []
 
         winner_member = guild.get_member(winner_id)
         loser_member  = guild.get_member(loser_id)
+
+        # Opponent level for XP scaling — use the loser's Pokémon level
+        opp_level = 1
+        if battle:
+            p1_is_winner = battle["player1"]["id"] == winner_id
+            loser_battle_poke = battle["player2"]["pokemon"] if p1_is_winner else battle["player1"]["pokemon"]
+            opp_level = loser_battle_poke.get("level", 1)
+
+        turns = battle["turn"] if battle else 1
 
         if winner_member:
             winner_data = await self._get_player(winner_member)
             if winner_data:
                 winner_data["wins"] = winner_data.get("wins", 0) + 1
-                wp = winner_data["pokemon"][winner_data["activePokemonIndex"]]
-                wp["xp"] = wp.get("xp", 0) + 50 * (battle["turn"] if battle else 1)
-                self._check_level_up(wp)
-                # Write battle damage back — winner keeps whatever HP they have left
+                wp  = winner_data["pokemon"][winner_data["activePokemonIndex"]]
+                # XP = base 80 + (opponent level × 3) + small turn bonus, capped to avoid abuse
+                xp_gain = min(80 + opp_level * 3 + turns * 2, 400)
+                wp["xp"] = wp.get("xp", 0) + xp_gain
+                msgs     = self._check_level_up(wp)
+                lvl_msgs.extend(msgs)
                 if battle:
-                    p1_is_winner = battle["player1"]["id"] == winner_id
+                    p1_is_winner       = battle["player1"]["id"] == winner_id
                     winner_battle_poke = battle["player1"]["pokemon"] if p1_is_winner else battle["player2"]["pokemon"]
-                    wp["stats"]["hp"] = max(1, winner_battle_poke["stats"]["hp"])  # winner survives with at least 1 HP
+                    wp["stats"]["hp"]  = max(1, winner_battle_poke["stats"]["hp"])
                 await self._save_player(winner_member, winner_data)
                 await _deposit(winner_member, 100)
+
+                # Evo notification — fire in background so it doesn't block
+                if channel and msgs:  # only check on level-up
+                    async def _winner_evo_check():
+                        await self._notify_evo_if_ready_member(
+                            channel, winner_member, winner_data,
+                            winner_data["activePokemonIndex"]
+                        )
+                    self.bot.loop.create_task(_winner_evo_check())
 
         if loser_member:
             loser_data = await self._get_player(loser_member)
             if loser_data:
                 loser_data["losses"] = loser_data.get("losses", 0) + 1
-                # Write battle damage back — loser's pokemon faints at 0 HP
+                lp = loser_data["pokemon"][loser_data["activePokemonIndex"]]
+                # Loser gets consolation XP — 30% of winner's gain, minimum 15
+                xp_consolation = max(15, math.floor((80 + opp_level * 3) * 0.30))
+                lp["xp"] = lp.get("xp", 0) + xp_consolation
+                loser_msgs = self._check_level_up(lp)
+                lvl_msgs.extend(loser_msgs)
                 if battle:
-                    p1_is_loser = battle["player1"]["id"] == loser_id
+                    p1_is_loser       = battle["player1"]["id"] == loser_id
                     loser_battle_poke = battle["player1"]["pokemon"] if p1_is_loser else battle["player2"]["pokemon"]
-                    lp = loser_data["pokemon"][loser_data["activePokemonIndex"]]
                     lp["stats"]["hp"] = 0  # fainted
                 await self._save_player(loser_member, loser_data)
+
+                if channel and loser_msgs:
+                    async def _loser_evo_check():
+                        await self._notify_evo_if_ready_member(
+                            channel, loser_member, loser_data,
+                            loser_data["activePokemonIndex"]
+                        )
+                    self.bot.loop.create_task(_loser_evo_check())
+
+        return lvl_msgs
+
+    async def _notify_evo_if_ready_member(
+        self,
+        channel: discord.TextChannel,
+        member: discord.Member,
+        player: dict,
+        poke_idx: int,
+    ) -> None:
+        """Send an evolution-available notice to a channel on behalf of a member."""
+        poke = player["pokemon"][poke_idx]
+        if poke.get("evoNotified"):
+            return
+        evo = await self._fetch_evolution_target(poke)
+        if evo and self._evolution_eligible(poke, evo):
+            poke["evoNotified"] = True
+            await self._save_player(member, player)
+            min_lvl = evo["min_level"] or 20
+            try:
+                await channel.send(embed=discord.Embed(
+                    title="✨ Evolution Available!",
+                    description=(
+                        f"{member.mention} — **{poke['displayName']}** can evolve into "
+                        f"**{evo['name'].capitalize()}** (reached Lv.{min_lvl})!\n\n"
+                        f"Use `evolve {poke_idx + 1}` to evolve it, or keep it as-is — "
+                        f"the choice is yours!"
+                    ),
+                    color=COLORS["yellow"],
+                ))
+            except discord.HTTPException:
+                pass
 
     # ── Spawn & Flee System ───────────────────────────────────────────────────
 
@@ -1014,30 +1310,50 @@ class PokéBot(commands.Cog):
         per_page = 6
         total    = len(player["pokemon"])
         pages    = max(1, math.ceil(total / per_page))
-        page     = max(1, min(page, pages))
-        offset   = (page - 1) * per_page
-        chunk    = player["pokemon"][offset: offset + per_page]
 
-        embed = discord.Embed(
-            title=f"{target.display_name}'s Pokémon ({total} total)",
-            color=COLORS["blue"],
-        )
-        embed.set_footer(
-            text=f"Page {page}/{pages} · Active: #{player['activePokemonIndex'] + 1} | Use `pokemon <page>` to navigate"
-        )
-
-        for i, p in enumerate(chunk):
-            idx    = offset + i + 1
-            active = " ⬅ Active" if idx - 1 == player["activePokemonIndex"] else ""
-            shiny  = " ✨" if p.get("shiny") else ""
-            nick   = f' "{p["nickname"]}"' if p.get("nickname") else ""
-            embed.add_field(
-                name=f"#{idx} {p['displayName']}{shiny}{nick}{active}",
-                value=f"Lv.{p['level']} | {' / '.join(type_tag(t) for t in p['types'])} | HP: {p['stats']['hp']}/{p['stats']['maxHp']}",
-                inline=False,
+        def build_embed(pg: int) -> discord.Embed:
+            pg     = max(1, min(pg, pages))
+            offset = (pg - 1) * per_page
+            chunk  = player["pokemon"][offset: offset + per_page]
+            embed  = discord.Embed(
+                title=f"{target.display_name}'s Pokémon ({total} total)",
+                color=COLORS["blue"],
             )
+            embed.set_footer(
+                text=f"Page {pg}/{pages} · Active: #{player['activePokemonIndex'] + 1}"
+            )
+            for i, p in enumerate(chunk):
+                idx     = offset + i + 1
+                active  = " ⬅ Active" if idx - 1 == player["activePokemonIndex"] else ""
+                shiny   = " ✨" if p.get("shiny") else ""
+                nick    = f' "{p["nickname"]}"' if p.get("nickname") else ""
+                xp_cur  = p.get("xp", 0)
+                xp_nxt  = p.get("xpToNext") or self._xp_for_level(p["level"])
+                xp_bar  = self._xp_bar(xp_cur, xp_nxt, length=8)
+                evo_tag = " 🌟*evo ready*" if p.get("evoNotified") else ""
+                embed.add_field(
+                    name=f"#{idx} {p['displayName']}{shiny}{nick}{active}{evo_tag}",
+                    value=(
+                        f"Lv.{p['level']} | {' / '.join(type_tag(t) for t in p['types'])} | "
+                        f"HP: {p['stats']['hp']}/{p['stats']['maxHp']}\n"
+                        f"XP {xp_bar} {xp_cur}/{xp_nxt}"
+                    ),
+                    inline=False,
+                )
+            return embed
 
-        await ctx.send(embed=embed)
+        page  = max(1, min(page, pages))
+        embed = build_embed(page)
+
+        if pages == 1:
+            await ctx.send(embed=embed)
+            return
+
+        async def async_build(pg: int) -> discord.Embed:
+            return build_embed(pg)
+
+        view = PaginatedView(async_build, pages, page, ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
 
     # ── Active ────────────────────────────────────────────────────────────────
 
@@ -1091,6 +1407,151 @@ class PokéBot(commands.Cog):
             f"{player['pokemon'][idx]['displayName']} is now nicknamed **{name}**!"
         ))
 
+    # ── Evolve ────────────────────────────────────────────────────────────────
+
+    @commands.command(name="evolve")
+    async def evolve(self, ctx: commands.Context, slot: int = 0) -> None:
+        """Evolve a Pokémon when it's ready. Usage: `evolve [slot]` (defaults to active)."""
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey with `start`!"))
+            return
+        if self._get_battle_by_user(ctx.author.id):
+            await ctx.send(embed=error_embed("You can't evolve Pokémon during a battle!"))
+            return
+
+        idx = (slot - 1) if slot > 0 else player["activePokemonIndex"]
+        if idx < 0 or idx >= len(player["pokemon"]):
+            await ctx.send(embed=error_embed(
+                f"Invalid slot. You have {len(player['pokemon'])} Pokémon (slots 1–{len(player['pokemon'])})."
+            ))
+            return
+
+        poke = player["pokemon"][idx]
+
+        async with ctx.typing():
+            evo = await self._fetch_evolution_target(poke)
+
+        if evo is None:
+            await ctx.send(embed=error_embed(
+                f"**{poke['displayName']}** is fully evolved — there's nowhere left to go!"
+            ))
+            return
+
+        if not self._evolution_eligible(poke, evo):
+            min_lvl = evo["min_level"] or 20
+            await ctx.send(embed=error_embed(
+                f"**{poke['displayName']}** can't evolve yet!\n"
+                f"Reach **Lv.{min_lvl}** to unlock evolution into **{evo['name'].capitalize()}**.\n"
+                f"_(Currently Lv.{poke['level']})_"
+            ))
+            return
+
+        # Confirm — evolving is irreversible
+        evo_name = evo["name"].capitalize()
+        confirm_embed = discord.Embed(
+            title=f"✨ Evolve {poke['displayName']} → {evo_name}?",
+            description=(
+                f"**{poke['displayName']}** will evolve into **{evo_name}**!\n\n"
+                f"• Types, moves, sprite and stats will update to the evolved form\n"
+                f"• Nickname **{poke['nickname']}** will be kept\n" if poke.get("nickname") else
+                f"• Stats and sprite will update to the evolved form\n"
+                f"• This cannot be undone\n\n"
+                f"Type `yes` to evolve, or `no` to keep **{poke['displayName']}** as-is."
+            ),
+            color=COLORS["yellow"],
+        )
+        if poke.get("spriteUrl"):
+            confirm_embed.set_thumbnail(url=poke["spriteUrl"])
+        await ctx.send(embed=confirm_embed)
+
+        def check(m: discord.Message) -> bool:
+            return (
+                m.author == ctx.author
+                and m.channel == ctx.channel
+                and m.content.lower().strip() in ("yes", "no")
+            )
+
+        try:
+            msg = await self.bot.wait_for("message", check=check, timeout=30.0)
+        except asyncio.TimeoutError:
+            await ctx.send(embed=error_embed("Evolution cancelled — no response in 30 seconds."))
+            return
+
+        if msg.content.lower().strip() == "no":
+            await ctx.send(embed=discord.Embed(
+                color=COLORS["gray"],
+                description=f"Kept **{poke['displayName']}** — that's totally fine!",
+            ))
+            return
+
+        # ── Perform the evolution ─────────────────────────────────────────────
+        async with ctx.typing():
+            try:
+                new_raw = await fetch_pokemon(self._session, evo["name"])
+            except Exception:
+                await ctx.send(embed=error_embed(
+                    f"Couldn't fetch data for **{evo_name}** right now. Try again in a moment!"
+                ))
+                return
+
+        old_name   = poke["displayName"]
+        new_types  = [t["type"]["name"] for t in new_raw["types"]]
+        new_sprite = (
+            new_raw["sprites"].get("front_shiny") or new_raw["sprites"]["front_default"]
+            if poke.get("shiny")
+            else new_raw["sprites"]["front_default"]
+        )
+
+        # Stat upgrade: recalculate based on new base stats at current level,
+        # then add a flat bonus so evolution feels like a real power spike
+        lvl = poke["level"]
+        old_stats  = dict(poke["stats"])
+        new_stats: Dict[str, int] = {}
+        for s in new_raw["stats"]:
+            base = s["base_stat"]
+            name = s["stat"]["name"]
+            if name == "hp":
+                new_max = math.floor(((2 * base * lvl) / 100) + lvl + 10)
+                # Preserve current HP ratio so the Pokémon doesn't suddenly heal
+                hp_ratio = old_stats["hp"] / max(old_stats["maxHp"], 1)
+                new_stats["maxHp"] = new_max
+                new_stats["hp"]    = max(1, math.floor(new_max * hp_ratio))
+            else:
+                new_stats[name] = math.floor(((2 * base * lvl) / 100) + 5)
+
+        # Mutate the Pokémon in-place so slot index and nickname are preserved
+        poke["name"]        = new_raw["name"]
+        poke["displayName"] = new_raw["name"].capitalize()
+        poke["id"]          = new_raw["id"]
+        poke["types"]       = new_types
+        poke["stats"]       = new_stats
+        poke["spriteUrl"]   = new_sprite
+        poke["evoNotified"] = False   # reset so next-stage evo can notify
+
+        # Register evolved form in dex
+        self._update_dex(player, poke)
+        await self._save_player(ctx.author, player)
+
+        embed = discord.Embed(
+            title=f"🎉 {old_name} evolved into {poke['displayName']}!",
+            description=(
+                f"{'✨ ' if poke.get('shiny') else ''}"
+                f"**{old_name}** → **{poke['displayName']}**\n\n"
+                f"Type: {' / '.join(type_tag(t) for t in new_types)}\n"
+                f"HP: {new_stats['hp']}/{new_stats['maxHp']} "
+                f"_(was {old_stats['hp']}/{old_stats['maxHp']})_"
+            ),
+            color=COLORS["shiny"] if poke.get("shiny") else COLORS["yellow"],
+        )
+        if new_sprite:
+            embed.set_image(url=new_sprite)
+        embed.set_footer(text="Use 'pokemon' to see your updated collection!")
+        await ctx.send(embed=embed)
+
+        # Immediately check if the newly-evolved form can evolve again
+        await self._notify_evo_if_ready(ctx, player, idx)
+
     # ── Dex ───────────────────────────────────────────────────────────────────
 
     @commands.command(name="dex")
@@ -1135,8 +1596,9 @@ class PokéBot(commands.Cog):
     # ── Catch ─────────────────────────────────────────────────────────────────
 
     @commands.command(name="catch")
-    async def catch(self, ctx: commands.Context, ball: str = "pokeball") -> None:
-        """Catch a wild Pokémon! Usage: `catch [pokeball|greatball|ultraball]`"""
+    async def catch(self, ctx: commands.Context, ball: str = "pokeball", berry: str = "") -> None:
+        """Catch a wild Pokémon! Usage: `catch [pokeball|greatball|ultraball] [berry]`
+        Berries: `razzberry` (better odds), `nanabberry` (no damage on fail), `pinapberry` (2× credits)."""
         player = await self._get_player(ctx.author)
         if not player:
             await ctx.send(embed=error_embed("Start your journey first with `start`!"))
@@ -1145,6 +1607,24 @@ class PokéBot(commands.Cog):
         spawn = self._spawn_cache.get(ctx.channel.id)
         if not spawn:
             await ctx.send(embed=error_embed("There's no wild Pokémon here right now!"))
+            return
+
+        # Block catch if active Pokémon has fainted
+        active_poke = player["pokemon"][player["activePokemonIndex"]]
+        if active_poke["stats"]["hp"] <= 0:
+            # Find the first non-fainted Pokémon to suggest
+            healthy = next(
+                (i + 1 for i, p in enumerate(player["pokemon"]) if p["stats"]["hp"] > 0),
+                None,
+            )
+            hint = (
+                f"Try `active {healthy}` to switch, or `use revive` to revive **{active_poke['displayName']}**."
+                if healthy
+                else f"Use `use revive` to revive **{active_poke['displayName']}** before throwing!"
+            )
+            await ctx.send(embed=error_embed(
+                f"**{active_poke['displayName']}** has fainted and can't battle!\n{hint}"
+            ))
             return
 
         ball = ball.lower().replace(" ", "").replace("-", "")
@@ -1166,28 +1646,78 @@ class PokéBot(commands.Cog):
             ))
             return
 
+        # ── Berry handling ────────────────────────────────────────────────────
+        berry_slug = berry.lower().replace(" ", "").replace("-", "") if berry else ""
+        berry_effect = {"catch_mult": 1.0, "no_damage": False, "credit_mult": 1}
+        berry_used_name = ""
+        if berry_slug:
+            if berry_slug not in BERRY_EFFECTS:
+                await ctx.send(embed=error_embed(
+                    f"Unknown berry **{berry_slug}**. Available: `razzberry`, `nanabberry`, `pinapberry`."
+                ))
+                return
+            berries = player["items"].setdefault("berries", {})
+            if berries.get(berry_slug, 0) <= 0:
+                await ctx.send(embed=error_embed(
+                    f"You don't have any {BERRY_NAMES[berry_slug]}! "
+                    f"Get them from `pokestop` or buy with `buy {berry_slug}`."
+                ))
+                return
+            # Consume berry
+            berries[berry_slug] -= 1
+            berry_effect = BERRY_EFFECTS[berry_slug]
+            berry_used_name = BERRY_NAMES[berry_slug]
+
         player["items"][ball] -= 1
         pokemon = spawn["pokemon"]
-        chance  = catch_rate(pokemon, ball)
-        caught  = random.random() < chance
+        base_chance = catch_rate(pokemon, ball)
+
+        # ── Level-difference modifier ─────────────────────────────────────────
+        # Compares active Pokémon level vs wild Pokémon level.
+        # Being 10+ levels above makes catching noticeably easier (~+40%).
+        # Being 10+ levels below makes it noticeably harder (~-35%).
+        # Clamped so it never flip-flops the core ball/HP math too wildly.
+        active_lvl = active_poke["level"]
+        wild_lvl   = pokemon["level"]
+        lvl_diff   = active_lvl - wild_lvl   # positive = trainer stronger
+        # Sigmoid-like linear clamp: ±0.04 per level difference, capped at ±0.40
+        lvl_mult   = 1.0 + max(-0.40, min(0.40, lvl_diff * 0.04))
+        chance = min(base_chance * berry_effect["catch_mult"] * lvl_mult, 0.95)
+        caught = random.random() < chance
 
         shakes     = 3 if caught else random.randint(0, 2)
         shake_text = "🔴 *shake*... " * shakes
 
-        # Wild Pokémon fights back — deals damage to the active Pokémon
-        active_poke = player["pokemon"][player["activePokemonIndex"]]
-        wild_level  = pokemon["level"]
-        scratch_dmg = max(1, random.randint(
-            math.floor(wild_level * 0.5),
-            math.floor(wild_level * 1.5)
-        ))
-        active_poke["stats"]["hp"] = max(0, active_poke["stats"]["hp"] - scratch_dmg)
-        fainted_from_catch = active_poke["stats"]["hp"] <= 0
+        # Wild Pokémon fights back — only deals damage on FAILED catches
+        fainted_from_catch = False
+        scratch_dmg     = 0
+        hp_note         = ""
+        if not caught and not berry_effect["no_damage"]:
+            wild_level  = pokemon["level"]
+            scratch_dmg = max(1, random.randint(
+                math.floor(wild_level * 0.5),
+                math.floor(wild_level * 1.5)
+            ))
+            active_poke["stats"]["hp"] = max(0, active_poke["stats"]["hp"] - scratch_dmg)
+            fainted_from_catch = active_poke["stats"]["hp"] <= 0
+            if fainted_from_catch:
+                hp_note = f" | ⚠️ {active_poke['displayName']} fainted! Use a Revive."
+            else:
+                hp_note = f" | {active_poke['displayName']} took {scratch_dmg} dmg ({active_poke['stats']['hp']}/{active_poke['stats']['maxHp']} HP)"
 
         async with ctx.typing():
             await asyncio.sleep(1.5)
 
         currency = await _currency_name(ctx.guild)
+        berry_tag = f"\n{berry_used_name} used! " if berry_used_name else ""
+
+        # ── Award catch XP to active Pokémon (both outcomes) ─────────────────
+        # Successful catch: full XP. Failed: 40% XP for the attempt.
+        wild_level     = pokemon["level"]
+        catch_xp_full  = max(10, math.floor(wild_level * 1.5 + 5))
+        catch_xp       = catch_xp_full if caught else max(5, math.floor(catch_xp_full * 0.4))
+        active_poke["xp"] = active_poke.get("xp", 0) + catch_xp
+        lvl_msgs = self._check_level_up(active_poke)
 
         if caught:
             # Pokémon caught — cancel flee timer and remove from spawn cache
@@ -1196,8 +1726,9 @@ class PokéBot(commands.Cog):
             # Schedule a fresh spawn after a short delay so the channel never goes dead
             self.bot.loop.create_task(self._delayed_respawn(ctx.channel))
 
-            credits_earned = 500 if pokemon.get("shiny") else (100 if pokemon["level"] >= 30 else 50)
-            is_new_dex = self._update_dex(player, pokemon)
+            base_credits   = 500 if pokemon.get("shiny") else (100 if pokemon["level"] >= 30 else 50)
+            credits_earned = base_credits * berry_effect["credit_mult"]
+            is_new_dex     = self._update_dex(player, pokemon)
             player["pokemon"].append({**pokemon, "caughtAt": time.time()})
             await self._save_player(ctx.author, player)
             await _deposit(ctx.author, credits_earned)
@@ -1206,15 +1737,13 @@ class PokéBot(commands.Cog):
                 " ✨ Shiny bonus!" if pokemon.get("shiny")
                 else (" 💪 High level bonus!" if pokemon["level"] >= 30 else "")
             )
-            hp_note = (
-                f" | ⚠️ {active_poke['displayName']} fainted! Use a Revive."
-                if fainted_from_catch
-                else f" | {active_poke['displayName']} took {scratch_dmg} dmg ({active_poke['stats']['hp']}/{active_poke['stats']['maxHp']} HP)"
-            )
+            if berry_effect["credit_mult"] > 1:
+                bonus_tag += f" 🍍 Pinap bonus (2× credits)!"
+            xp_line = f"+{catch_xp} XP ({active_poke['displayName']})"
             embed = pokemon_embed(
                 pokemon,
                 f"{ctx.author.display_name} caught {pokemon['displayName']}{'  ✨' if pokemon.get('shiny') else ''}!",
-                footer=f"{shake_text}Gotcha! Added to your collection.{hp_note}",
+                footer=f"{berry_tag}{shake_text}Gotcha! Added to your collection.",
             )
             embed.color = COLORS["shiny"] if pokemon.get("shiny") else COLORS["green"]
             embed.add_field(
@@ -1222,6 +1751,7 @@ class PokéBot(commands.Cog):
                 value=f"+{credits_earned}{bonus_tag}",
                 inline=True,
             )
+            embed.add_field(name="⭐ XP Earned", value=xp_line, inline=True)
             if is_new_dex:
                 dex_count = len(player.get("caughtDex", []))
                 embed.add_field(
@@ -1229,26 +1759,33 @@ class PokéBot(commands.Cog):
                     value=f"New entry! ({dex_count}/{MAX_POKEMON} caught)",
                     inline=True,
                 )
+            await ctx.send(embed=embed)
+            if lvl_msgs:
+                await ctx.send(embed=discord.Embed(description="\n".join(lvl_msgs), color=COLORS["green"]))
+            # Check evo eligibility after any level-up
+            if lvl_msgs:
+                await self._notify_evo_if_ready(ctx, player, player["activePokemonIndex"])
         else:
-            await self._save_player(ctx.author, player)  # saves HP damage from wild pokemon
-            hp_note = (
-                f"\n⚠️ **{active_poke['displayName']}** fainted! Use `use revive` before battling."
-                if fainted_from_catch
-                else f"\n{active_poke['displayName']} took **{scratch_dmg} damage** ({active_poke['stats']['hp']}/{active_poke['stats']['maxHp']} HP remaining)"
-            )
+            await self._save_player(ctx.author, player)  # saves HP damage, berry consumption, and XP
+            nanab_note = " 🍌 Nanab Berry absorbed the hit!" if berry_effect["no_damage"] and berry_slug == "nanabberry" else ""
+            hp_note    = hp_note + nanab_note if not berry_effect["no_damage"] else f"\n🍌 Nanab Berry protected {active_poke['displayName']} from damage!"
             embed = discord.Embed(
                 title=f"Oh no! {pokemon['displayName']} broke free!",
                 description=(
-                    f"{shake_text}💨 {pokemon['displayName']} escaped!\n"
-                    f"{hp_note}\n\n"
+                    f"{berry_tag}{shake_text}💨 {pokemon['displayName']} escaped!\n"
+                    f"{hp_note}\n"
+                    f"_(+{catch_xp} XP to {active_poke['displayName']} for the attempt)_\n\n"
                     f"_{BALL_NAMES[ball]}s remaining: {player['items'][ball]}_"
                 ),
                 color=COLORS["red"],
             )
             if pokemon.get("spriteUrl"):
                 embed.set_thumbnail(url=pokemon["spriteUrl"])
-
-        await ctx.send(embed=embed)
+            await ctx.send(embed=embed)
+            if lvl_msgs:
+                await ctx.send(embed=discord.Embed(description="\n".join(lvl_msgs), color=COLORS["green"]))
+            if lvl_msgs:
+                await self._notify_evo_if_ready(ctx, player, player["activePokemonIndex"])
 
 
     # ── Release ───────────────────────────────────────────────────────────────
@@ -1375,8 +1912,10 @@ class PokéBot(commands.Cog):
         items   = player.get("items", {})
         healing = items.get("healing", {})
         tms     = items.get("tms", [])
+        berries = items.get("berries", {})
         balance  = await _get_balance(ctx.author)
         currency = await _currency_name(ctx.guild)
+        streak   = player.get("pokestopStreak", 0)
 
         balls_lines = []
         for ball_id, label in BALL_NAMES.items():
@@ -1389,13 +1928,22 @@ class PokéBot(commands.Cog):
             count = healing.get(item_id, 0)
             heal_lines.append(f"{label} — {count}")
 
+        berry_lines = []
+        for berry_id, label in BERRY_NAMES.items():
+            count = berries.get(berry_id, 0)
+            berry_lines.append(f"{label} — {count}")
+
         embed = discord.Embed(
             title=f"🎒 {ctx.author.display_name}'s Bag",
             color=COLORS["blue"],
         )
-        embed.add_field(name=f"💰 {currency}", value=str(balance), inline=False)
-        embed.add_field(name="🎯 Poké Balls",   value="\n".join(balls_lines), inline=True)
-        embed.add_field(name="💊 Healing Items", value="\n".join(heal_lines), inline=True)
+        embed.add_field(name=f"💰 {currency}", value=str(balance), inline=True)
+        if streak:
+            embed.add_field(name="🔥 Pokéstop Streak", value=f"{streak} day{'s' if streak != 1 else ''}", inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
+        embed.add_field(name="🎯 Poké Balls",    value="\n".join(balls_lines),  inline=True)
+        embed.add_field(name="💊 Healing Items",  value="\n".join(heal_lines),   inline=True)
+        embed.add_field(name="🍓 Berries",        value="\n".join(berry_lines),  inline=True)
 
         if tms:
             tm_lines = []
@@ -1416,6 +1964,7 @@ class PokéBot(commands.Cog):
     # ── Shop ──────────────────────────────────────────────────────────────────
 
     @commands.command(name="shop")
+    @commands.command(name="shop")
     async def shop(self, ctx: commands.Context) -> None:
         """Browse the PokéMart."""
         player = await self._get_player(ctx.author)
@@ -1427,23 +1976,39 @@ class PokéBot(commands.Cog):
         currency = await _currency_name(ctx.guild)
         prices   = await self._get_shop_prices(ctx.guild)
 
-        balls_str = "\n\n".join(
-            f"{i['emoji']} **{i['name']}** — {prices.get(i['id'], i['price'])} {currency}\n_{i['desc']}_"
-            for i in SHOP_ITEMS if i["category"] == "balls"
-        )
-        heal_str = "\n\n".join(
-            f"{i['emoji']} **{i['name']}** — {prices.get(i['id'], i['price'])} {currency}\n_{i['desc']}_"
-            for i in SHOP_ITEMS if i["category"] == "healing"
-        )
-        embed = discord.Embed(
-            title="🛒 PokéMart",
-            description=f"Your balance: **💰 {balance} {currency}**\n\nUse `buy <item> [amount]` to purchase.",
-            color=COLORS["yellow"],
-        )
-        embed.add_field(name="🎯 Poké Balls",   value=balls_str, inline=False)
-        embed.add_field(name="💊 Healing Items", value=heal_str,  inline=False)
-        embed.set_footer(text="Win battles and catch Pokémon to earn more!")
-        await ctx.send(embed=embed)
+        # Three pages: 1=Balls, 2=Healing, 3=Berries
+        SHOP_PAGES = [
+            ("🎯 Poké Balls",   "balls"),
+            ("💊 Healing Items", "healing"),
+            ("🍓 Berries",       "berries"),
+        ]
+        total_pages = len(SHOP_PAGES)
+
+        def build_shop_embed(pg: int) -> discord.Embed:
+            pg = max(1, min(pg, total_pages))
+            section_name, category = SHOP_PAGES[pg - 1]
+            items_str = "\n\n".join(
+                f"{i['emoji']} **{i['name']}** — {prices.get(i['id'], i['price'])} {currency}\n_{i['desc']}_"
+                for i in SHOP_ITEMS if i["category"] == category
+            )
+            embed = discord.Embed(
+                title=f"🛒 PokéMart — {section_name}",
+                description=(
+                    f"Your balance: **💰 {balance} {currency}**\n"
+                    f"Use `buy <item> [amount]` to purchase.\n\u200b"
+                ),
+                color=COLORS["yellow"],
+            )
+            embed.add_field(name=section_name, value=items_str, inline=False)
+            embed.set_footer(text=f"Page {pg}/{total_pages} · Win battles and catch Pokémon to earn more!")
+            return embed
+
+        async def async_shop_build(pg: int) -> discord.Embed:
+            return build_shop_embed(pg)
+
+        embed = build_shop_embed(1)
+        view  = PaginatedView(async_shop_build, total_pages, 1, ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
 
     # ── Buy ───────────────────────────────────────────────────────────────────
 
@@ -1479,6 +2044,9 @@ class PokéBot(commands.Cog):
 
         if shop_item["category"] == "balls":
             player["items"][item] = player["items"].get(item, 0) + amount
+        elif shop_item["category"] == "berries":
+            berries = player["items"].setdefault("berries", {})
+            berries[item] = berries.get(item, 0) + amount
         else:
             if "healing" not in player["items"]:
                 player["items"]["healing"] = {}
@@ -1698,7 +2266,7 @@ class PokéBot(commands.Cog):
 
             if afk:
                 battle["status"] = "finished"
-                await self._end_battle(guild, battle_id, other["id"], afk["id"])
+                await self._end_battle(guild, battle_id, other["id"], afk["id"], channel)
                 try:
                     embed = discord.Embed(
                         title="⏰ Battle Timeout!",
@@ -1777,13 +2345,21 @@ class PokéBot(commands.Cog):
                     if winner["id"] == battle["player1"]["id"]
                     else battle["player1"]["id"]
                 )
-                await self._end_battle(ctx.guild, battle_id, winner["id"], loser_id)
+                lvl_msgs = await self._end_battle(ctx.guild, battle_id, winner["id"], loser_id, ctx.channel)
                 currency       = await _currency_name(ctx.guild)
                 embed.color    = COLORS["yellow"]
                 embed.title    = f"🏆 {winner['username']} wins the battle!"
-                embed.set_footer(text=f"{winner['username']} earned 100 {currency} and battle XP!")
-
-            await ctx.send(embed=embed)
+                xp_note = f" · Level-up messages incoming!" if lvl_msgs else ""
+                embed.set_footer(text=f"{winner['username']} earned 100 {currency} and battle XP!{xp_note}")
+                await ctx.send(embed=embed)
+                # Surface level-up messages as a follow-up
+                if lvl_msgs:
+                    await ctx.send(embed=discord.Embed(
+                        description="\n".join(lvl_msgs),
+                        color=COLORS["green"],
+                    ))
+            else:
+                await ctx.send(embed=embed)
 
     # ── Pokédex ───────────────────────────────────────────────────────────────
 
@@ -1812,7 +2388,6 @@ class PokéBot(commands.Cog):
             ))
             return
 
-        # Build name map from the player's current collection
         seen: Dict[int, str] = {}
         for pk in player["pokemon"]:
             if pk["id"] in caught_ids and pk["id"] not in seen:
@@ -1821,52 +2396,55 @@ class PokéBot(commands.Cog):
         all_entries = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
         per_page    = 30
         total_pages = max(1, math.ceil(total_caught / per_page))
-        page        = max(1, min(page, total_pages))
-        offset      = (page - 1) * per_page
-        chunk       = all_entries[offset:offset + per_page]
-
+        remaining   = MAX_POKEMON - total_caught
         rank_label, rank_color = _dex_rank(total_caught)
         prog_bar  = _dex_progress_bar(total_caught, MAX_POKEMON, length=20)
-        remaining = MAX_POKEMON - total_caught
 
-        # Milestone flavour text (only on page 1)
-        if page == 1:
-            if completion >= 100:
-                flavour = "🎉 You've caught them all! Legendary!"
-            elif completion >= 75:
-                flavour = f"🔥 Almost there — just **{remaining}** left!"
-            elif completion >= 50:
-                flavour = "💪 Halfway there — keep it up!"
-            elif completion >= 25:
-                flavour = f"🌱 Making good progress — **{remaining}** still out there!"
+        def build_dex_embed(pg: int) -> discord.Embed:
+            pg     = max(1, min(pg, total_pages))
+            offset = (pg - 1) * per_page
+            chunk  = all_entries[offset:offset + per_page]
+
+            if pg == 1:
+                if completion >= 100:   flavour = "🎉 You've caught them all! Legendary!"
+                elif completion >= 75:  flavour = f"🔥 Almost there — just **{remaining}** left!"
+                elif completion >= 50:  flavour = "💪 Halfway there — keep it up!"
+                elif completion >= 25:  flavour = f"🌱 Making good progress — **{remaining}** still out there!"
+                else:                   flavour = f"🗺️ Your journey is just beginning — **{remaining}** left to discover!"
             else:
-                flavour = f"🗺️ Your journey is just beginning — **{remaining}** left to discover!"
-        else:
-            flavour = ""
+                flavour = ""
 
-        title = (
-            f"📖 {target.display_name}'s Pokédex"
-            if total_pages == 1
-            else f"📖 {target.display_name}'s Pokédex — Page {page}/{total_pages}"
-        )
-        embed = discord.Embed(title=title, color=rank_color)
-        embed.description = (
-            f"{rank_label}\n\n"
-            f"{prog_bar}\n"
-            f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}% complete"
-            + (f"\n\n{flavour}" if flavour else "")
-        )
+            title = (
+                f"📖 {target.display_name}'s Pokédex"
+                if total_pages == 1
+                else f"📖 {target.display_name}'s Pokédex — Page {pg}/{total_pages}"
+            )
+            embed = discord.Embed(title=title, color=rank_color)
+            embed.description = (
+                f"{rank_label}\n\n{prog_bar}\n"
+                f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}% complete"
+                + (f"\n\n{flavour}" if flavour else "")
+            )
+            col_size = 10
+            cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
+            for col in cols:
+                val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
+                embed.add_field(name="\u200b", value=val, inline=True)
+            embed.set_footer(text=f"Page {pg}/{total_pages} · {remaining} species still to find!")
+            return embed
 
-        # Pokémon entries in up to 3 inline columns of 10
-        col_size = 10
-        cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
-        for col in cols:
-            val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
-            embed.add_field(name="\u200b", value=val, inline=True)
+        async def async_dex_build(pg: int) -> discord.Embed:
+            return build_dex_embed(pg)
 
-        footer = f"Page {page}/{total_pages} · pokedex <page> to navigate · {remaining} species still to find!"
-        embed.set_footer(text=footer)
-        await ctx.send(embed=embed)
+        page  = max(1, min(page, total_pages))
+        embed = build_dex_embed(page)
+
+        if total_pages == 1:
+            await ctx.send(embed=embed)
+            return
+
+        view = PaginatedView(async_dex_build, total_pages, page, ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
 
     @commands.command(name="dexpage", aliases=["dp"])
     async def dexpage(self, ctx: commands.Context, page: int = 1, user: Optional[discord.Member] = None) -> None:
@@ -1894,33 +2472,43 @@ class PokéBot(commands.Cog):
         all_entries = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
         per_page    = 30
         total_pages = max(1, math.ceil(total_caught / per_page))
-        page        = max(1, min(page, total_pages))
-        offset      = (page - 1) * per_page
-        chunk       = all_entries[offset:offset + per_page]
         remaining   = MAX_POKEMON - total_caught
         completion  = (total_caught / MAX_POKEMON) * 100
-
         rank_label, rank_color = _dex_rank(total_caught)
         prog_bar = _dex_progress_bar(total_caught, MAX_POKEMON, length=20)
 
-        embed = discord.Embed(
-            title=f"📖 {target.display_name}'s Pokédex — Page {page} of {total_pages}",
-            color=rank_color,
-        )
-        embed.description = (
-            f"{rank_label}\n"
-            f"{prog_bar}\n"
-            f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}%"
-        )
+        def build_dp_embed(pg: int) -> discord.Embed:
+            pg     = max(1, min(pg, total_pages))
+            offset = (pg - 1) * per_page
+            chunk  = all_entries[offset:offset + per_page]
+            embed  = discord.Embed(
+                title=f"📖 {target.display_name}'s Pokédex — Page {pg}/{total_pages}",
+                color=rank_color,
+            )
+            embed.description = (
+                f"{rank_label}\n{prog_bar}\n"
+                f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}%"
+            )
+            col_size = 10
+            cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
+            for col in cols:
+                val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
+                embed.add_field(name="\u200b", value=val, inline=True)
+            embed.set_footer(text=f"Page {pg}/{total_pages} · {remaining} species still to find!")
+            return embed
 
-        col_size = 10
-        cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
-        for col in cols:
-            val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
-            embed.add_field(name="\u200b", value=val, inline=True)
+        async def async_dp_build(pg: int) -> discord.Embed:
+            return build_dp_embed(pg)
 
-        embed.set_footer(text=f"Page {page}/{total_pages} · dexpage <page> to navigate · {remaining} species still to find!")
-        await ctx.send(embed=embed)
+        page  = max(1, min(page, total_pages))
+        embed = build_dp_embed(page)
+
+        if total_pages == 1:
+            await ctx.send(embed=embed)
+            return
+
+        view = PaginatedView(async_dp_build, total_pages, page, ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
 
         # ── Leaderboard ───────────────────────────────────────────────────────────
 
@@ -2007,105 +2595,173 @@ class PokéBot(commands.Cog):
         """Show all PokéBot commands."""
         prefix   = ctx.clean_prefix
         currency = await _currency_name(ctx.guild)
-        embed    = discord.Embed(
-            title=f"📖 PokéBot — Command Reference",
-            color=COLORS["blue"],
-        )
-        embed.add_field(
-            name="🌟 Getting Started",
-            value="\n".join([
-                f"`{prefix}start` — Begin your journey & pick a starter",
-                f"`{prefix}profile [@user]` — View trainer profile",
-                f"`{prefix}pokehelp` — Show this message",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="🎯 Catching",
-            value="\n".join([
-                f"`{prefix}catch [ball]` — Catch a wild Pokémon",
-                f"`{prefix}pokespawn` — *(Admin)* Force spawn a Pokémon",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="📦 Your Collection",
-            value="\n".join([
-                f"`{prefix}pokemon [page] [@user]` — Browse your Pokémon",
-                f"`{prefix}active <slot>` — Set your battle Pokémon",
-                f"`{prefix}nickname <slot> <name>` — Give a Pokémon a nickname",
-                f"`{prefix}release <slot>` — Release a Pokémon for rewards",
-                f"`{prefix}dex <name or #>` — Look up any Pokémon",
-                f"`{prefix}pokedex [page] [@user]` — View your Pokédex",
-                f"`{prefix}dexpage <page> [@user]` — Browse Pokédex pages",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="⚔️ Battling",
-            value="\n".join([
-                f"`{prefix}battle @user` — Challenge someone to a battle",
-                f"`{prefix}move <move_name>` — Use a move in your current battle",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="🛒 Shop",
-            value="\n".join([
-                f"`{prefix}shop` — Browse the PokéMart",
-                f"`{prefix}buy <item> [amount]` — Buy items",
-                f"`{prefix}use <item> [slot]` — Use a healing item",
-                f"`{prefix}inventory` — View your bag & {currency} balance",
-                f"`{prefix}pokestop` — Spin for free daily items",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="💿 TMs",
-            value="\n".join([
-                f"`{prefix}tms [page]` — Browse TM Shop (25 moves)",
-                f"`{prefix}buytm <move>` — Buy a TM (e.g. `buytm thunderbolt`)",
-                f"`{prefix}usetm <move> <pokemon_slot> <move_slot>` — Teach the TM",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="🏆 Leaderboard",
-            value=f"`{prefix}pokeboard [wins|caught|shinies|balance]` — Server rankings",
-            inline=False,
-        )
-        embed.add_field(
-            name="⚙️ Admin",
-            value="\n".join([
-                f"`{prefix}pokeset spawnchannel #channel` — Set spawn channel",
-                f"`{prefix}pokeset spawninterval <seconds>` — Set spawn timer",
-                f"`{prefix}pokeset fleetimeout <minutes>` — Set flee timer",
-                f"`{prefix}pokeset maxpokemon <limit>` — Set collection cap",
-                f"`{prefix}pokeset setprice <item> <price>` — Set item price",
-                f"`{prefix}pokeset showprices` — View current prices",
-                f"`{prefix}pokeset resetprices` — Reset prices to defaults",
-                f"`{prefix}pokespawn` — Force a spawn now",
-            ]),
-            inline=False,
-        )
-        embed.add_field(
-            name="💡 Tips",
-            value="\n".join([
-                "• Wild Pokémon spawn on a timer or every ~15 messages",
-                "• Uncaught Pokémon **flee after a configurable timeout** (default 4 hours)",
-                "• Shiny Pokémon are **1/512** — extremely rare!",
-                "• Winning battles earns XP and 100 " + currency,
-                f"• All earnings go straight to your server {currency} balance",
-                "• Higher-level balls have better catch rates",
-                "• Spin `pokestop` every day for free balls and items",
-                "• Check your `pokedex` — 1,025 species to complete!",
-                "• All 1,025 Pokémon (Gen 1–9) can appear",
-                "• TMs are one-use — buy with `buytm`, teach with `usetm <move> <poke_slot> <move_slot>`",
-            ]),
-            inline=False,
-        )
-        embed.set_footer(text="Good luck on your journey, Trainer!")
-        await ctx.send(embed=embed)
+
+        def make_page(pg: int) -> discord.Embed:
+            embed = discord.Embed(color=COLORS["blue"])
+            if pg == 1:
+                embed.title = "📖 PokéBot — Getting Started & Catching"
+                embed.add_field(
+                    name="🌟 Getting Started",
+                    value="\n".join([
+                        f"`{prefix}start` — Begin your journey & pick a starter",
+                        f"`{prefix}profile [@user]` — View trainer profile",
+                        f"`{prefix}pokehelp` — Show this help (use buttons to browse)",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🎯 Catching",
+                    value="\n".join([
+                        f"`{prefix}catch [ball] [berry]` — Catch a wild Pokémon",
+                        "• Higher-level active Pokémon improve catch rate",
+                        "• Wild Pokémon only deal damage on **failed** throws",
+                        f"`{prefix}pokespawn` — *(Admin)* Force spawn a Pokémon",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🍓 Berries",
+                    value="\n".join([
+                        f"`{prefix}berries` — View your berry pouch",
+                        f"`{prefix}catch <ball> <berry>` — e.g. `catch ultraball razzberry`",
+                        "• 🍓 **Razz Berry** — catch rate ×1.5",
+                        "• 🍌 **Nanab Berry** — no damage on a failed throw",
+                        "• 🍍 **Pinap Berry** — 2× credits on a successful catch",
+                        f"_Get berries from `{prefix}pokestop` or `{prefix}shop`_",
+                    ]),
+                    inline=False,
+                )
+            elif pg == 2:
+                embed.title = "📖 PokéBot — Your Collection & XP"
+                embed.add_field(
+                    name="📦 Your Collection",
+                    value="\n".join([
+                        f"`{prefix}pokemon [page] [@user]` — Browse your Pokémon (shows XP bars)",
+                        f"`{prefix}active <slot>` — Set your battle Pokémon",
+                        f"`{prefix}nickname <slot> <name>` — Give a Pokémon a nickname",
+                        f"`{prefix}release <slot>` — Release a Pokémon for rewards",
+                        f"`{prefix}dex <name or #>` — Look up any Pokémon",
+                        f"`{prefix}pokedex [page] [@user]` — View your Pokédex",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="⭐ XP & Levelling",
+                    value="\n".join([
+                        "• Catch XP: `wild_level × 1.5 + 5` (40% on failed throws)",
+                        "• Win XP: `80 + opp_level × 3 + turns × 2` (max 400)",
+                        "• Loss XP: 30% consolation — losing isn't wasted!",
+                        "• Level-ups grow HP, Atk, Def and Speed automatically",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="✨ Evolution",
+                    value="\n".join([
+                        f"`{prefix}evolve [slot]` — Evolve a Pokémon (defaults to active)",
+                        "• Evolution is **optional** — you'll get a notification when ready",
+                        "• The Pokémon's nickname, shiny status and slot are preserved",
+                        "• Stats are recalculated from the evolved form's base stats",
+                    ]),
+                    inline=False,
+                )
+            elif pg == 3:
+                embed.title = "📖 PokéBot — Battling & Trading"
+                embed.add_field(
+                    name="⚔️ Battling",
+                    value="\n".join([
+                        f"`{prefix}battle @user` — Challenge someone to a battle",
+                        f"`{prefix}move <move_name>` — Use a move in your current battle",
+                        f"• Winner earns 100 {currency} + full XP",
+                        "• Loser earns 30% consolation XP · 3-min AFK timeout",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🔄 Trading",
+                    value="\n".join([
+                        f"`{prefix}trade @user <your_slot> <their_slot>` — Offer a trade",
+                        "• Target types `accepttrade` or `declinetrade`",
+                        "• Both trainers' Pokédexes update after a successful trade",
+                        "• Cannot trade during battles or your last Pokémon",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🏆 Leaderboard",
+                    value=f"`{prefix}pokeboard [wins|caught|shinies|balance]` — Server rankings",
+                    inline=False,
+                )
+            elif pg == 4:
+                embed.title = "📖 PokéBot — Shop, TMs & Daily"
+                embed.add_field(
+                    name="🛒 Shop",
+                    value="\n".join([
+                        f"`{prefix}shop` — Browse the PokéMart (3 pages: Balls / Healing / Berries)",
+                        f"`{prefix}buy <item> [amount]` — Buy items",
+                        f"`{prefix}use <item> [slot]` — Use a healing item",
+                        f"`{prefix}inventory` — View your bag & {currency} balance",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="💿 TMs",
+                    value="\n".join([
+                        f"`{prefix}tms [page]` — Browse TM Shop (25 moves, 4 pages)",
+                        f"`{prefix}buytm <move>` — Buy a TM  e.g. `buytm thunderbolt`",
+                        f"`{prefix}usetm <move> <poke_slot> <move_slot>` — Teach the TM",
+                        "• TMs are one-use — choose carefully!",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🏪 Daily Pokéstop",
+                    value="\n".join([
+                        f"`{prefix}pokestop` — Spin for free daily items + streak bonuses",
+                        "• 🔥 **Day 3+:** +1 Great Ball, +1 Razz Berry every spin",
+                        "• 🌟 **Every 7th day:** +2 Ultra Balls, +2 Pinap Berries, +300 credits",
+                        "• Miss a day and your streak resets — spin every day!",
+                    ]),
+                    inline=False,
+                )
+            elif pg == 5:
+                embed.title = "📖 PokéBot — Admin & Tips"
+                embed.add_field(
+                    name="⚙️ Admin",
+                    value="\n".join([
+                        f"`{prefix}pokeset spawnchannel #channel` — Set spawn channel",
+                        f"`{prefix}pokeset spawninterval <seconds>` — Set spawn timer",
+                        f"`{prefix}pokeset fleetimeout <minutes>` — Set flee timer",
+                        f"`{prefix}pokeset maxpokemon <limit>` — Set collection cap",
+                        f"`{prefix}pokeset setprice <item> <price>` — Set item price",
+                        f"`{prefix}pokeset showprices` — View current prices",
+                        f"`{prefix}pokeset resetprices` — Reset prices to defaults",
+                        f"`{prefix}pokespawn` — Force a spawn now",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="💡 Tips",
+                    value="\n".join([
+                        "• Wild Pokémon spawn on a timer or every ~15 messages",
+                        "• Uncaught Pokémon **flee** after a configurable timeout (default 4 h)",
+                        "• Shiny Pokémon are **1/512** — extremely rare!",
+                        "• Your active Pokémon's level affects catch rate vs the wild Pokémon",
+                        "• Catch XP is awarded even on a failed throw",
+                        "• Check your `pokedex` — 1,025 species to complete!",
+                        f"• All earnings go straight to your server {currency} balance",
+                    ]),
+                    inline=False,
+                )
+            embed.set_footer(text=f"Page {pg}/5 · PokéBot — Good luck on your journey, Trainer!")
+            return embed
+
+        async def async_help_build(pg: int) -> discord.Embed:
+            return make_page(pg)
+
+        embed = make_page(1)
+        view  = PaginatedView(async_help_build, 5, 1, ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
 
 
     # ── TMs ───────────────────────────────────────────────────────────────────
@@ -2123,32 +2779,46 @@ class PokéBot(commands.Cog):
         owned_tms = player.get("items", {}).get("tms", [])
         tm_prices = await self._get_tm_prices(ctx.guild)
 
-        all_tms   = list(TM_LIST.items())
-        per_page  = 8
+        all_tms     = list(TM_LIST.items())
+        per_page    = 8
         total_pages = max(1, math.ceil(len(all_tms) / per_page))
-        page      = max(1, min(page, total_pages))
-        offset    = (page - 1) * per_page
-        chunk     = all_tms[offset:offset + per_page]
 
-        embed = discord.Embed(
-            title="💿 TM Shop",
-            description=(
-                f"Balance: **💰 {balance} {currency}**\n"
-                f"Use `buytm <move>` to purchase · `usetm <move> <slot> <move_slot>` to teach\n\u200b"
-            ),
-            color=COLORS["blue"],
-        )
-        for slug, info in chunk:
-            owned_tag = " ✅ **Owned**" if slug in owned_tms else ""
-            emoji     = TM_TYPE_EMOJI.get(info["type"], "💿")
-            price     = tm_prices.get(slug, info["price"])
-            embed.add_field(
-                name=f"{emoji} **{info['name']}** — {price} {currency}{owned_tag}",
-                value=f"_{info['desc']}_  ·  Type: {info['type'].capitalize()}  ·  `{slug}`",
-                inline=False,
+        def build_tms_embed(pg: int) -> discord.Embed:
+            pg     = max(1, min(pg, total_pages))
+            offset = (pg - 1) * per_page
+            chunk  = all_tms[offset:offset + per_page]
+            embed  = discord.Embed(
+                title="💿 TM Shop",
+                description=(
+                    f"Balance: **💰 {balance} {currency}**\n"
+                    f"Use `buytm <move>` to purchase · `usetm <move> <slot> <move_slot>` to teach\n\u200b"
+                ),
+                color=COLORS["blue"],
             )
-        embed.set_footer(text=f"Page {page}/{total_pages} · tms <page> to navigate · {len(all_tms)} TMs total")
-        await ctx.send(embed=embed)
+            for slug, info in chunk:
+                owned_tag = " ✅ **Owned**" if slug in owned_tms else ""
+                emoji     = TM_TYPE_EMOJI.get(info["type"], "💿")
+                price     = tm_prices.get(slug, info["price"])
+                embed.add_field(
+                    name=f"{emoji} **{info['name']}** — {price} {currency}{owned_tag}",
+                    value=f"_{info['desc']}_  ·  Type: {info['type'].capitalize()}  ·  `{slug}`",
+                    inline=False,
+                )
+            embed.set_footer(text=f"Page {pg}/{total_pages} · {len(all_tms)} TMs total")
+            return embed
+
+        async def async_tms_build(pg: int) -> discord.Embed:
+            return build_tms_embed(pg)
+
+        page  = max(1, min(page, total_pages))
+        embed = build_tms_embed(page)
+
+        if total_pages == 1:
+            await ctx.send(embed=embed)
+            return
+
+        view = PaginatedView(async_tms_build, total_pages, page, ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
 
     @commands.command(name="buytm")
     async def buytm(self, ctx: commands.Context, *, move: str) -> None:
@@ -2304,33 +2974,45 @@ class PokéBot(commands.Cog):
 
     @commands.command(name="pokestop")
     async def pokestop(self, ctx: commands.Context) -> None:
-        """Spin a Pokéstop for free daily items! Resets at midnight each day."""
+        """Spin a Pokéstop for free daily items and streak bonuses! Resets at midnight ET."""
         player = await self._get_player(ctx.author)
         if not player:
             await ctx.send(embed=error_embed("Start your journey first with `start`!"))
             return
 
-        # Check if already claimed today (reset at midnight US Eastern)
+        # ── Streak / cooldown logic ───────────────────────────────────────────
         EASTERN   = zoneinfo.ZoneInfo("America/New_York")
         now       = datetime.now(tz=EASTERN)
         today_str = now.strftime("%Y-%m-%d")
         last_stop = player.get("lastPokestop")
+        streak    = player.get("pokestopStreak", 0)
 
         if last_stop == today_str:
-            # Calculate time until next midnight Eastern
             midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             delta    = midnight - now
             hours, remainder = divmod(int(delta.total_seconds()), 3600)
             minutes          = remainder // 60
             await ctx.send(embed=error_embed(
                 f"You already spun this Pokéstop today!\n"
-                f"Come back in **{hours}h {minutes}m** when it resets at midnight Eastern."
+                f"Come back in **{hours}h {minutes}m** when it resets at midnight Eastern.\n"
+                f"🔥 Current streak: **{streak} day{'s' if streak != 1 else ''}**"
             ))
             return
 
-        # Build a random reward bundle
+        # Check if streak is still alive (must spin on consecutive days)
+        if last_stop:
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            if last_stop == yesterday:
+                streak += 1   # consecutive day — keep the streak going
+            else:
+                streak = 1    # missed a day — reset
+        else:
+            streak = 1        # first ever spin
+
+        # ── Build reward bundle ───────────────────────────────────────────────
         reward_balls   = {}
         reward_healing = {}
+        reward_berries = {}
         reward_credits = 0
         lines          = []
         currency       = await _currency_name(ctx.guild)
@@ -2366,36 +3048,264 @@ class PokéBot(commands.Cog):
             reward_healing["revive"] = 1
             lines.append("⭐ 1× Revive")
 
+        # Berries — always a small chance; better chance with higher streaks
+        berry_base = 0.40 + min(streak - 1, 6) * 0.05   # up to 70% at streak 7+
+        if random.random() < berry_base:
+            razz = random.randint(1, 2)
+            reward_berries["razzberry"] = razz
+            lines.append(f"🍓 {razz}× Razz Berry")
+        if random.random() < (berry_base * 0.6):
+            nanab = random.randint(1, 2)
+            reward_berries["nanabberry"] = nanab
+            lines.append(f"🍌 {nanab}× Nanab Berry")
+        if random.random() < (berry_base * 0.4):
+            pinap = 1
+            reward_berries["pinapberry"] = pinap
+            lines.append(f"🍍 {pinap}× Pinap Berry")
+
         # Small currency bonus
         if random.random() < 0.6:
             reward_credits = random.randint(25, 150)
             lines.append(f"💰 {reward_credits} {currency}")
 
-        # Apply rewards to player
-        items = player.setdefault("items", {"pokeball": 0, "greatball": 0, "ultraball": 0, "healing": {}})
+        # ── Streak bonuses (on top of normal rewards) ─────────────────────────
+        streak_bonus_lines = []
+        if streak >= 7 and streak % 7 == 0:
+            # Weekly milestone: a guaranteed Ultra Ball + Pinap Berry + big credit bump
+            reward_balls["ultraball"]    = reward_balls.get("ultraball", 0) + 2
+            reward_berries["pinapberry"] = reward_berries.get("pinapberry", 0) + 2
+            reward_credits              += 300
+            streak_bonus_lines.append("🌟 **Weekly milestone bonus!** +2 Ultra Balls, +2 Pinap Berries, +300 credits!")
+        elif streak >= 3:
+            # 3-day+ bonus: extra ball and berry
+            reward_balls["greatball"]  = reward_balls.get("greatball", 0) + 1
+            reward_berries["razzberry"] = reward_berries.get("razzberry", 0) + 1
+            streak_bonus_lines.append("✨ **Streak bonus!** +1 Great Ball, +1 Razz Berry")
+
+        # ── Apply rewards ─────────────────────────────────────────────────────
+        items   = player.setdefault("items", {"pokeball": 0, "greatball": 0, "ultraball": 0, "healing": {}, "tms": [], "berries": {}})
         healing = items.setdefault("healing", {})
+        berries = items.setdefault("berries", {})
 
         for ball, qty in reward_balls.items():
             items[ball] = items.get(ball, 0) + qty
         for item, qty in reward_healing.items():
             healing[item] = healing.get(item, 0) + qty
+        for berry, qty in reward_berries.items():
+            berries[berry] = berries.get(berry, 0) + qty
 
-        player["lastPokestop"] = today_str
+        player["lastPokestop"]   = today_str
+        player["pokestopStreak"] = streak
         await self._save_player(ctx.author, player)
 
         if reward_credits:
             await _deposit(ctx.author, reward_credits)
 
+        # ── Streak display ────────────────────────────────────────────────────
+        streak_flames = "🔥" * min(streak, 7)
+        streak_header = f"{streak_flames} **Day {streak} streak!**"
+        if streak == 1:
+            streak_header = "🗺️ Spin #1 — start your streak!"
+
         embed = discord.Embed(
             title="🏪 Pokéstop",
             description=(
-                f"**{ctx.author.display_name}** spun a Pokéstop!\n\n"
+                f"**{ctx.author.display_name}** spun a Pokéstop!\n"
+                f"{streak_header}\n\n"
                 + "\n".join(lines)
-                + "\n\n_Come back tomorrow for more!_"
+                + ("\n\n" + "\n".join(streak_bonus_lines) if streak_bonus_lines else "")
+                + "\n\n_Come back tomorrow to keep your streak alive!_"
             ),
             color=COLORS["blue"],
         )
-        embed.set_footer(text="Resets daily at midnight Eastern (ET)")
+        next_milestone = 7 - (streak % 7)
+        if next_milestone < 7:
+            embed.set_footer(text=f"🌟 Weekly bonus in {next_milestone} day{'s' if next_milestone != 1 else ''} · Resets daily at midnight Eastern (ET)")
+        else:
+            embed.set_footer(text="Resets daily at midnight Eastern (ET)")
+        await ctx.send(embed=embed)
+
+
+    # ── Berries ───────────────────────────────────────────────────────────────
+
+    @commands.command(name="berries", aliases=["myberries"])
+    async def berries(self, ctx: commands.Context) -> None:
+        """View your berry inventory."""
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey with `start`!"))
+            return
+        bag = player.get("items", {}).get("berries", {})
+        lines = []
+        for slug, label in BERRY_NAMES.items():
+            count = bag.get(slug, 0)
+            effect = {
+                "razzberry":  "Catch rate ×1.5",
+                "nanabberry": "No damage on fail",
+                "pinapberry": "2× catch credits",
+            }[slug]
+            lines.append(f"{label} ×**{count}** — _{effect}_")
+        embed = discord.Embed(
+            title=f"🍓 {ctx.author.display_name}'s Berry Pouch",
+            description="\n".join(lines) or "_No berries — spin a `pokestop` or buy some with `buy`!_",
+            color=COLORS["green"],
+        )
+        embed.set_footer(text="Use berries: catch <ball> <berry>  e.g.  catch ultraball razzberry")
+        await ctx.send(embed=embed)
+
+    # ── Trade ─────────────────────────────────────────────────────────────────
+
+    @commands.command(name="trade")
+    async def trade(self, ctx: commands.Context, target: discord.Member, your_slot: int, their_slot: int) -> None:
+        """Offer a Pokémon trade. Usage: `trade @user <your_slot> <their_slot>`
+        Both trainers must confirm. The trade swaps the Pokémon in those slots."""
+        if target == ctx.author:
+            await ctx.send(embed=error_embed("You can't trade with yourself!"))
+            return
+        if target.bot:
+            await ctx.send(embed=error_embed("You can't trade with a bot!"))
+            return
+
+        player = await self._get_player(ctx.author)
+        if not player:
+            await ctx.send(embed=error_embed("Start your journey with `start`!"))
+            return
+        target_data = await self._get_player(target)
+        if not target_data:
+            await ctx.send(embed=error_embed(f"{target.display_name} hasn't started their journey yet!"))
+            return
+
+        if self._get_battle_by_user(ctx.author.id) or self._get_battle_by_user(target.id):
+            await ctx.send(embed=error_embed("Can't trade while either trainer is in a battle!"))
+            return
+
+        # Validate slots
+        your_idx  = your_slot - 1
+        their_idx = their_slot - 1
+        if your_idx < 0 or your_idx >= len(player["pokemon"]):
+            await ctx.send(embed=error_embed(f"You don't have a Pokémon in slot {your_slot}. You have {len(player['pokemon'])}."))
+            return
+        if their_idx < 0 or their_idx >= len(target_data["pokemon"]):
+            await ctx.send(embed=error_embed(f"{target.display_name} doesn't have a Pokémon in slot {their_slot}. They have {len(target_data['pokemon'])}."))
+            return
+        if len(player["pokemon"]) <= 1:
+            await ctx.send(embed=error_embed("You can't trade your last Pokémon!"))
+            return
+        if len(target_data["pokemon"]) <= 1:
+            await ctx.send(embed=error_embed(f"{target.display_name} can't trade their last Pokémon!"))
+            return
+
+        your_poke  = player["pokemon"][your_idx]
+        their_poke = target_data["pokemon"][their_idx]
+
+        # Can't offer the active Pokémon if it would leave 0 usable ones (edge case handled below)
+        # Stash the offer
+        self._trades[target.id] = {
+            "offerer_id":   ctx.author.id,
+            "offerer_name": ctx.author.display_name,
+            "target_id":    target.id,
+            "channel_id":   ctx.channel.id,
+            "your_idx":     your_idx,
+            "their_idx":    their_idx,
+            "expires":      time.time() + 120,
+        }
+
+        shiny_y = " ✨" if your_poke.get("shiny") else ""
+        shiny_t = " ✨" if their_poke.get("shiny") else ""
+        nick_y  = f' "{your_poke["nickname"]}"' if your_poke.get("nickname") else ""
+        nick_t  = f' "{their_poke["nickname"]}"' if their_poke.get("nickname") else ""
+
+        embed = discord.Embed(
+            title="🔄 Trade Offer!",
+            description=(
+                f"**{ctx.author.display_name}** wants to trade with **{target.display_name}**!\n\n"
+                f"📤 **{ctx.author.display_name}** offers:\n"
+                f"→ **{your_poke['displayName']}{shiny_y}{nick_y}** Lv.{your_poke['level']} "
+                f"| {' / '.join(t.capitalize() for t in your_poke['types'])}\n\n"
+                f"📥 **{target.display_name}**'s Pokémon in slot {their_slot}:\n"
+                f"→ **{their_poke['displayName']}{shiny_t}{nick_t}** Lv.{their_poke['level']} "
+                f"| {' / '.join(t.capitalize() for t in their_poke['types'])}\n\n"
+                f"{target.mention} — type `accepttrade` to accept or `declinetrade` to decline!\n"
+                f"_(Expires in 2 minutes)_"
+            ),
+            color=COLORS["orange"],
+        )
+        if your_poke.get("spriteUrl"):
+            embed.set_thumbnail(url=your_poke["spriteUrl"])
+        if their_poke.get("spriteUrl"):
+            embed.set_image(url=their_poke["spriteUrl"])
+        await ctx.send(embed=embed)
+
+        def check(m: discord.Message) -> bool:
+            return (
+                m.author == target
+                and m.channel == ctx.channel
+                and m.content.lower().strip() in ("accepttrade", "declinetrade")
+            )
+
+        try:
+            msg = await self.bot.wait_for("message", check=check, timeout=120.0)
+        except asyncio.TimeoutError:
+            self._trades.pop(target.id, None)
+            await ctx.send(embed=error_embed(f"{target.display_name} didn't respond. Trade expired."))
+            return
+
+        trade = self._trades.pop(target.id, None)
+        if not trade or time.time() > trade["expires"]:
+            await ctx.send(embed=error_embed("Trade expired."))
+            return
+
+        if msg.content.lower().strip() == "declinetrade":
+            await ctx.send(embed=discord.Embed(
+                color=COLORS["gray"],
+                description=f"❌ {target.display_name} declined the trade.",
+            ))
+            return
+
+        # ── Execute the trade ─────────────────────────────────────────────────
+        # Re-fetch fresh data to avoid stale state
+        player      = await self._get_player(ctx.author)
+        target_data = await self._get_player(target)
+        if not player or not target_data:
+            await ctx.send(embed=error_embed("Trade failed — one trainer's data could not be loaded."))
+            return
+
+        yi, ti = trade["your_idx"], trade["their_idx"]
+        # Validate indices are still valid (collection may have changed)
+        if yi >= len(player["pokemon"]) or ti >= len(target_data["pokemon"]):
+            await ctx.send(embed=error_embed("Trade failed — a Pokémon slot is no longer valid (collection changed)."))
+            return
+
+        # Swap the Pokémon
+        poke_y = copy.deepcopy(player["pokemon"][yi])
+        poke_t = copy.deepcopy(target_data["pokemon"][ti])
+        player["pokemon"][yi]      = poke_t
+        target_data["pokemon"][ti] = poke_y
+
+        # Fix active indices if they pointed at the traded slot
+        if player["activePokemonIndex"] == yi:
+            player["activePokemonIndex"] = yi  # same slot, new pokemon — fine
+        if target_data["activePokemonIndex"] == ti:
+            target_data["activePokemonIndex"] = ti
+
+        # Update Pokédex for both trainers
+        self._update_dex(player, poke_t)
+        self._update_dex(target_data, poke_y)
+
+        await self._save_player(ctx.author, player)
+        await self._save_player(target, target_data)
+
+        shiny_y = " ✨" if poke_y.get("shiny") else ""
+        shiny_t = " ✨" if poke_t.get("shiny") else ""
+        embed = discord.Embed(
+            title="🔄 Trade Complete!",
+            description=(
+                f"✅ Trade successful!\n\n"
+                f"**{ctx.author.display_name}** received: **{poke_t['displayName']}{shiny_t}** Lv.{poke_t['level']}\n"
+                f"**{target.display_name}** received: **{poke_y['displayName']}{shiny_y}** Lv.{poke_y['level']}"
+            ),
+            color=COLORS["green"],
+        )
         await ctx.send(embed=embed)
 
 
