@@ -147,30 +147,38 @@ class UFC(commands.Cog):
         Example: !ufc fighter Jon Jones
         """
         async with ctx.typing():
-            # Try ESPN first
-            fighter = await search_fighter_espn(self.session, name)
+            fighter = None
 
-            # If ESPN gives us no stat categories, enrich with Sherdog
-            if not fighter or (
-                not fighter.get("stat_categories") and not fighter.get("fights")
-            ):
-                sherdog = await get_fighter_sherdog(self.session, name)
-                if sherdog:
-                    if fighter:
-                        # Merge: use ESPN bio, Sherdog fights/record if missing
-                        fighter["fights"] = sherdog.get("fights", [])
-                        if not fighter.get("record"):
-                            fighter["record"] = sherdog.get("record", "")
-                        if not fighter.get("gym"):
-                            fighter["gym"] = sherdog.get("association", "")
-                    else:
-                        fighter = sherdog
+            # 1. Try ESPN (finds fighters on current/recent cards)
+            espn_result = await search_fighter_espn(self.session, name)
+            if espn_result:
+                fighter = espn_result
+
+            # 2. Always try Sherdog for fight history and bio
+            sherdog_result = await get_fighter_sherdog(self.session, name)
+            if sherdog_result:
+                if fighter:
+                    if not fighter.get("fights"):
+                        fighter["fights"] = sherdog_result.get("fights", [])
+                    if not fighter.get("record"):
+                        fighter["record"] = sherdog_result.get("record", "")
+                    if not fighter.get("gym"):
+                        fighter["gym"] = sherdog_result.get("association", "")
+                    if not fighter.get("height"):
+                        fighter["height"] = sherdog_result.get("height", "")
+                    if not fighter.get("weight"):
+                        fighter["weight"] = sherdog_result.get("weight", "")
+                else:
+                    fighter = sherdog_result
 
         if not fighter:
             await self._send_error(
                 ctx,
-                f"Couldn't find a fighter named **{name}**.\n"
-                "Check the spelling — use their full fight name.",
+                f"Couldn't find **{name}**.\n\n"
+                "Tips:\n"
+                "• Use their full name (e.g. `Jon Jones` not `Jones`)\n"
+                "• Check spelling — use their official fight name\n"
+                "• ESPN only tracks active/recent UFC fighters",
             )
             return
 
