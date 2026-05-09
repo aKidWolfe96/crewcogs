@@ -1,0 +1,11 @@
+{
+    "name": "UFC",
+    "short": "UFC fight cards, results, fighter stats, and server picks.",
+    "description": "Display upcoming UFC fight cards, recent event results, fighter stats, and run a server-wide picks/predictions game with a leaderboard.",
+    "author": ["you"],
+    "version": "1.0.0",
+    "min_bot_version": "3.4.0",
+    "min_python_version": [3, 8, 0],
+    "tags": ["ufc", "mma", "sports", "picks", "predictions"],
+    "requirements": ["aiohttp", "beautifulsoup4"]
+}
