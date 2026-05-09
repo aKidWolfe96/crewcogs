@@ -41,7 +41,7 @@ class UFC(commands.Cog):
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=0xUFC2024, force_registration=True)
+        self.config = Config.get_conf(self, identifier=0xFC2024, force_registration=True)
 
         # Per-guild defaults
         self.config.register_guild(
