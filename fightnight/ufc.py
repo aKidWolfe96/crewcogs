@@ -1,404 +1,315 @@
 """
-UFC Cog for Red-DiscordBot
-Displays UFC fight cards, results, fighter stats, and runs a server picks game.
-
+UFC Cog for Red-DiscordBot v3
 Commands:
-    !ufc card       - Upcoming fight card
-    !ufc results    - Most recent event results
-    !ufc fighter    - Fighter stats
-    !ufc pick       - Log your pick for a fight
-    !ufc picks      - View server picks for upcoming event
-    !ufc standings  - Pick 'em leaderboard
-    !ufc settle     - [Admin] Settle picks after an event
-    !ufc clearpicks - [Admin] Clear picks for a new event
+    !ufc card           upcoming fight card
+    !ufc results        most recent event results
+    !ufc fighter <name> fighter stats
+    !ufc pick <name>    lock in a pick
+    !ufc picks          see server picks
+    !ufc standings      pick em leaderboard
+    !ufc settle         [admin] score picks and update standings
+    !ufc clearpicks     [admin] clear picks without settling
+    !ufc resetstandings [admin] wipe standings
 """
 import asyncio
 import aiohttp
 import discord
 from redbot.core import commands, Config, checks
 from redbot.core.bot import Red
-from typing import Optional
 
-from .api import (
-    get_upcoming_event,
-    get_recent_event,
-    search_fighter_espn,
-    get_fighter_sherdog,
-)
+from .api import get_upcoming_event, get_recent_event, get_fighter
 from .embeds import (
-    build_card_embed,
-    build_results_embed,
-    build_fighter_embed,
-    build_picks_embed,
-    build_standings_embed,
-    build_pick_confirm_embed,
-    build_error_embed,
+    card_embed, results_embed, fighter_embed,
+    picks_embed, standings_embed,
+    pick_confirm_embed, error_embed,
 )
 
 
 class UFC(commands.Cog):
-    """UFC fight cards, results, fighter stats, and server picks."""
+    """UFC fight cards, results, fighter stats, and server pick em."""
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=0xFC2024, force_registration=True)
-
-        # Per-guild defaults
-        self.config.register_guild(
-            picks={},       # {fight_key: {user_id: fighter_name}}
-            standings={},   # {user_id: {correct: int, total: int}}
-            current_event=None,  # cached event name for active picks
+        self.config = Config.get_conf(
+            self, identifier=7833209, force_registration=True
         )
-
-        self._session: Optional[aiohttp.ClientSession] = None
+        self.config.register_guild(
+            picks={},       # {"Fighter A|Fighter B": {"user_id": "Fighter A"}}
+            standings={},   # {"user_id": {"correct": int, "total": int}}
+        )
+        self._session: aiohttp.ClientSession = None
 
     async def cog_load(self):
         self._session = aiohttp.ClientSession()
 
     async def cog_unload(self):
-        if self._session:
+        if self._session and not self._session.closed:
             await self._session.close()
 
     @property
     def session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+        if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
 
-    # ─── Helper ───────────────────────────────────────────────────────────────
-
-    async def _send_error(self, ctx: commands.Context, msg: str):
-        await ctx.send(embed=build_error_embed(msg))
-
-    # ─── Main Command Group ───────────────────────────────────────────────────
+    # ── group ─────────────────────────────────────────────────────────────────
 
     @commands.group(name="ufc", invoke_without_command=True)
     async def ufc(self, ctx: commands.Context):
-        """UFC commands — fight cards, results, fighter stats, and picks."""
-        prefix = ctx.clean_prefix
-        help_text = (
-            f"**UFC Commands**\n"
-            f"`{prefix}ufc card` — Upcoming fight card\n"
-            f"`{prefix}ufc results` — Most recent event results\n"
-            f"`{prefix}ufc fighter <name>` — Fighter stats & record\n"
-            f"`{prefix}ufc pick <fighter name>` — Lock in your pick\n"
-            f"`{prefix}ufc picks` — View server picks for next event\n"
-            f"`{prefix}ufc standings` — Pick 'em leaderboard\n"
-        )
-        embed = discord.Embed(
-            title="🥊 UFC Bot",
-            description=help_text,
-            color=0xD20A0A,
-        )
-        embed.set_footer(text="Data via ESPN • Picks powered by your server")
+        """UFC commands."""
+        p = ctx.clean_prefix
+        embed = discord.Embed(title="🥊  UFC Bot", color=0xD20A0A, description=(
+            f"`{p}ufc card` — upcoming fight card\n"
+            f"`{p}ufc results` — recent event results\n"
+            f"`{p}ufc fighter <name>` — fighter stats\n"
+            f"`{p}ufc pick <name>` — lock in your pick\n"
+            f"`{p}ufc picks` — server picks\n"
+            f"`{p}ufc standings` — pick em leaderboard\n"
+        ))
         await ctx.send(embed=embed)
 
-    # ─── !ufc card ────────────────────────────────────────────────────────────
+    # ── card ──────────────────────────────────────────────────────────────────
 
     @ufc.command(name="card")
     async def ufc_card(self, ctx: commands.Context):
-        """Show the upcoming UFC fight card."""
+        """Upcoming UFC fight card."""
         async with ctx.typing():
             event = await get_upcoming_event(self.session)
-
         if not event:
-            await self._send_error(
-                ctx,
-                "Couldn't fetch the upcoming fight card right now. Try again shortly.",
-            )
-            return
+            return await ctx.send(embed=error_embed(
+                "Couldn't fetch the upcoming card right now. Try again in a moment."
+            ))
+        await ctx.send(embed=card_embed(event))
 
-        embed = build_card_embed(event)
-        await ctx.send(embed=embed)
-
-    # ─── !ufc results ─────────────────────────────────────────────────────────
+    # ── results ───────────────────────────────────────────────────────────────
 
     @ufc.command(name="results")
     async def ufc_results(self, ctx: commands.Context):
-        """Show results from the most recent UFC event."""
+        """Most recent UFC event results."""
         async with ctx.typing():
             event = await get_recent_event(self.session)
-
         if not event:
-            await self._send_error(
-                ctx,
-                "Couldn't fetch recent results right now. Try again shortly.",
-            )
-            return
+            return await ctx.send(embed=error_embed(
+                "Couldn't fetch recent results right now. Try again in a moment."
+            ))
+        await ctx.send(embed=results_embed(event))
 
-        embed = build_results_embed(event)
-        await ctx.send(embed=embed)
-
-        # Auto-trigger standing settlement if picks exist for this event
-        guild_picks = await self.config.guild(ctx.guild).picks()
-        current_event = await self.config.guild(ctx.guild).current_event()
-        if guild_picks and current_event and current_event == event.get("name"):
-            await ctx.send(
-                f"📢 Results are in! Admins: use `{ctx.clean_prefix}ufc settle` "
-                f"to process picks and update standings."
-            )
-
-    # ─── !ufc fighter ─────────────────────────────────────────────────────────
+    # ── fighter ───────────────────────────────────────────────────────────────
 
     @ufc.command(name="fighter")
     async def ufc_fighter(self, ctx: commands.Context, *, name: str):
-        """Look up a UFC fighter's stats and recent fights.
+        """Look up a fighter's stats and recent fight history.
 
         Example: !ufc fighter Jon Jones
         """
         async with ctx.typing():
-            fighter = None
-
-            # 1. Try ESPN (finds fighters on current/recent cards)
-            espn_result = await search_fighter_espn(self.session, name)
-            if espn_result:
-                fighter = espn_result
-
-            # 2. Always try Sherdog for fight history and bio
-            sherdog_result = await get_fighter_sherdog(self.session, name)
-            if sherdog_result:
-                if fighter:
-                    if not fighter.get("fights"):
-                        fighter["fights"] = sherdog_result.get("fights", [])
-                    if not fighter.get("record"):
-                        fighter["record"] = sherdog_result.get("record", "")
-                    if not fighter.get("gym"):
-                        fighter["gym"] = sherdog_result.get("association", "")
-                    if not fighter.get("height"):
-                        fighter["height"] = sherdog_result.get("height", "")
-                    if not fighter.get("weight"):
-                        fighter["weight"] = sherdog_result.get("weight", "")
-                else:
-                    fighter = sherdog_result
-
-        if not fighter:
-            await self._send_error(
-                ctx,
+            f = await get_fighter(self.session, name)
+        if not f:
+            return await ctx.send(embed=error_embed(
                 f"Couldn't find **{name}**.\n\n"
-                "Tips:\n"
-                "• Use their full name (e.g. `Jon Jones` not `Jones`)\n"
+                "• Use their full name (`Jon Jones` not `Jones`)\n"
                 "• Check spelling — use their official fight name\n"
-                "• ESPN only tracks active/recent UFC fighters",
-            )
-            return
+                "• ESPN only covers active UFC fighters; "
+                "Sherdog covers most of MMA history"
+            ))
+        await ctx.send(embed=fighter_embed(f))
 
-        embed = build_fighter_embed(fighter)
-        await ctx.send(embed=embed)
-
-    # ─── !ufc pick ────────────────────────────────────────────────────────────
+    # ── pick ──────────────────────────────────────────────────────────────────
 
     @ufc.command(name="pick")
     async def ufc_pick(self, ctx: commands.Context, *, fighter_name: str):
         """Lock in your pick for a fight on the upcoming card.
 
+        The bot matches your input to the right fight automatically.
         Example: !ufc pick Jon Jones
-        The bot will match your pick to the right fight automatically.
         """
         async with ctx.typing():
             event = await get_upcoming_event(self.session)
 
         if not event:
-            await self._send_error(ctx, "Couldn't fetch the upcoming card to match your pick.")
-            return
+            return await ctx.send(embed=error_embed(
+                "Couldn't fetch the upcoming card to match your pick."
+            ))
 
-        fights = event.get("fights", [])
-        fighter_name_lower = fighter_name.lower().strip()
+        # match to a fight
+        query = fighter_name.lower().strip()
+        matched_fight = matched_fighter = opponent = None
 
-        matched_fight = None
-        matched_fighter = None
-        matched_opponent = None
-
-        for fight in fights:
-            red = fight.get("red_name", "")
-            blue = fight.get("blue_name", "")
-            if fighter_name_lower in red.lower():
-                matched_fight = fight
+        for fight in event.get("fights", []):
+            red, blue = fight["red"], fight["blue"]
+            if query in red.lower():
+                matched_fight   = fight
                 matched_fighter = red
-                matched_opponent = blue
+                opponent        = blue
                 break
-            if fighter_name_lower in blue.lower():
-                matched_fight = fight
+            if query in blue.lower():
+                matched_fight   = fight
                 matched_fighter = blue
-                matched_opponent = red
+                opponent        = red
                 break
 
         if not matched_fight:
-            await self._send_error(
-                ctx,
-                f"**{fighter_name}** doesn't appear on the upcoming card.\n"
-                f"Use `{ctx.clean_prefix}ufc card` to see the full fight card.",
-            )
-            return
+            return await ctx.send(embed=error_embed(
+                f"**{fighter_name}** isn't on the upcoming card.\n"
+                f"Use `{ctx.clean_prefix}ufc card` to see current matchups."
+            ))
 
-        fight_key = f"{matched_fight['red_name']}|{matched_fight['blue_name']}"
-        user_id = str(ctx.author.id)
+        fight_key = f"{matched_fight['red']}|{matched_fight['blue']}"
+        uid = str(ctx.author.id)
 
         async with self.config.guild(ctx.guild).picks() as picks:
             if fight_key not in picks:
                 picks[fight_key] = {}
-            old_pick = picks[fight_key].get(user_id)
-            picks[fight_key][user_id] = matched_fighter
+            old = picks[fight_key].get(uid)
+            picks[fight_key][uid] = matched_fighter
 
-        # Store which event picks are for
-        await self.config.guild(ctx.guild).current_event.set(event.get("name"))
-
-        if old_pick and old_pick != matched_fighter:
+        if old and old != matched_fighter:
             await ctx.send(
-                f"🔄 {ctx.author.mention} changed pick from **{old_pick}** → **{matched_fighter}**"
+                f"🔄 {ctx.author.mention} changed pick: "
+                f"**{old}** → **{matched_fighter}**"
             )
         else:
-            embed = build_pick_confirm_embed(
-                ctx.author, matched_fighter, event["short_name"], matched_opponent
-            )
-            await ctx.send(embed=embed)
+            await ctx.send(embed=pick_confirm_embed(
+                ctx.author, matched_fighter, opponent, event["shortname"]
+            ))
 
-    # ─── !ufc picks ───────────────────────────────────────────────────────────
+    # ── picks ─────────────────────────────────────────────────────────────────
 
     @ufc.command(name="picks")
     async def ufc_picks(self, ctx: commands.Context):
         """Show everyone's picks for the upcoming event."""
         async with ctx.typing():
             event = await get_upcoming_event(self.session)
-            picks = await self.config.guild(ctx.guild).picks()
+            current_picks = await self.config.guild(ctx.guild).picks()
 
         if not event:
-            await self._send_error(ctx, "Couldn't fetch the upcoming event.")
-            return
+            return await ctx.send(embed=error_embed("Couldn't fetch the upcoming event."))
 
-        embed = build_picks_embed(event, picks, ctx.guild)
-        await ctx.send(embed=embed)
+        await ctx.send(embed=picks_embed(event, current_picks, ctx.guild))
 
-    # ─── !ufc standings ───────────────────────────────────────────────────────
+    # ── standings ─────────────────────────────────────────────────────────────
 
     @ufc.command(name="standings")
     async def ufc_standings(self, ctx: commands.Context):
-        """Show the server's pick 'em leaderboard."""
-        standings = await self.config.guild(ctx.guild).standings()
-        embed = build_standings_embed(standings, ctx.guild)
-        await ctx.send(embed=embed)
+        """Show the server pick em leaderboard."""
+        s = await self.config.guild(ctx.guild).standings()
+        await ctx.send(embed=standings_embed(s, ctx.guild))
 
-    # ─── !ufc settle (Admin) ──────────────────────────────────────────────────
+    # ── settle ────────────────────────────────────────────────────────────────
 
     @ufc.command(name="settle")
     @checks.admin_or_permissions(manage_guild=True)
     async def ufc_settle(self, ctx: commands.Context):
-        """[Admin] Score picks against results and update standings.
+        """[Admin] Score picks against the most recent results and update standings.
 
-        Run this after an event completes. The bot will fetch the most recent
-        results and compare against locked-in picks.
+        Run this after an event finishes. Picks are cleared automatically.
         """
         async with ctx.typing():
             event = await get_recent_event(self.session)
-            picks = await self.config.guild(ctx.guild).picks()
+            current_picks = await self.config.guild(ctx.guild).picks()
 
         if not event:
-            await self._send_error(ctx, "Couldn't fetch recent results to settle picks.")
-            return
+            return await ctx.send(embed=error_embed("Couldn't fetch recent results."))
+        if not current_picks:
+            return await ctx.send("No picks to settle.")
 
-        if not picks:
-            await ctx.send("No picks to settle for this event.")
-            return
-
-        fights = event.get("fights", [])
-
-        # Build winner map: fight_key -> winner name
-        winner_map = {}
-        for fight in fights:
-            red = fight.get("red_name", "")
-            blue = fight.get("blue_name", "")
-            result = fight.get("result") or {}
-            winner = result.get("winner", "")
-            if red and blue and winner:
-                key = f"{red}|{blue}"
-                winner_map[key] = winner
+        # build winner map from results
+        winner_map = {}  # fight_key -> winner name
+        for f in event.get("fights", []):
+            w = f.get("winner", "")
+            if w:
+                key = f"{f['red']}|{f['blue']}"
+                winner_map[key] = w
 
         if not winner_map:
-            await self._send_error(
-                ctx,
-                "No fight results found yet — results may not be posted. Try again after the event.",
+            return await ctx.send(embed=error_embed(
+                "No fight results found yet — run this after the event finishes."
+            ))
+
+        # tally
+        deltas = {}  # uid -> {correct, total}
+        for fight_key, fight_picks in current_picks.items():
+            actual = winner_map.get(fight_key)
+            if not actual:
+                continue
+            for uid, picked in fight_picks.items():
+                deltas.setdefault(uid, {"correct": 0, "total": 0})
+                deltas[uid]["total"] += 1
+                if picked.lower() == actual.lower():
+                    deltas[uid]["correct"] += 1
+
+        if not deltas:
+            return await ctx.send(
+                "Picks exist but no fight results matched — "
+                "are results posted yet?"
             )
-            return
 
-        # Tally scores
-        score_deltas = {}  # user_id -> {correct, total}
-
-        for fight_key, fight_picks in picks.items():
-            actual_winner = winner_map.get(fight_key)
-            if not actual_winner:
-                continue  # fight not yet resolved
-
-            for user_id, picked in fight_picks.items():
-                if user_id not in score_deltas:
-                    score_deltas[user_id] = {"correct": 0, "total": 0}
-                score_deltas[user_id]["total"] += 1
-                if picked.lower() == actual_winner.lower():
-                    score_deltas[user_id]["correct"] += 1
-
-        if not score_deltas:
-            await ctx.send("Picks exist but no fight results matched yet. Are results posted?")
-            return
-
-        # Update standings
+        # update standings
         async with self.config.guild(ctx.guild).standings() as standings:
-            for user_id, delta in score_deltas.items():
-                if user_id not in standings:
-                    standings[user_id] = {"correct": 0, "total": 0}
-                standings[user_id]["correct"] += delta["correct"]
-                standings[user_id]["total"] += delta["total"]
+            for uid, d in deltas.items():
+                if uid not in standings:
+                    standings[uid] = {"correct": 0, "total": 0}
+                standings[uid]["correct"] += d["correct"]
+                standings[uid]["total"]   += d["total"]
 
-        # Clear picks for next event
+        # clear picks
         await self.config.guild(ctx.guild).picks.set({})
-        await self.config.guild(ctx.guild).current_event.set(None)
 
-        # Build summary
-        lines = ["**Picks settled!** Here's how everyone did:\n"]
-        for user_id, delta in sorted(score_deltas.items(), key=lambda x: -x[1]["correct"]):
-            member = ctx.guild.get_member(int(user_id))
-            display = member.display_name if member else f"User {user_id}"
-            correct = delta["correct"]
-            total = delta["total"]
-            pct = int((correct / total) * 100) if total > 0 else 0
-            emoji = "🔥" if correct == total else ("✅" if correct > 0 else "❌")
-            lines.append(f"{emoji} **{display}**: {correct}/{total} ({pct}%)")
+        # summary
+        lines = [f"**Picks settled for {event['shortname']}!**\n"]
+        for uid, d in sorted(deltas.items(), key=lambda x: -x[1]["correct"]):
+            member  = ctx.guild.get_member(int(uid))
+            display = member.display_name if member else f"<@{uid}>"
+            c, t    = d["correct"], d["total"]
+            pct     = round(c / t * 100) if t else 0
+            icon    = "🔥" if c == t else ("✅" if c else "❌")
+            lines.append(f"{icon} **{display}**: {c}/{t} ({pct}%)")
 
         lines.append(f"\nPicks cleared. Use `{ctx.clean_prefix}ufc pick` for the next event!")
 
         embed = discord.Embed(
-            title=f"📊 Picks Settled: {event.get('short_name', event.get('name', 'UFC Event'))}",
+            title="📊  Picks Settled",
             description="\n".join(lines),
-            color=0xC8A951,
+            color=UFC_GOLD if deltas else 0x888888,
         )
         await ctx.send(embed=embed)
 
-    # ─── !ufc clearpicks (Admin) ──────────────────────────────────────────────
+    # ── clearpicks ────────────────────────────────────────────────────────────
 
     @ufc.command(name="clearpicks")
     @checks.admin_or_permissions(manage_guild=True)
     async def ufc_clearpicks(self, ctx: commands.Context):
-        """[Admin] Manually clear all picks without settling scores."""
+        """[Admin] Clear all picks without updating standings."""
         await self.config.guild(ctx.guild).picks.set({})
-        await self.config.guild(ctx.guild).current_event.set(None)
-        await ctx.send("✅ All picks cleared.")
+        await ctx.send("✅ Picks cleared.")
 
-    # ─── !ufc resetstandings (Admin) ──────────────────────────────────────────
+    # ── resetstandings ────────────────────────────────────────────────────────
 
     @ufc.command(name="resetstandings")
     @checks.admin_or_permissions(administrator=True)
     async def ufc_resetstandings(self, ctx: commands.Context):
-        """[Admin] Wipe the pick 'em standings entirely. Cannot be undone."""
+        """[Admin] Permanently wipe all standings. Asks for confirmation."""
         await ctx.send(
             "⚠️ This will **permanently delete** all standings. "
-            "Type `confirm` to proceed."
+            "Type `confirm` to proceed or anything else to cancel."
         )
 
         def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == "confirm"
+            return m.author == ctx.author and m.channel == ctx.channel
 
         try:
-            await self.bot.wait_for("message", check=check, timeout=30)
+            msg = await self.bot.wait_for("message", check=check, timeout=30)
         except asyncio.TimeoutError:
-            await ctx.send("Reset cancelled.")
-            return
+            return await ctx.send("Timed out — standings not reset.")
 
-        await self.config.guild(ctx.guild).standings.set({})
-        await ctx.send("✅ Standings reset.")
+        if msg.content.strip().lower() == "confirm":
+            await self.config.guild(ctx.guild).standings.set({})
+            await ctx.send("✅ Standings reset.")
+        else:
+            await ctx.send("Cancelled — standings unchanged.")
+
+
+
+
+async def setup(bot: Red):
+    await bot.add_cog(UFC(bot))
