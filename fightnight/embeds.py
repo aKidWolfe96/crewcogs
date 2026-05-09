@@ -255,18 +255,29 @@ def build_picks_embed(event: dict, picks: dict, guild: discord.Guild) -> discord
         embed.set_footer(text="UFC Picks • Lock in before the event!")
         return embed
 
-    # Group picks by fight (matchup key)
+    # Build a lookup from the current card for weight class enrichment
     fights = event.get("fights", [])
+    card_fight_meta = {}  # fight_key -> fight dict
     for fight in fights:
         red = fight.get("red_name", "")
         blue = fight.get("blue_name", "")
-        if not red or not blue:
-            continue
+        if red and blue:
+            card_fight_meta[f"{red}|{blue}"] = fight
 
-        fight_key = f"{red}|{blue}"
-        fight_picks = picks.get(fight_key, {})
+    # Render every stored pick group — fall back to raw key if not on current card
+    fields_added = 0
+    for fight_key, fight_picks in picks.items():
         if not fight_picks:
             continue
+
+        parts = fight_key.split("|", 1)
+        if len(parts) != 2:
+            continue
+        red, blue = parts[0], parts[1]
+
+        fight_meta = card_fight_meta.get(fight_key, {})
+        wc = fight_meta.get("weight_class", "")
+        emoji = _weight_emoji(wc)
 
         red_pickers = []
         blue_pickers = []
@@ -295,9 +306,6 @@ def build_picks_embed(event: dict, picks: dict, guild: discord.Guild) -> discord
         red_names = ", ".join(red_pickers) if red_pickers else "—"
         blue_names = ", ".join(blue_pickers) if blue_pickers else "—"
 
-        wc = fight.get("weight_class", "")
-        emoji = _weight_emoji(wc)
-
         value = (
             f"{bar}\n"
             f"🟥 **{red}** ({red_pct}%) — {red_names}\n"
@@ -306,6 +314,14 @@ def build_picks_embed(event: dict, picks: dict, guild: discord.Guild) -> discord
         embed.add_field(
             name=f"{emoji} {red} vs {blue}",
             value=value,
+            inline=False,
+        )
+        fields_added += 1
+
+    if fields_added == 0:
+        embed.add_field(
+            name="No picks yet!",
+            value="Use `!ufc pick <fighter>` to make your picks.",
             inline=False,
         )
 
