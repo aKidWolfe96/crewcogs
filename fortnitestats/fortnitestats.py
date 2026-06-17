@@ -61,7 +61,7 @@ RARITY_COLORS = {
 class FortniteStats(commands.Cog):
     """Graphical Fortnite stats, item shop, news and cosmetics."""
 
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
