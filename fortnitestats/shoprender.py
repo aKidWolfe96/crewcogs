@@ -37,6 +37,7 @@ MARGIN = 40
 HEADER_H = 150
 CARD_RADIUS = 14
 MAX_CARDS = 400
+JAM_TRACK_LIMIT = 4                   # only show the top N jam tracks
 DOWNLOAD_CONCURRENCY = 12
 MAX_PNG_BYTES = 9_000_000
 
@@ -244,14 +245,19 @@ def _compose(sections, vbuck_bytes, date_str) -> bytes:
     block_w = SECTION_COLS * TILE + (SECTION_COLS - 1) * TILE_GAP
     canvas_w = MARGIN * 2 + MASONRY_COLS * block_w + (MASONRY_COLS - 1) * COL_GAP
 
-    # largest section first → balanced columns (LPT bin-packing heuristic)
-    ordered = sorted(sections, key=lambda s: _block_height(len(s[1])), reverse=True)
+    # Order-preserving column fill: keep the shop's section order and flow
+    # sections down each column (new/featured stay top-left), advancing to the
+    # next column once a column passes the balancing target.
+    heights = [_block_height(len(c)) + SECTION_GAP for _, c in sections]
+    target = (sum(heights) / MASONRY_COLS) if heights else 0
     col_heights = [0] * MASONRY_COLS
     placements = []
-    for name, cards in ordered:
-        c = min(range(MASONRY_COLS), key=lambda i: col_heights[i])
-        placements.append((c, col_heights[c], name, cards))
-        col_heights[c] += _block_height(len(cards)) + SECTION_GAP
+    ci = 0
+    for (name, cards), h in zip(sections, heights):
+        if col_heights[ci] > 0 and col_heights[ci] + h > target and ci < MASONRY_COLS - 1:
+            ci += 1
+        placements.append((ci, col_heights[ci], name, cards))
+        col_heights[ci] += h
 
     content_h = max(col_heights) if col_heights else 0
     canvas_h = HEADER_H + content_h + MARGIN
@@ -416,7 +422,23 @@ async def render_shop_image(loop, shop) -> bytes:
     seen = set()
     count = 0
 
-    for entry in shop.entries:
+    # Sort entries the way the shop presents them: section order (layout.index),
+    # then new/featured first within a section (sort_priority desc, newest in_date).
+    def _shop_key(entry):
+        layout = getattr(entry, "layout", None)
+        idx = getattr(layout, "index", None) if layout else None
+        rank = getattr(layout, "rank", None) if layout else None
+        sp = getattr(entry, "sort_priority", None)
+        in_date = getattr(entry, "in_date", None)
+        ts = in_date.timestamp() if in_date else 0
+        return (
+            idx if idx is not None else 1_000_000,
+            -(sp if sp is not None else 0),
+            -ts,
+            rank if rank is not None else 1_000_000,
+        )
+
+    for entry in sorted(shop.entries, key=_shop_key):
         if count >= MAX_CARDS:
             break
         oid = getattr(entry, "offer_id", None)
@@ -430,11 +452,20 @@ async def render_shop_image(loop, shop) -> bytes:
         if _is_placeholder(name):
             continue  # drop "[VIRTUAL]/SID_Placeholder/TBD" junk
 
-        if oid:
-            seen.add(oid)
         is_track = bool(getattr(entry, "tracks", None)) and not (getattr(entry, "br", None))
         layout = getattr(entry, "layout", None)
         section = layout.name if layout and layout.name else "Featured"
+
+        # cap jam-track sections to the top N (entries are already in shop order)
+        current = sections.get(section, [])
+        is_track_section = ("jam track" in section.lower()) or (
+            bool(current) and all(c.get("is_track") for c in current)
+        )
+        if (is_track or is_track_section) and len(current) >= JAM_TRACK_LIMIT:
+            continue
+
+        if oid:
+            seen.add(oid)
         top, bottom = _colors_for(entry, rarity_item, is_track)
         if section not in sections:
             sections[section] = []
@@ -444,6 +475,7 @@ async def render_shop_image(loop, shop) -> bytes:
             "price": getattr(entry, "final_price", None),
             "regular_price": getattr(entry, "regular_price", None),
             "badge_text": _badge_for(entry), "c_top": top, "c_bottom": bottom,
+            "is_track": is_track,
         })
         count += 1
 
