@@ -1,13 +1,16 @@
 """
 Graphical item-shop renderer for the FortniteStats cog.
 
-Builds a single PNG that mimics the in-game shop: full-bleed item tile art
-(the same renders Epic ships in the shop), with names and V-Bucks prices
-overlaid on a gradient scrim. All network I/O is async; the PIL compositing
-runs in an executor so the bot's event loop never blocks.
+Produces a dense, EasyFnStats-style shop board: a bright shop-blue background,
+"SHOP" + date header, and every section packed into a balanced masonry so there
+are no wasted gaps and nothing is dropped. Each tile is full-bleed item art with
+name, V-Bucks price (and struck original when discounted), plus a corner badge
+for discounts / bonus items / bundles.
+
+All network I/O is async; PIL compositing runs in an executor.
 
 Public entry point:
-    await render_shop_image(loop, shop) -> bytes  (PNG)
+    await render_shop_image(loop, shop) -> bytes  (PNG, or JPEG if very large)
 """
 
 import asyncio
@@ -15,34 +18,44 @@ import io
 import logging
 import os
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 log = logging.getLogger("red.fortnitestats")
 
 # ----------------------------- layout constants ----------------------------- #
-CARD_W = 256
-CARD_H = 300
-COLS = 4
-GAP = 16
-MARGIN = 32
-TITLE_H = 120
-SECTION_H = 58
-CARD_RADIUS = 18
-MAX_CARDS = 80
+TILE_W = 158
+TILE_H = 172
+TILE_GAP = 8
+SECTION_COLS = 3                      # tiles per section block (width)
+SECTION_GAP = 24                      # vertical gap between stacked sections
+SECTION_HEADER_H = 40
+MASONRY_COLS = 5                      # number of section-wide columns
+COL_GAP = 22                          # horizontal gap between masonry columns
+MARGIN = 40
+HEADER_H = 150
+CARD_RADIUS = 14
+MAX_CARDS = 400                       # effectively "render everything"
 DOWNLOAD_CONCURRENCY = 12
+MAX_PNG_BYTES = 9_000_000             # re-encode to JPEG above this
 
-BG_TOP = (18, 20, 34)
-BG_BOTTOM = (8, 9, 16)
+BG_TOP = (32, 150, 236)
+BG_BOTTOM = (20, 116, 200)
 TEXT = (255, 255, 255)
-SUBTEXT = (200, 205, 218)
-ACCENT = (90, 200, 250)
-PRICE_COLOR = (255, 233, 110)
+SUBTEXT = (220, 235, 252)
+PRICE_COLOR = (255, 255, 255)
+STRUCK_COLOR = (150, 205, 245)
+BADGE_BG = (255, 216, 60)
+BADGE_TEXT = (40, 35, 10)
 
 FONT_PATHS = {
     "bold": [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/Library/Fonts/Arial Bold.ttf",
         "C:\\Windows\\Fonts\\arialbd.ttf",
+    ],
+    "bolditalic": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+        "C:\\Windows\\Fonts\\arialbi.ttf",
     ],
     "regular": [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -52,24 +65,14 @@ FONT_PATHS = {
 }
 
 RARITY_RGB = {
-    "common": (130, 130, 138),
-    "uncommon": (96, 185, 50),
-    "rare": (44, 138, 222),
-    "epic": (170, 60, 240),
-    "legendary": (230, 132, 50),
-    "mythic": (232, 196, 50),
-    "icon_series": (38, 210, 200),
-    "marvel": (200, 55, 56),
-    "dc": (70, 90, 220),
-    "starwars": (40, 44, 70),
-    "gaming_legends": (110, 50, 168),
-    "slurp": (40, 220, 210),
-    "lava": (216, 92, 34),
-    "frozen": (120, 205, 230),
-    "shadow": (62, 62, 70),
+    "common": (130, 130, 138), "uncommon": (96, 185, 50), "rare": (44, 138, 222),
+    "epic": (170, 60, 240), "legendary": (230, 132, 50), "mythic": (232, 196, 50),
+    "icon_series": (38, 210, 200), "marvel": (200, 55, 56), "dc": (70, 90, 220),
+    "starwars": (40, 44, 70), "gaming_legends": (110, 50, 168), "slurp": (40, 220, 210),
+    "lava": (216, 92, 34), "frozen": (120, 205, 230), "shadow": (62, 62, 70),
     "dark": (150, 50, 188),
 }
-DEFAULT_RGB = (70, 78, 110)
+DEFAULT_RGB = (52, 86, 140)
 
 
 # ------------------------------- font helpers ------------------------------- #
@@ -122,8 +125,6 @@ def _rounded_mask(size, radius):
 
 
 def _cover_fit(img, box_w, box_h, anchor_top=True):
-    """Scale to fully cover the box, then crop. Crops from the top by default so
-    character faces (top of the render) are preserved and legs get cut instead."""
     img = img.convert("RGBA")
     iw, ih = img.size
     scale = max(box_w / iw, box_h / ih)
@@ -142,8 +143,7 @@ def _contain_fit(img, box_w, box_h):
 
 def _wrap(draw, text, font, max_w, max_lines=2):
     words = text.split()
-    lines, cur = [], ""
-    i = 0
+    lines, cur, i = [], "", 0
     while i < len(words):
         word = words[i]
         trial = f"{cur} {word}".strip()
@@ -170,152 +170,208 @@ def _wrap(draw, text, font, max_w, max_lines=2):
     return lines[:max_lines]
 
 
-# ------------------------------- compositing -------------------------------- #
-def _render_card(card, fonts, vbuck_icon):
-    """Return a finished RGBA tile (CARD_W x CARD_H) for one offer."""
-    f_name, f_price = fonts["name"], fonts["price"]
+# ------------------------------- tile drawing ------------------------------- #
+def _render_tile(card, fonts, vbuck_icon):
+    f_name, f_price, f_badge = fonts["name"], fonts["price"], fonts["badge"]
     top, bottom = card["c_top"], card["c_bottom"]
-
-    # base: always a gradient (shows through transparent icon art / art gaps)
-    tile = _vertical_gradient((CARD_W, CARD_H), top, bottom).convert("RGBA")
+    tile = _vertical_gradient((TILE_W, TILE_H), top, bottom).convert("RGBA")
 
     art_bytes = card.get("art_bytes")
     if art_bytes:
         try:
             art = Image.open(io.BytesIO(art_bytes))
             if card.get("full_bleed"):
-                filled = _cover_fit(art, CARD_W, CARD_H, anchor_top=True)
-                tile.alpha_composite(filled, (0, 0))
+                tile.alpha_composite(_cover_fit(art, TILE_W, TILE_H, anchor_top=True), (0, 0))
             else:
-                fitted = _contain_fit(art, CARD_W - 28, int(CARD_H * 0.7))
-                ax = (CARD_W - fitted.width) // 2
-                ay = max(10, int(CARD_H * 0.7) - fitted.height + 6)
+                fitted = _contain_fit(art, TILE_W - 20, int(TILE_H * 0.66))
+                ax = (TILE_W - fitted.width) // 2
+                ay = max(8, int(TILE_H * 0.66) - fitted.height + 6)
                 tile.alpha_composite(fitted, (ax, ay))
         except Exception:  # noqa: BLE001
             pass
 
-    # bottom scrim for text legibility
-    scrim_h = int(CARD_H * 0.46)
-    scrim = Image.new("RGBA", (CARD_W, scrim_h), (0, 0, 0, 0))
+    # bottom scrim
+    scrim_h = int(TILE_H * 0.5)
+    scrim = Image.new("RGBA", (TILE_W, scrim_h), (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(scrim)
     for yy in range(scrim_h):
-        a = int(205 * (yy / scrim_h) ** 1.3)
-        sdraw.line([(0, yy), (CARD_W, yy)], fill=(0, 0, 0, a))
-    tile.alpha_composite(scrim, (0, CARD_H - scrim_h))
+        a = int(210 * (yy / scrim_h) ** 1.25)
+        sdraw.line([(0, yy), (TILE_W, yy)], fill=(0, 0, 0, a))
+    tile.alpha_composite(scrim, (0, TILE_H - scrim_h))
 
-    # rarity accent strip along the bottom edge
     tdraw = ImageDraw.Draw(tile)
-    tdraw.rectangle([0, CARD_H - 5, CARD_W, CARD_H], fill=top + (255,))
+    # rarity accent strip
+    tdraw.rectangle([0, TILE_H - 4, TILE_W, TILE_H], fill=top + (255,))
 
-    # name + price
-    name_lines = _wrap(tdraw, card["name"], f_name, CARD_W - 28, max_lines=2)
-    line_h = f_name.getbbox("Ag")[3] + 4
-    price_y = CARD_H - 42
-    ny = price_y - len(name_lines) * line_h - 6
+    # name + price row
+    name_lines = _wrap(tdraw, card["name"], f_name, TILE_W - 18, max_lines=2)
+    line_h = f_name.getbbox("Ag")[3] + 3
+    price_y = TILE_H - 30
+    ny = price_y - len(name_lines) * line_h - 4
     for line in name_lines:
-        # subtle shadow for pop
-        tdraw.text((15, ny + 1), line, font=f_name, fill=(0, 0, 0))
-        tdraw.text((14, ny), line, font=f_name, fill=TEXT)
+        tdraw.text((10, ny + 1), line, font=f_name, fill=(0, 0, 0))
+        tdraw.text((9, ny), line, font=f_name, fill=TEXT)
         ny += line_h
 
-    price_str = f"{card['price']:,}" if card["price"] is not None else "—"
-    px = 14
+    px = 9
     if vbuck_icon is not None:
-        tile.alpha_composite(vbuck_icon, (px, price_y - 1))
-        px += vbuck_icon.width + 6
+        tile.alpha_composite(vbuck_icon, (px, price_y))
+        px += vbuck_icon.width + 4
+    price_str = f"{card['price']:,}" if card["price"] is not None else "—"
     tdraw.text((px, price_y), price_str, font=f_price, fill=PRICE_COLOR)
+    px += tdraw.textlength(price_str, font=f_price) + 6
+    # struck original price when discounted
+    reg = card.get("regular_price")
+    if reg and card["price"] is not None and reg > card["price"]:
+        reg_str = f"{reg:,}"
+        tdraw.text((px, price_y + 1), reg_str, font=f_badge, fill=STRUCK_COLOR)
+        w = tdraw.textlength(reg_str, font=f_badge)
+        midy = price_y + 1 + f_badge.getbbox("0")[3] // 2 + 1
+        tdraw.line([(px, midy), (px + w, midy)], fill=STRUCK_COLOR, width=1)
 
-    # round the corners
-    rounded = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
-    rounded.paste(tile, (0, 0), _rounded_mask((CARD_W, CARD_H), CARD_RADIUS))
+    # corner badge
+    badge = card.get("badge_text")
+    if badge:
+        bx, by = 7, 7
+        pad = 5
+        bw = tdraw.textlength(badge, font=f_badge) + pad * 2
+        bh = f_badge.getbbox("Ag")[3] + pad
+        tdraw.rounded_rectangle([bx, by, bx + bw, by + bh], 5, fill=BADGE_BG)
+        tdraw.text((bx + pad, by + pad // 2), badge, font=f_badge, fill=BADGE_TEXT)
+
+    rounded = Image.new("RGBA", (TILE_W, TILE_H), (0, 0, 0, 0))
+    rounded.paste(tile, (0, 0), _rounded_mask((TILE_W, TILE_H), CARD_RADIUS))
     return rounded
+
+
+# ------------------------------- composition -------------------------------- #
+def _section_block_height(n_items):
+    rows = max(1, (n_items + SECTION_COLS - 1) // SECTION_COLS)
+    return SECTION_HEADER_H + rows * TILE_H + (rows - 1) * TILE_GAP
 
 
 def _compose(sections, vbuck_bytes, date_str) -> bytes:
     fonts = {
-        "title": _font("bold", 52),
-        "date": _font("regular", 24),
-        "section": _font("bold", 30),
-        "name": _font("bold", 21),
-        "price": _font("bold", 21),
+        "title": _font("bold", 70),
+        "date": _font("bolditalic", 26),
+        "section": _font("bolditalic", 24),
+        "name": _font("bold", 16),
+        "price": _font("bold", 16),
+        "badge": _font("bold", 13),
     }
 
-    grid_w = COLS * CARD_W + (COLS - 1) * GAP
-    canvas_w = grid_w + MARGIN * 2
+    block_w = SECTION_COLS * TILE_W + (SECTION_COLS - 1) * TILE_GAP
+    canvas_w = MARGIN * 2 + MASONRY_COLS * block_w + (MASONRY_COLS - 1) * COL_GAP
 
-    total_h = TITLE_H + MARGIN
-    for _, cards in sections:
-        rows = (len(cards) + COLS - 1) // COLS
-        total_h += SECTION_H + rows * CARD_H + (rows - 1) * GAP + GAP
-    total_h += MARGIN
+    # masonry packing: place each section in the currently-shortest column
+    col_heights = [0] * MASONRY_COLS
+    placements = []  # (col_index, y_within_stack, section_name, cards)
+    for name, cards in sections:
+        c = min(range(MASONRY_COLS), key=lambda i: col_heights[i])
+        placements.append((c, col_heights[c], name, cards))
+        col_heights[c] += _section_block_height(len(cards)) + SECTION_GAP
 
-    canvas = Image.new("RGB", (canvas_w, total_h), BG_TOP)
-    canvas.paste(_vertical_gradient((canvas_w, total_h), BG_TOP, BG_BOTTOM), (0, 0))
+    content_h = max(col_heights) if col_heights else 0
+    canvas_h = HEADER_H + content_h + MARGIN
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), BG_TOP)
+    canvas.paste(_vertical_gradient((canvas_w, canvas_h), BG_TOP, BG_BOTTOM), (0, 0))
     draw = ImageDraw.Draw(canvas)
 
-    draw.text((MARGIN, 34), "FORTNITE ITEM SHOP", font=fonts["title"], fill=TEXT)
-    draw.text((MARGIN, 92), date_str, font=fonts["date"], fill=SUBTEXT)
+    # header
+    draw.text((MARGIN, 36), "SHOP", font=fonts["title"], fill=TEXT)
+    draw.text((MARGIN + 4, 116), date_str, font=fonts["date"], fill=SUBTEXT)
 
     vbuck_icon = None
     if vbuck_bytes:
         try:
             vbuck_icon = Image.open(io.BytesIO(vbuck_bytes)).convert("RGBA")
-            vbuck_icon.thumbnail((24, 24), Image.LANCZOS)
+            vbuck_icon.thumbnail((19, 19), Image.LANCZOS)
         except Exception:  # noqa: BLE001
             vbuck_icon = None
 
-    y = TITLE_H + MARGIN
-    for section_name, cards in sections:
-        draw.rounded_rectangle([MARGIN, y + 10, MARGIN + 6, y + 40], 3, fill=ACCENT)
-        draw.text((MARGIN + 18, y + 8), section_name.upper(), font=fonts["section"], fill=TEXT)
-        y += SECTION_H
-
+    for col, y0, name, cards in placements:
+        bx = MARGIN + col * (block_w + COL_GAP)
+        by = HEADER_H + y0
+        # section header
+        draw.text((bx + 2, by + 4), name.upper(), font=fonts["section"], fill=TEXT)
+        draw.line([(bx + 2, by + SECTION_HEADER_H - 8),
+                   (bx + block_w, by + SECTION_HEADER_H - 8)], fill=(255, 255, 255, 60), width=2)
+        gy = by + SECTION_HEADER_H
         for idx, card in enumerate(cards):
-            col = idx % COLS
-            row = idx // COLS
-            cx = MARGIN + col * (CARD_W + GAP)
-            cy = y + row * (CARD_H + GAP)
-            tile = _render_card(card, fonts, vbuck_icon)
-            canvas.paste(tile, (cx, cy), tile)
-
-        rows = (len(cards) + COLS - 1) // COLS
-        y += rows * CARD_H + (rows - 1) * GAP + GAP
+            r, c = divmod(idx, SECTION_COLS)
+            tx = bx + c * (TILE_W + TILE_GAP)
+            ty = gy + r * (TILE_H + TILE_GAP)
+            tile = _render_tile(card, fonts, vbuck_icon)
+            canvas.paste(tile, (tx, ty), tile)
 
     draw.text(
-        (MARGIN, total_h - 26),
+        (MARGIN, canvas_h - 26),
         "data via fortnite-api.com · not affiliated with Epic Games",
         font=_font("regular", 15),
-        fill=(115, 120, 138),
+        fill=(210, 230, 248),
     )
 
     out = io.BytesIO()
     canvas.save(out, format="PNG", optimize=True)
-    return out.getvalue()
+    data = out.getvalue()
+    if len(data) > MAX_PNG_BYTES:
+        out = io.BytesIO()
+        canvas.convert("RGB").save(out, format="JPEG", quality=86, optimize=True)
+        data = out.getvalue()
+    return data
 
 
 # ------------------------------- async driver ------------------------------- #
 def _pick_art(entry):
-    """Return (asset, item, full_bleed). Prefers the full shop-tile render."""
+    """Return (asset, item, full_bleed). Bundles use their combined art."""
     items = entry.br or []
     item = items[0] if items else None
 
-    # 1) the real in-game shop tile render (best looking)
+    bundle = getattr(entry, "bundle", None)
+    if bundle and getattr(bundle, "image", None):
+        return bundle.image, item, True
+
     nda = getattr(entry, "new_display_asset", None)
     if nda and getattr(nda, "images", None):
         imgs = nda.images
-        offer = getattr(imgs, "offer_image", None) or imgs.get("OfferImage") if imgs else None
+        offer = getattr(imgs, "offer_image", None)
+        if not offer and hasattr(imgs, "get"):
+            offer = imgs.get("OfferImage")
         if offer:
             return offer, item, True
 
-    # 2) the cosmetic's featured poster art (also fills nicely)
     if item and item.images and item.images.featured:
         return item.images.featured, item, True
-
-    # 3) plain icon on a gradient
     if item and item.images and item.images.icon:
         return item.images.icon, item, False
-
     return None, item, False
+
+
+def _name_for(entry, item):
+    bundle = getattr(entry, "bundle", None)
+    if bundle and getattr(bundle, "name", None):
+        return bundle.name
+    if item and item.name:
+        return item.name
+    return getattr(entry, "dev_name", None) or "Unknown"
+
+
+def _badge_for(entry):
+    final = getattr(entry, "final_price", None)
+    regular = getattr(entry, "regular_price", None)
+    if final is not None and regular and regular > final:
+        return f"{regular - final:,} V-Bucks Off"
+    tag = getattr(entry, "offer_tag", None)
+    if tag and getattr(tag, "text", None):
+        return tag.text
+    bundle = getattr(entry, "bundle", None)
+    if bundle and getattr(bundle, "info", None):
+        return bundle.info
+    banner = getattr(entry, "banner", None)
+    if banner and getattr(banner, "value", None):
+        return banner.value
+    return None
 
 
 def _colors_for(entry, item):
@@ -359,7 +415,6 @@ async def render_shop_image(loop, shop) -> bytes:
         layout = getattr(entry, "layout", None)
         section = layout.name if layout and layout.name else "Featured"
         asset, item, full_bleed = _pick_art(entry)
-        name = (item.name if item else None) or getattr(entry, "dev_name", None) or "Unknown"
         top, bottom = _colors_for(entry, item)
         if section not in sections:
             sections[section] = []
@@ -368,8 +423,10 @@ async def render_shop_image(loop, shop) -> bytes:
             {
                 "asset": asset,
                 "full_bleed": full_bleed,
-                "name": name,
+                "name": _name_for(entry, item),
                 "price": getattr(entry, "final_price", None),
+                "regular_price": getattr(entry, "regular_price", None),
+                "badge_text": _badge_for(entry),
                 "c_top": top,
                 "c_bottom": bottom,
             }
@@ -393,7 +450,7 @@ async def render_shop_image(loop, shop) -> bytes:
             card.pop("asset", None)
     vbuck_bytes = await vbuck_task if vbuck_task is not None else None
 
-    date_str = shop.date.strftime("%A, %B %d, %Y") if shop.date else "Today"
+    date_str = shop.date.strftime("%A – %b %d, %Y") if shop.date else "Today"
     ordered_sections = [(s, sections[s]) for s in order if sections[s]]
 
     return await loop.run_in_executor(None, _compose, ordered_sections, vbuck_bytes, date_str)
