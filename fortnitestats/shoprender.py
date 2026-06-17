@@ -38,6 +38,7 @@ HEADER_H = 150
 CARD_RADIUS = 14
 MAX_CARDS = 400
 JAM_TRACK_LIMIT = 4                   # only show the top N jam tracks
+MAX_SECTION_ROWS = 8                  # split taller sections so columns stay even
 DOWNLOAD_CONCURRENCY = 12
 MAX_PNG_BYTES = 9_000_000
 
@@ -245,19 +246,28 @@ def _compose(sections, vbuck_bytes, date_str) -> bytes:
     block_w = SECTION_COLS * TILE + (SECTION_COLS - 1) * TILE_GAP
     canvas_w = MARGIN * 2 + MASONRY_COLS * block_w + (MASONRY_COLS - 1) * COL_GAP
 
-    # Order-preserving column fill: keep the shop's section order and flow
-    # sections down each column (new/featured stay top-left), advancing to the
-    # next column once a column passes the balancing target.
-    heights = [_block_height(len(c)) + SECTION_GAP for _, c in sections]
-    target = (sum(heights) / MASONRY_COLS) if heights else 0
+    # Split oversized sections into capped blocks so no single block towers over
+    # the others, then place each block into the currently shortest column. This
+    # keeps every column close to the same height (even, squared look) while
+    # preserving shop order within each section.
+    chunk = MAX_SECTION_ROWS * SECTION_COLS
+    blocks = []  # (header, cards)
+    for name, cards in sections:
+        if not cards:
+            continue
+        if len(cards) <= chunk:
+            blocks.append((name, cards))
+        else:
+            for i in range(0, len(cards), chunk):
+                blocks.append((name, cards[i : i + chunk]))
+
     col_heights = [0] * MASONRY_COLS
     placements = []
-    ci = 0
-    for (name, cards), h in zip(sections, heights):
-        if col_heights[ci] > 0 and col_heights[ci] + h > target and ci < MASONRY_COLS - 1:
-            ci += 1
+    # largest block first → flattest column bottoms (LPT bin-packing)
+    for name, cards in sorted(blocks, key=lambda b: len(b[1]), reverse=True):
+        ci = min(range(MASONRY_COLS), key=lambda i: col_heights[i])
         placements.append((ci, col_heights[ci], name, cards))
-        col_heights[ci] += h
+        col_heights[ci] += _block_height(len(cards)) + SECTION_GAP
 
     content_h = max(col_heights) if col_heights else 0
     canvas_h = HEADER_H + content_h + MARGIN
