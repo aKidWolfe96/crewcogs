@@ -1,16 +1,20 @@
 """
 UFC Cog for Red-DiscordBot v3.
 
+Picks are tied to the EVENT they were made for, and `settle` re-fetches that
+specific event's results by date — so it always settles the right card even
+after ESPN's scoreboard has rolled over to a new event.
+
 Commands
-  !ufc card            upcoming fight card
-  !ufc results         most recent event results
-  !ufc fighter <name>  fighter stats + recent fights
-  !ufc pick <name>     lock in a pick for the upcoming card
-  !ufc picks           show server picks
-  !ufc standings       pick-em leaderboard
-  !ufc settle          [admin] score picks vs results, update standings
-  !ufc clearpicks      [admin] clear picks without scoring
-  !ufc resetstandings  [admin] wipe standings (confirmation required)
+  !ufc card                 upcoming fight card
+  !ufc results              most recent event results
+  !ufc fighter <name>       fighter stats + recent fights
+  !ufc pick <name>          lock in a pick for the upcoming card
+  !ufc picks                show server picks for the upcoming card
+  !ufc standings            pick-em leaderboard
+  !ufc settle [YYYY-MM-DD]  [admin] score picks vs results, update standings
+  !ufc clearpicks           [admin] clear all picks without scoring
+  !ufc resetstandings       [admin] wipe standings (confirmation required)
 """
 import asyncio
 import aiohttp
@@ -18,12 +22,54 @@ import discord
 from redbot.core import commands, Config, checks
 from redbot.core.bot import Red
 
-from .api import get_upcoming_event, get_recent_event, get_fighter
+from .api import (
+    get_upcoming_event, get_recent_event,
+    get_event_on_date, get_event_by_id, get_fighter,
+)
 from . import embeds
 
 
 def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
+
+
+def _merge_deltas(total: dict, part: dict):
+    for uid, d in part.items():
+        t = total.setdefault(uid, {"correct": 0, "total": 0})
+        t["correct"] += d["correct"]
+        t["total"]   += d["total"]
+
+
+def _score_picks(picks_dict: dict, results_event: dict):
+    """
+    Score {fight_key: {uid: picked_name}} against a results event.
+    Matches by FIGHTER NAME (order-independent), robust to card changes.
+    Returns (deltas, resolved):
+        deltas   = {uid: {"correct": int, "total": int}}
+        resolved = [(fight_key, uid), ...]
+    """
+    result_fights = results_event.get("fights", []) if results_event else []
+
+    def find_result(picked: str):
+        pn = _norm(picked)
+        for rf in result_fights:
+            r, b = _norm(rf["red"]), _norm(rf["blue"])
+            if pn == r or pn == b or pn in r or pn in b:
+                return rf
+        return None
+
+    deltas, resolved = {}, []
+    for fight_key, fp in picks_dict.items():
+        for uid, picked in fp.items():
+            rf = find_result(picked)
+            if not rf or not rf.get("winner"):
+                continue
+            resolved.append((fight_key, uid))
+            d = deltas.setdefault(uid, {"correct": 0, "total": 0})
+            d["total"] += 1
+            if _norm(rf["winner"]) == _norm(picked):
+                d["correct"] += 1
+    return deltas, resolved
 
 
 class UFC(commands.Cog):
@@ -33,8 +79,9 @@ class UFC(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=7833209, force_registration=True)
         self.config.register_guild(
-            picks={},      # { "Red Name|Blue Name": { "user_id": "Picked Name" } }
-            standings={},  # { "user_id": { "correct": int, "total": int } }
+            events={},      # { eid: {"meta": {...}, "picks": {"Red|Blue": {uid: name}}} }
+            picks={},       # legacy flat picks (pre-event-scoping) — still settle-able
+            standings={},   # { uid: {"correct": int, "total": int} }
         )
         self._session: aiohttp.ClientSession = None
 
@@ -54,8 +101,7 @@ class UFC(commands.Cog):
     # ── group ──────────────────────────────────────────────────────────────-
 
     @commands.group(name="ufc", invoke_without_command=True)
-    async def ufc(self, ctx: commands.Context):
-        """UFC commands."""
+    async def ufc(self, ctx):
         p = ctx.clean_prefix
         e = discord.Embed(title="🥊  UFC Bot", color=0xD20A0A, description=(
             f"`{p}ufc card` — upcoming fight card\n"
@@ -126,11 +172,21 @@ class UFC(commands.Cog):
                 f"Use `{ctx.clean_prefix}ufc card` to see current matchups."))
 
         fight_key = f"{matched['red']}|{matched['blue']}"
+        eid = event["id"]
         uid = str(ctx.author.id)
-        async with self.config.guild(ctx.guild).picks() as picks:
-            picks.setdefault(fight_key, {})
-            old = picks[fight_key].get(uid)
-            picks[fight_key][uid] = picked
+
+        async with self.config.guild(ctx.guild).events() as evs:
+            bucket = evs.setdefault(eid, {"meta": {}, "picks": {}})
+            bucket["meta"] = {
+                "id": eid,
+                "name": event["name"],
+                "shortname": event["shortname"],
+                "date": event.get("date", ""),
+                "date_compact": event.get("date_compact", ""),
+            }
+            bucket["picks"].setdefault(fight_key, {})
+            old = bucket["picks"][fight_key].get(uid)
+            bucket["picks"][fight_key][uid] = picked
 
         if old and old != picked:
             await ctx.send(f"🔄 {ctx.author.mention} changed pick: **{old}** → **{picked}**")
@@ -142,13 +198,21 @@ class UFC(commands.Cog):
 
     @ufc.command(name="picks")
     async def ufc_picks(self, ctx):
+        """Show everyone's picks for the upcoming event."""
         async with ctx.typing():
             event = await get_upcoming_event(self.session)
-            picks = await self.config.guild(ctx.guild).picks()
+            evs = await self.config.guild(ctx.guild).events()
+            legacy = await self.config.guild(ctx.guild).picks()
+
         if not event:
-            # still show stored picks even if the card fetch failed
             event = {"shortname": "Upcoming Event", "name": "Upcoming Event",
-                     "date": "TBD", "fights": []}
+                     "date": "TBD", "fights": [], "id": ""}
+
+        bucket = evs.get(event.get("id", ""), {})
+        picks = dict(bucket.get("picks", {}))
+        for k, v in (legacy or {}).items():
+            picks.setdefault(k, {}).update(v)
+
         await ctx.send(embed=embeds.picks_embed(event, picks, ctx.guild))
 
     # ── standings ────────────────────────────────────────────────────────────
@@ -156,98 +220,138 @@ class UFC(commands.Cog):
     @ufc.command(name="standings")
     async def ufc_standings(self, ctx):
         standings = await self.config.guild(ctx.guild).standings()
-        picks = await self.config.guild(ctx.guild).picks()
-        pending = sum(len(v) for v in picks.values()) if picks else 0
+        evs = await self.config.guild(ctx.guild).events()
+        legacy = await self.config.guild(ctx.guild).picks()
+        pending = sum(len(fp) for b in evs.values() for fp in b.get("picks", {}).values())
+        pending += sum(len(v) for v in (legacy or {}).values())
         await ctx.send(embed=embeds.standings_embed(standings, ctx.guild, pending))
 
     # ── settle ─────────────────────────────────────────────────────────────-
 
     @ufc.command(name="settle")
     @checks.admin_or_permissions(manage_guild=True)
-    async def ufc_settle(self, ctx):
-        """[Admin] Score picks against the most recent results and update standings.
+    async def ufc_settle(self, ctx, date: str = None):
+        """[Admin] Score picks against results and update standings.
 
-        Picks are matched to results by FIGHTER NAME, so this is robust even if
-        ESPN reorders the card or tweaks names between pick-time and settle-time.
-        Only resolved fights are scored; unresolved picks stay for a later settle.
+        Normally just run `!ufc settle` after an event — it settles each event
+        you have picks for, fetching that exact card's results by date.
+
+        To force-settle everything against a specific past card, pass its date:
+            !ufc settle 2024-04-13
         """
+        guild = ctx.guild
+
         async with ctx.typing():
-            event = await get_recent_event(self.session)
-            picks = await self.config.guild(ctx.guild).picks()
+            evs = await self.config.guild(guild).events()
+            legacy = await self.config.guild(guild).picks()
 
-        if not event:
-            return await ctx.send(embed=embeds.error_embed("Couldn't fetch recent results."))
-        if not picks:
-            return await ctx.send("No picks to settle.")
+            if not evs and not legacy:
+                return await ctx.send("No picks to settle.")
 
-        result_fights = event.get("fights", [])
+            total_deltas = {}
+            settled_names = []
+            resolved_by_event = {}
+            resolved_legacy = []
 
-        def find_result(picked_name: str):
-            """Find the results fight a picked fighter appears in (order-independent)."""
-            pn = _norm(picked_name)
-            for rf in result_fights:
-                r, b = _norm(rf["red"]), _norm(rf["blue"])
-                if pn == r or pn == b or pn in r or pn in b:
-                    return rf
-            return None
+            if date:
+                ymd = date.replace("-", "").replace("/", "")
+                results = await get_event_on_date(self.session, ymd)
+                if not results:
+                    return await ctx.send(embed=embeds.error_embed(
+                        f"No UFC event found on **{date}**. "
+                        "Use the event date as `YYYY-MM-DD`."))
+                settled_names.append(results["shortname"])
+                for eid, bucket in evs.items():
+                    d, r = _score_picks(bucket.get("picks", {}), results)
+                    _merge_deltas(total_deltas, d)
+                    resolved_by_event.setdefault(eid, []).extend(r)
+                if legacy:
+                    d, r = _score_picks(legacy, results)
+                    _merge_deltas(total_deltas, d)
+                    resolved_legacy.extend(r)
+            else:
+                for eid, bucket in evs.items():
+                    meta = bucket.get("meta", {})
+                    ymd = meta.get("date_compact", "")
+                    results = (await get_event_by_id(self.session, eid, ymd)
+                               or await get_event_on_date(self.session, ymd))
+                    if not results:
+                        continue
+                    d, r = _score_picks(bucket.get("picks", {}), results)
+                    if r:
+                        settled_names.append(meta.get("shortname", results["shortname"]))
+                    _merge_deltas(total_deltas, d)
+                    resolved_by_event.setdefault(eid, []).extend(r)
+                if legacy:
+                    results = await get_recent_event(self.session)
+                    if results:
+                        d, r = _score_picks(legacy, results)
+                        if r:
+                            settled_names.append(results["shortname"])
+                        _merge_deltas(total_deltas, d)
+                        resolved_legacy.extend(r)
 
-        # score by fighter name, collect which picks were resolved
-        deltas = {}             # uid -> {correct, total}
-        resolved = []           # (fight_key, uid)
-        for fight_key, fight_picks in picks.items():
-            for uid, picked in fight_picks.items():
-                rf = find_result(picked)
-                if not rf or not rf.get("winner"):
-                    continue  # no result yet — leave it for next settle
-                resolved.append((fight_key, uid))
-                d = deltas.setdefault(uid, {"correct": 0, "total": 0})
-                d["total"] += 1
-                if _norm(rf["winner"]) == _norm(picked):
-                    d["correct"] += 1
-
-        if not deltas:
+        if not total_deltas:
             return await ctx.send(embed=embeds.error_embed(
-                "No fight results matched the locked-in picks yet.\n"
-                "Run this once the event has finished and results are posted."))
+                "No finished fights matched the locked-in picks yet.\n"
+                "Run `!ufc settle` once results are posted, or settle a specific "
+                "card with `!ufc settle YYYY-MM-DD`."))
 
-        # apply to standings
-        async with self.config.guild(ctx.guild).standings() as standings:
-            for uid, d in deltas.items():
+        async with self.config.guild(guild).standings() as standings:
+            for uid, d in total_deltas.items():
                 s = standings.setdefault(uid, {"correct": 0, "total": 0})
                 s["correct"] += d["correct"]
                 s["total"]   += d["total"]
 
-        # remove only the resolved picks (keep unresolved ones)
-        async with self.config.guild(ctx.guild).picks() as picks_w:
-            for fight_key, uid in resolved:
-                if fight_key in picks_w and uid in picks_w[fight_key]:
-                    del picks_w[fight_key][uid]
-                if fight_key in picks_w and not picks_w[fight_key]:
-                    del picks_w[fight_key]
+        async with self.config.guild(guild).events() as evs_w:
+            for eid, pairs in resolved_by_event.items():
+                if eid not in evs_w:
+                    continue
+                pmap = evs_w[eid].get("picks", {})
+                for fight_key, uid in pairs:
+                    if fight_key in pmap and uid in pmap[fight_key]:
+                        del pmap[fight_key][uid]
+                    if fight_key in pmap and not pmap[fight_key]:
+                        del pmap[fight_key]
+                if not pmap:
+                    del evs_w[eid]
+        if resolved_legacy:
+            async with self.config.guild(guild).picks() as legacy_w:
+                for fight_key, uid in resolved_legacy:
+                    if fight_key in legacy_w and uid in legacy_w[fight_key]:
+                        del legacy_w[fight_key][uid]
+                    if fight_key in legacy_w and not legacy_w[fight_key]:
+                        del legacy_w[fight_key]
 
-        lines = [f"Scored **{len(resolved)}** pick(s):\n"]
-        for uid, d in sorted(deltas.items(), key=lambda x: -x[1]["correct"]):
-            m = ctx.guild.get_member(int(uid))
+        scored = sum(d["total"] for d in total_deltas.values())
+        lines = [f"Scored **{scored}** pick(s):\n"]
+        for uid, d in sorted(total_deltas.items(), key=lambda x: -x[1]["correct"]):
+            m = guild.get_member(int(uid))
             disp = m.display_name if m else f"<@{uid}>"
             c, t = d["correct"], d["total"]
             pct = round(c / t * 100) if t else 0
             icon = "🔥" if c == t else ("✅" if c else "❌")
             lines.append(f"{icon} **{disp}**: {c}/{t} ({pct}%)")
-        leftover = sum(len(v) for v in (await self.config.guild(ctx.guild).picks()).values())
+
+        leftover = sum(len(fp) for b in (await self.config.guild(guild).events()).values()
+                       for fp in b.get("picks", {}).values())
+        leftover += sum(len(v) for v in (await self.config.guild(guild).picks()).values())
         if leftover:
             lines.append(f"\n*{leftover} pick(s) not yet scored (fights pending).*")
         lines.append(f"\nUse `{ctx.clean_prefix}ufc standings` to see the leaderboard.")
 
-        await ctx.send(embed=embeds.settle_embed(event["shortname"], lines))
+        label = ", ".join(dict.fromkeys(settled_names)) or "UFC"
+        await ctx.send(embed=embeds.settle_embed(label, lines))
 
     # ── clearpicks / resetstandings ───────────────────────────────────────────
 
     @ufc.command(name="clearpicks")
     @checks.admin_or_permissions(manage_guild=True)
     async def ufc_clearpicks(self, ctx):
-        """[Admin] Clear all picks without scoring."""
+        """[Admin] Clear all picks (every event) without scoring."""
+        await self.config.guild(ctx.guild).events.set({})
         await self.config.guild(ctx.guild).picks.set({})
-        await ctx.send("✅ Picks cleared.")
+        await ctx.send("✅ All picks cleared.")
 
     @ufc.command(name="resetstandings")
     @checks.admin_or_permissions(administrator=True)
