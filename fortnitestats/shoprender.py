@@ -1,11 +1,14 @@
 """
 Graphical item-shop renderer for the FortniteStats cog.
 
-Produces a dense, EasyFnStats-style shop board: a bright shop-blue background,
-"SHOP" + date header, and every section packed into a balanced masonry so there
-are no wasted gaps and nothing is dropped. Each tile is full-bleed item art with
-name, V-Bucks price (and struck original when discounted), plus a corner badge
-for discounts / bonus items / bundles.
+EasyFnStats-style board: shop-blue background, "SHOP" + date header, every
+section packed into a balanced masonry (largest section first) so columns stay
+even. Square tiles with full-bleed art, name, V-Bucks price (struck original
+when discounted), and a corner badge for discounts / bonuses / bundles.
+
+Reads ALL shop item types — outfits/emotes (br), jam tracks, instruments, cars,
+lego kits and bundles — and skips unresolved "[VIRTUAL]/SID_Placeholder" entries
+that Epic ships in the raw feed.
 
 All network I/O is async; PIL compositing runs in an executor.
 
@@ -23,35 +26,33 @@ from PIL import Image, ImageDraw, ImageFont
 log = logging.getLogger("red.fortnitestats")
 
 # ----------------------------- layout constants ----------------------------- #
-TILE_W = 158
-TILE_H = 172
+TILE = 168                            # square tile (width == height)
 TILE_GAP = 8
-SECTION_COLS = 3                      # tiles per section block (width)
-SECTION_GAP = 24                      # vertical gap between stacked sections
+SECTION_COLS = 3
+SECTION_GAP = 26
 SECTION_HEADER_H = 40
-MASONRY_COLS = 5                      # number of section-wide columns
-COL_GAP = 22                          # horizontal gap between masonry columns
+MASONRY_COLS = 5
+COL_GAP = 22
 MARGIN = 40
 HEADER_H = 150
 CARD_RADIUS = 14
-MAX_CARDS = 400                       # effectively "render everything"
+MAX_CARDS = 400
 DOWNLOAD_CONCURRENCY = 12
-MAX_PNG_BYTES = 9_000_000             # re-encode to JPEG above this
+MAX_PNG_BYTES = 9_000_000
 
 BG_TOP = (32, 150, 236)
 BG_BOTTOM = (20, 116, 200)
 TEXT = (255, 255, 255)
 SUBTEXT = (220, 235, 252)
-PRICE_COLOR = (255, 255, 255)
 STRUCK_COLOR = (150, 205, 245)
 BADGE_BG = (255, 216, 60)
 BADGE_TEXT = (40, 35, 10)
+TRACK_RGB = (78, 52, 120)             # default tile color for jam tracks
 
 FONT_PATHS = {
     "bold": [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/Library/Fonts/Arial Bold.ttf",
-        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "/Library/Fonts/Arial Bold.ttf", "C:\\Windows\\Fonts\\arialbd.ttf",
     ],
     "bolditalic": [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
@@ -59,8 +60,7 @@ FONT_PATHS = {
     ],
     "regular": [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
+        "/Library/Fonts/Arial.ttf", "C:\\Windows\\Fonts\\arial.ttf",
     ],
 }
 
@@ -76,7 +76,7 @@ DEFAULT_RGB = (52, 86, 140)
 
 
 # ------------------------------- font helpers ------------------------------- #
-def _font(kind: str, size: int):
+def _font(kind, size):
     for path in FONT_PATHS.get(kind, []):
         if os.path.exists(path):
             try:
@@ -107,14 +107,7 @@ def _vertical_gradient(size, top, bottom):
     base = Image.new("RGB", (1, h))
     for y in range(h):
         t = y / max(h - 1, 1)
-        base.putpixel(
-            (0, y),
-            (
-                int(top[0] + (bottom[0] - top[0]) * t),
-                int(top[1] + (bottom[1] - top[1]) * t),
-                int(top[2] + (bottom[2] - top[2]) * t),
-            ),
-        )
+        base.putpixel((0, y), tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
     return base.resize((w, h))
 
 
@@ -145,8 +138,7 @@ def _wrap(draw, text, font, max_w, max_lines=2):
     words = text.split()
     lines, cur, i = [], "", 0
     while i < len(words):
-        word = words[i]
-        trial = f"{cur} {word}".strip()
+        trial = f"{cur} {words[i]}".strip()
         if draw.textlength(trial, font=font) <= max_w:
             cur = trial
             i += 1
@@ -155,7 +147,7 @@ def _wrap(draw, text, font, max_w, max_lines=2):
                 lines.append(cur)
                 cur = ""
             else:
-                lines.append(word)
+                lines.append(words[i])
                 i += 1
             if len(lines) == max_lines:
                 cur = ""
@@ -174,39 +166,35 @@ def _wrap(draw, text, font, max_w, max_lines=2):
 def _render_tile(card, fonts, vbuck_icon):
     f_name, f_price, f_badge = fonts["name"], fonts["price"], fonts["badge"]
     top, bottom = card["c_top"], card["c_bottom"]
-    tile = _vertical_gradient((TILE_W, TILE_H), top, bottom).convert("RGBA")
+    tile = _vertical_gradient((TILE, TILE), top, bottom).convert("RGBA")
 
     art_bytes = card.get("art_bytes")
     if art_bytes:
         try:
             art = Image.open(io.BytesIO(art_bytes))
             if card.get("full_bleed"):
-                tile.alpha_composite(_cover_fit(art, TILE_W, TILE_H, anchor_top=True), (0, 0))
+                tile.alpha_composite(_cover_fit(art, TILE, TILE, anchor_top=True), (0, 0))
             else:
-                fitted = _contain_fit(art, TILE_W - 20, int(TILE_H * 0.66))
-                ax = (TILE_W - fitted.width) // 2
-                ay = max(8, int(TILE_H * 0.66) - fitted.height + 6)
+                fitted = _contain_fit(art, TILE - 24, int(TILE * 0.62))
+                ax = (TILE - fitted.width) // 2
+                ay = max(8, int(TILE * 0.62) - fitted.height + 6)
                 tile.alpha_composite(fitted, (ax, ay))
         except Exception:  # noqa: BLE001
             pass
 
-    # bottom scrim
-    scrim_h = int(TILE_H * 0.5)
-    scrim = Image.new("RGBA", (TILE_W, scrim_h), (0, 0, 0, 0))
+    scrim_h = int(TILE * 0.46)
+    scrim = Image.new("RGBA", (TILE, scrim_h), (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(scrim)
     for yy in range(scrim_h):
-        a = int(210 * (yy / scrim_h) ** 1.25)
-        sdraw.line([(0, yy), (TILE_W, yy)], fill=(0, 0, 0, a))
-    tile.alpha_composite(scrim, (0, TILE_H - scrim_h))
+        sdraw.line([(0, yy), (TILE, yy)], fill=(0, 0, 0, int(215 * (yy / scrim_h) ** 1.25)))
+    tile.alpha_composite(scrim, (0, TILE - scrim_h))
 
     tdraw = ImageDraw.Draw(tile)
-    # rarity accent strip
-    tdraw.rectangle([0, TILE_H - 4, TILE_W, TILE_H], fill=top + (255,))
+    tdraw.rectangle([0, TILE - 4, TILE, TILE], fill=top + (255,))
 
-    # name + price row
-    name_lines = _wrap(tdraw, card["name"], f_name, TILE_W - 18, max_lines=2)
+    name_lines = _wrap(tdraw, card["name"], f_name, TILE - 18, max_lines=2)
     line_h = f_name.getbbox("Ag")[3] + 3
-    price_y = TILE_H - 30
+    price_y = TILE - 30
     ny = price_y - len(name_lines) * line_h - 4
     for line in name_lines:
         tdraw.text((10, ny + 1), line, font=f_name, fill=(0, 0, 0))
@@ -218,58 +206,52 @@ def _render_tile(card, fonts, vbuck_icon):
         tile.alpha_composite(vbuck_icon, (px, price_y))
         px += vbuck_icon.width + 4
     price_str = f"{card['price']:,}" if card["price"] is not None else "—"
-    tdraw.text((px, price_y), price_str, font=f_price, fill=PRICE_COLOR)
+    tdraw.text((px, price_y), price_str, font=f_price, fill=TEXT)
     px += tdraw.textlength(price_str, font=f_price) + 6
-    # struck original price when discounted
     reg = card.get("regular_price")
     if reg and card["price"] is not None and reg > card["price"]:
         reg_str = f"{reg:,}"
-        tdraw.text((px, price_y + 1), reg_str, font=f_badge, fill=STRUCK_COLOR)
+        tdraw.text((px, price_y + 2), reg_str, font=f_badge, fill=STRUCK_COLOR)
         w = tdraw.textlength(reg_str, font=f_badge)
-        midy = price_y + 1 + f_badge.getbbox("0")[3] // 2 + 1
+        midy = price_y + 2 + f_badge.getbbox("0")[3] // 2 + 1
         tdraw.line([(px, midy), (px + w, midy)], fill=STRUCK_COLOR, width=1)
 
-    # corner badge
     badge = card.get("badge_text")
     if badge:
-        bx, by = 7, 7
         pad = 5
         bw = tdraw.textlength(badge, font=f_badge) + pad * 2
         bh = f_badge.getbbox("Ag")[3] + pad
-        tdraw.rounded_rectangle([bx, by, bx + bw, by + bh], 5, fill=BADGE_BG)
-        tdraw.text((bx + pad, by + pad // 2), badge, font=f_badge, fill=BADGE_TEXT)
+        tdraw.rounded_rectangle([7, 7, 7 + bw, 7 + bh], 5, fill=BADGE_BG)
+        tdraw.text((7 + pad, 7 + pad // 2), badge, font=f_badge, fill=BADGE_TEXT)
 
-    rounded = Image.new("RGBA", (TILE_W, TILE_H), (0, 0, 0, 0))
-    rounded.paste(tile, (0, 0), _rounded_mask((TILE_W, TILE_H), CARD_RADIUS))
+    rounded = Image.new("RGBA", (TILE, TILE), (0, 0, 0, 0))
+    rounded.paste(tile, (0, 0), _rounded_mask((TILE, TILE), CARD_RADIUS))
     return rounded
 
 
 # ------------------------------- composition -------------------------------- #
-def _section_block_height(n_items):
+def _block_height(n_items):
     rows = max(1, (n_items + SECTION_COLS - 1) // SECTION_COLS)
-    return SECTION_HEADER_H + rows * TILE_H + (rows - 1) * TILE_GAP
+    return SECTION_HEADER_H + rows * TILE + (rows - 1) * TILE_GAP
 
 
 def _compose(sections, vbuck_bytes, date_str) -> bytes:
     fonts = {
-        "title": _font("bold", 70),
-        "date": _font("bolditalic", 26),
-        "section": _font("bolditalic", 24),
-        "name": _font("bold", 16),
-        "price": _font("bold", 16),
-        "badge": _font("bold", 13),
+        "title": _font("bold", 70), "date": _font("bolditalic", 26),
+        "section": _font("bolditalic", 24), "name": _font("bold", 16),
+        "price": _font("bold", 16), "badge": _font("bold", 13),
     }
-
-    block_w = SECTION_COLS * TILE_W + (SECTION_COLS - 1) * TILE_GAP
+    block_w = SECTION_COLS * TILE + (SECTION_COLS - 1) * TILE_GAP
     canvas_w = MARGIN * 2 + MASONRY_COLS * block_w + (MASONRY_COLS - 1) * COL_GAP
 
-    # masonry packing: place each section in the currently-shortest column
+    # largest section first → balanced columns (LPT bin-packing heuristic)
+    ordered = sorted(sections, key=lambda s: _block_height(len(s[1])), reverse=True)
     col_heights = [0] * MASONRY_COLS
-    placements = []  # (col_index, y_within_stack, section_name, cards)
-    for name, cards in sections:
+    placements = []
+    for name, cards in ordered:
         c = min(range(MASONRY_COLS), key=lambda i: col_heights[i])
         placements.append((c, col_heights[c], name, cards))
-        col_heights[c] += _section_block_height(len(cards)) + SECTION_GAP
+        col_heights[c] += _block_height(len(cards)) + SECTION_GAP
 
     content_h = max(col_heights) if col_heights else 0
     canvas_h = HEADER_H + content_h + MARGIN
@@ -277,8 +259,6 @@ def _compose(sections, vbuck_bytes, date_str) -> bytes:
     canvas = Image.new("RGB", (canvas_w, canvas_h), BG_TOP)
     canvas.paste(_vertical_gradient((canvas_w, canvas_h), BG_TOP, BG_BOTTOM), (0, 0))
     draw = ImageDraw.Draw(canvas)
-
-    # header
     draw.text((MARGIN, 36), "SHOP", font=fonts["title"], fill=TEXT)
     draw.text((MARGIN + 4, 116), date_str, font=fonts["date"], fill=SUBTEXT)
 
@@ -293,24 +273,20 @@ def _compose(sections, vbuck_bytes, date_str) -> bytes:
     for col, y0, name, cards in placements:
         bx = MARGIN + col * (block_w + COL_GAP)
         by = HEADER_H + y0
-        # section header
         draw.text((bx + 2, by + 4), name.upper(), font=fonts["section"], fill=TEXT)
-        draw.line([(bx + 2, by + SECTION_HEADER_H - 8),
-                   (bx + block_w, by + SECTION_HEADER_H - 8)], fill=(255, 255, 255, 60), width=2)
+        draw.line([(bx + 2, by + SECTION_HEADER_H - 8), (bx + block_w, by + SECTION_HEADER_H - 8)],
+                  fill=(255, 255, 255), width=1)
         gy = by + SECTION_HEADER_H
         for idx, card in enumerate(cards):
             r, c = divmod(idx, SECTION_COLS)
-            tx = bx + c * (TILE_W + TILE_GAP)
-            ty = gy + r * (TILE_H + TILE_GAP)
+            tx = bx + c * (TILE + TILE_GAP)
+            ty = gy + r * (TILE + TILE_GAP)
             tile = _render_tile(card, fonts, vbuck_icon)
             canvas.paste(tile, (tx, ty), tile)
 
-    draw.text(
-        (MARGIN, canvas_h - 26),
-        "data via fortnite-api.com · not affiliated with Epic Games",
-        font=_font("regular", 15),
-        fill=(210, 230, 248),
-    )
+    draw.text((MARGIN, canvas_h - 26),
+              "data via fortnite-api.com · not affiliated with Epic Games",
+              font=_font("regular", 15), fill=(210, 230, 248))
 
     out = io.BytesIO()
     canvas.save(out, format="PNG", optimize=True)
@@ -322,39 +298,74 @@ def _compose(sections, vbuck_bytes, date_str) -> bytes:
     return data
 
 
-# ------------------------------- async driver ------------------------------- #
-def _pick_art(entry):
-    """Return (asset, item, full_bleed). Bundles use their combined art."""
-    items = entry.br or []
-    item = items[0] if items else None
+# ------------------------------- entry resolution --------------------------- #
+def _is_placeholder(name):
+    if not name:
+        return True
+    n = name.strip().lower()
+    return (
+        "placeholder" in n
+        or "sid_" in n
+        or n.startswith("[virtual]")
+        or n.startswith("tbd")
+        or n == "tbd"
+        or n == "unknown"
+    )
 
-    bundle = getattr(entry, "bundle", None)
-    if bundle and getattr(bundle, "image", None):
-        return bundle.image, item, True
 
+def _img_asset(images):
+    if not images:
+        return None
+    return getattr(images, "featured", None) or getattr(images, "icon", None) \
+        or getattr(images, "large", None) or getattr(images, "small", None)
+
+
+def _resolve(entry):
+    """Return (asset, full_bleed, name, rarity_item) or None to skip the entry."""
     nda = getattr(entry, "new_display_asset", None)
+    nda_offer = None
     if nda and getattr(nda, "images", None):
         imgs = nda.images
-        offer = getattr(imgs, "offer_image", None)
-        if not offer and hasattr(imgs, "get"):
-            offer = imgs.get("OfferImage")
-        if offer:
-            return offer, item, True
+        nda_offer = getattr(imgs, "offer_image", None)
+        if not nda_offer and hasattr(imgs, "get"):
+            nda_offer = imgs.get("OfferImage")
 
-    if item and item.images and item.images.featured:
-        return item.images.featured, item, True
-    if item and item.images and item.images.icon:
-        return item.images.icon, item, False
-    return None, item, False
-
-
-def _name_for(entry, item):
     bundle = getattr(entry, "bundle", None)
-    if bundle and getattr(bundle, "name", None):
-        return bundle.name
-    if item and item.name:
-        return item.name
-    return getattr(entry, "dev_name", None) or "Unknown"
+    br = getattr(entry, "br", None) or []
+    item = br[0] if br else None
+
+    # bundles: combined art + bundle name
+    if bundle and getattr(bundle, "image", None):
+        return bundle.image, True, getattr(bundle, "name", None), item
+
+    # standard cosmetics (outfits, emotes, etc.)
+    if item:
+        if nda_offer:
+            return nda_offer, True, item.name, item
+        if item.images and item.images.featured:
+            return item.images.featured, True, item.name, item
+        if item.images and item.images.icon:
+            return item.images.icon, False, item.name, item
+        return None, False, item.name, item
+
+    # jam tracks → square album art + title
+    tracks = getattr(entry, "tracks", None) or []
+    if tracks:
+        t = tracks[0]
+        return getattr(t, "album_art", None), True, getattr(t, "title", None), None
+
+    # instruments / cars / lego — fall back to the shop render if present
+    for attr in ("instruments", "cars", "lego_kits"):
+        seq = getattr(entry, attr, None) or []
+        if seq:
+            obj = seq[0]
+            asset = nda_offer or _img_asset(getattr(obj, "images", None))
+            return asset, bool(nda_offer), getattr(obj, "name", None), obj
+
+    # nothing resolvable
+    if nda_offer:
+        return nda_offer, True, getattr(entry, "dev_name", None), None
+    return None
 
 
 def _badge_for(entry):
@@ -374,14 +385,15 @@ def _badge_for(entry):
     return None
 
 
-def _colors_for(entry, item):
+def _colors_for(entry, rarity_item, is_track):
     colors = getattr(entry, "colors", None)
     if colors and colors.color1:
         top = _hex_to_rgb(colors.color1)
         bottom = _hex_to_rgb(colors.color3 or colors.color2 or colors.color1, top)
-        bottom = tuple(max(0, int(c * 0.5)) for c in bottom)
-        return top, bottom
-    rar = item.rarity.value.lower() if (item and item.rarity) else None
+        return top, tuple(max(0, int(c * 0.5)) for c in bottom)
+    if is_track:
+        return TRACK_RGB, tuple(int(c * 0.5) for c in TRACK_RGB)
+    rar = rarity_item.rarity.value.lower() if (rarity_item and getattr(rarity_item, "rarity", None)) else None
     base = RARITY_RGB.get(rar, DEFAULT_RGB)
     return base, tuple(max(0, int(c * 0.45)) for c in base)
 
@@ -399,38 +411,40 @@ async def _download(asset, sem):
 
 async def render_shop_image(loop, shop) -> bytes:
     sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-
     sections: dict[str, list] = {}
     order: list[str] = []
     seen = set()
     count = 0
+
     for entry in shop.entries:
         if count >= MAX_CARDS:
             break
         oid = getattr(entry, "offer_id", None)
         if oid and oid in seen:
             continue
+
+        resolved = _resolve(entry)
+        if not resolved:
+            continue
+        asset, full_bleed, name, rarity_item = resolved
+        if _is_placeholder(name):
+            continue  # drop "[VIRTUAL]/SID_Placeholder/TBD" junk
+
         if oid:
             seen.add(oid)
+        is_track = bool(getattr(entry, "tracks", None)) and not (getattr(entry, "br", None))
         layout = getattr(entry, "layout", None)
         section = layout.name if layout and layout.name else "Featured"
-        asset, item, full_bleed = _pick_art(entry)
-        top, bottom = _colors_for(entry, item)
+        top, bottom = _colors_for(entry, rarity_item, is_track)
         if section not in sections:
             sections[section] = []
             order.append(section)
-        sections[section].append(
-            {
-                "asset": asset,
-                "full_bleed": full_bleed,
-                "name": _name_for(entry, item),
-                "price": getattr(entry, "final_price", None),
-                "regular_price": getattr(entry, "regular_price", None),
-                "badge_text": _badge_for(entry),
-                "c_top": top,
-                "c_bottom": bottom,
-            }
-        )
+        sections[section].append({
+            "asset": asset, "full_bleed": full_bleed, "name": name,
+            "price": getattr(entry, "final_price", None),
+            "regular_price": getattr(entry, "regular_price", None),
+            "badge_text": _badge_for(entry), "c_top": top, "c_bottom": bottom,
+        })
         count += 1
 
     tasks, refs = [], []
@@ -452,5 +466,4 @@ async def render_shop_image(loop, shop) -> bytes:
 
     date_str = shop.date.strftime("%A – %b %d, %Y") if shop.date else "Today"
     ordered_sections = [(s, sections[s]) for s in order if sections[s]]
-
     return await loop.run_in_executor(None, _compose, ordered_sections, vbuck_bytes, date_str)
