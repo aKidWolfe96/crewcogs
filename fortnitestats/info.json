@@ -1,0 +1,12 @@
+{
+    "author": ["Aaron"],
+    "name": "FortniteStats",
+    "short": "Graphical Fortnite stats, item shop, news and cosmetics.",
+    "description": "Self-hosted Fortnite cog powered by the official fortnite-api.com library. Graphical BR player stats, daily item shop (with optional auto-post), in-game news, and cosmetic lookups. Account linking stored locally in Red's Config.",
+    "tags": ["fortnite", "games", "stats", "shop"],
+    "requirements": ["fortnite-api>=3.3.0"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
