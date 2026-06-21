@@ -297,5 +297,6 @@ def settle_embed(event_name: str, lines: list) -> discord.Embed:
     return discord.Embed(title=f"📊  Picks Settled — {event_name}",
                          description="\n".join(lines), color=UFC_GOLD)
 
+
 def error_embed(msg: str) -> discord.Embed:
     return discord.Embed(title="❌  Error", description=msg, color=0xFF4444)
