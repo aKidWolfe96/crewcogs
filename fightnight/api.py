@@ -12,7 +12,7 @@ Everything degrades gracefully: if one source is down, the others still answer.
 import re
 import aiohttp
 from urllib.parse import quote
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from bs4 import BeautifulSoup
 
@@ -162,13 +162,37 @@ def _fmt_event(raw: dict) -> dict:
     }
 
 
+# A card runs several hours; treat an event that started within this window as
+# the "current" event so `card`/`picks` keep working once the fights go live.
+LIVE_WINDOW = timedelta(hours=24)
+
+
 async def get_upcoming_event(session: aiohttp.ClientSession) -> Optional[dict]:
+    """
+    Return the current or next event.
+
+    A live event (started within the last 24h) counts as "current" — otherwise
+    the moment a card begins it would stop being "upcoming" and `card`/`picks`
+    would break mid-event. Falls back to the soonest future event.
+    """
     now = datetime.now(timezone.utc)
     events = await _scoreboard(session)
-    upcoming = [(d, e) for e in events if (d := _parse_date(e)) and d >= now]
-    if upcoming:
-        upcoming.sort(key=lambda x: x[0])
-        return _fmt_event(upcoming[0][1])
+    parsed = [(d, e) for e in events if (d := _parse_date(e))]
+    if not parsed:
+        return None
+
+    # 1) live / just-started events (most recent first)
+    live = [(d, e) for d, e in parsed if d <= now and (now - d) <= LIVE_WINDOW]
+    if live:
+        live.sort(key=lambda x: x[0], reverse=True)
+        return _fmt_event(live[0][1])
+
+    # 2) soonest genuinely-future event
+    future = [(d, e) for d, e in parsed if d > now]
+    if future:
+        future.sort(key=lambda x: x[0])
+        return _fmt_event(future[0][1])
+
     return None
 
 
