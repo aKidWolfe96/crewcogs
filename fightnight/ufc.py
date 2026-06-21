@@ -171,6 +171,11 @@ class UFC(commands.Cog):
                 f"**{fighter_name}** isn't on the upcoming card.\n"
                 f"Use `{ctx.clean_prefix}ufc card` to see current matchups."))
 
+        if matched.get("completed") or matched.get("winner"):
+            return await ctx.send(embed=embeds.error_embed(
+                f"That fight (**{matched['red']}** vs **{matched['blue']}**) has "
+                "already happened — picks for it are locked."))
+
         fight_key = f"{matched['red']}|{matched['blue']}"
         eid = event["id"]
         uid = str(ctx.author.id)
@@ -204,9 +209,18 @@ class UFC(commands.Cog):
             evs = await self.config.guild(ctx.guild).events()
             legacy = await self.config.guild(ctx.guild).picks()
 
+        # If ESPN is unreachable, fall back to the most recent stored event
+        # bucket so picks still display from saved data.
         if not event:
-            event = {"shortname": "Upcoming Event", "name": "Upcoming Event",
-                     "date": "TBD", "fights": [], "id": ""}
+            if evs:
+                eid = max(evs, key=lambda k: evs[k].get("meta", {}).get("date_compact", ""))
+                meta = evs[eid].get("meta", {})
+                event = {"shortname": meta.get("shortname", "Event"),
+                         "name": meta.get("name", "Event"),
+                         "date": meta.get("date", "TBD"), "fights": [], "id": eid}
+            else:
+                event = {"shortname": "Upcoming Event", "name": "Upcoming Event",
+                         "date": "TBD", "fights": [], "id": ""}
 
         bucket = evs.get(event.get("id", ""), {})
         picks = dict(bucket.get("picks", {}))
