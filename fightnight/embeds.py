@@ -249,7 +249,8 @@ def picks_embed(event: dict, picks: dict, guild: discord.Guild) -> discord.Embed
 # ── standings ─────────────────────────────────────────────────────────────────
 
 def standings_embed(standings: dict, guild: discord.Guild,
-                    pending: int = 0) -> discord.Embed:
+                    pending: int = 0, betting: dict = None) -> discord.Embed:
+    betting = betting or {}
     e = discord.Embed(title="🏆  UFC Pick Em Standings", color=UFC_GOLD)
 
     if not standings:
@@ -273,13 +274,68 @@ def standings_embed(standings: dict, guild: discord.Guild,
         c, t = st.get("correct", 0), st.get("total", 0)
         pct = round(c / t * 100) if t else 0
         medal = medals[i] if i < 3 else f"`{i+1}.`"
-        lines.append(f"{medal} **{disp}** — {c}/{t} ({pct}%)")
+
+        row = f"{medal} **{disp}** — {c}/{t} ({pct}%)"
+
+        # betting column — only for users who have actually bet
+        b = betting.get(uid)
+        if b and (b.get("won", 0) or b.get("lost", 0)):
+            net = b.get("net", 0)
+            sign = "+" if net >= 0 else "−"
+            money_emoji = "💰" if net >= 0 else "📉"
+            row += f"  •  {money_emoji} {sign}{abs(net):,} ({b.get('won',0)}W-{b.get('lost',0)}L)"
+
+        lines.append(row)
     e.description = "\n".join(lines)
 
     if pending:
         e.set_footer(text=f"UFC Pick Em • {pending} pick(s) pending for the next event")
     else:
         e.set_footer(text="UFC Pick Em • updates after each settle")
+    return e
+
+
+# ── betting embeds ────────────────────────────────────────────────────────────
+
+def bet_confirm_embed(member, fighter, opponent, amount, event_name,
+                      currency="credits", slots_left=0, changed_from=None) -> discord.Embed:
+    if changed_from is not None:
+        title = "🔁  Bet Updated!"
+        desc = (f"{member.mention} now has **{amount:,} {currency}** on **{fighter}** "
+                f"(was {changed_from:,})\nto beat **{opponent}** — *{event_name}*")
+    else:
+        title = "💰  Bet Placed!"
+        desc = (f"{member.mention} bet **{amount:,} {currency}** on **{fighter}** "
+                f"to beat **{opponent}**\n*{event_name}*\n\n"
+                f"Win pays **{amount*2:,} {currency}** • {slots_left} bet slot(s) left")
+    return discord.Embed(title=title, description=desc, color=GREEN)
+
+
+def unbet_embed(member, fighter, amount, currency="credits", slots_left=0) -> discord.Embed:
+    return discord.Embed(
+        title="↩️  Bet Cancelled",
+        description=(f"{member.mention} cancelled their bet on **{fighter}** and was "
+                     f"refunded **{amount:,} {currency}**.\n"
+                     f"You now have {slots_left} bet slot(s) free."),
+        color=UFC_BLUE,
+    )
+
+
+def bets_embed(member, bets: list, currency="credits", max_bets=3) -> discord.Embed:
+    """bets: list of {fighter, opponent, amount}"""
+    e = discord.Embed(title=f"💰  {member.display_name}'s Active Bets", color=UFC_GOLD)
+    if not bets:
+        e.description = ("No active bets.\nUse `!ufc bet <fighter> <amount>` to place one "
+                         f"(max {max_bets} per card).")
+        return e
+    lines, total = [], 0
+    for b in bets:
+        total += b["amount"]
+        lines.append(f"🥊 **{b['amount']:,}** on **{b['fighter']}** vs {b['opponent']}")
+    e.description = "\n".join(lines)
+    e.add_field(name="Total staked", value=f"{total:,} {currency}", inline=True)
+    e.add_field(name="Slots used", value=f"{len(bets)}/{max_bets}", inline=True)
+    e.set_footer(text="Win pays 2× your stake • !ufc unbet <fighter> to cancel")
     return e
 
 
