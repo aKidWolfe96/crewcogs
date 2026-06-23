@@ -38,6 +38,16 @@ ROLE_EMOJI = {
 }
 SPRAY = "\U0001F3A8"  # 🎨
 
+# Challenge-board role styling (distinct from the OverFast rank roles above).
+BOARD_ROLE_ORDER = ("Tank", "Damage", "Support", "Other")
+BOARD_ROLE_META = {
+    "Tank": ("\U0001F6E1\uFE0F", 0x3B82F6),     # 🛡️ blue
+    "Damage": ("\u2694\uFE0F", 0xEF4444),        # ⚔️ red
+    "Support": ("\u271A", 0x22C55E),             # ✚ green
+    "Other": (SPRAY, 0x9CA3AF),                  # 🎨 gray
+}
+VALID_BOARD_ROLES = {"tank": "Tank", "damage": "Damage", "support": "Support"}
+
 
 class Overwatch(commands.Cog):
     """Overwatch stats and a self-report spray-challenge board."""
@@ -150,6 +160,20 @@ class Overwatch(commands.Cog):
     def _done_on_board(done: list, challenges: dict) -> list:
         """Member's completed IDs that still exist on the board (filters stale)."""
         return [cid for cid in done if cid in challenges]
+
+    @staticmethod
+    def _short_condition(text: str) -> str:
+        """Drop a trailing '(Achievement Name)' so the list view scans cleanly."""
+        if text.endswith(")") and " (" in text:
+            return text[: text.rfind(" (")].rstrip()
+        return text
+
+    @staticmethod
+    def _hero_from_reward(reward: str) -> str:
+        """'Cute D.Va Spray' -> 'D.Va'; non-matching rewards pass through unchanged."""
+        if reward.startswith("Cute ") and reward.endswith(" Spray"):
+            return reward[5:-6].strip() or reward
+        return reward
 
     # ------------------------------------------------------------------ #
     # Command group
@@ -297,7 +321,7 @@ class Overwatch(commands.Cog):
 
     @ow_challenge.command(name="list")
     async def challenge_list(self, ctx: commands.Context):
-        """Show the challenge board with a completion count per entry."""
+        """Show the board grouped by role, with a completion count per spray."""
         challenges = await self.config.guild(ctx.guild).challenges()
         if not challenges:
             return await ctx.send(
@@ -306,11 +330,36 @@ class Overwatch(commands.Cog):
                 f"`{ctx.clean_prefix}ow challenge add`."
             )
         members = await self.config.all_members(ctx.guild)
-        lines = []
-        for cid, c in sorted(challenges.items(), key=lambda kv: int(kv[0])):
-            count = sum(1 for d in members.values() if cid in d.get("done", []))
-            lines.append(f"`#{cid}` **{c['reward']}** \u2014 {c['name']} (\u2705 {count})")
-        await self._send_paged(ctx, f"{SPRAY} Spray Challenges", "\n".join(lines))
+
+        # Bucket challenges by their stored role (defaulting unknowns to "Other").
+        by_role: dict[str, list] = {}
+        for cid, c in challenges.items():
+            by_role.setdefault(c.get("role", "Other"), []).append((cid, c))
+
+        for role in BOARD_ROLE_ORDER:
+            entries = by_role.get(role)
+            if not entries:
+                continue
+            emoji, color = BOARD_ROLE_META[role]
+            entries.sort(key=lambda kv: self._hero_from_reward(kv[1]["reward"]).lower())
+            lines = []
+            for cid, c in entries:
+                count = sum(1 for d in members.values() if cid in d.get("done", []))
+                hero = self._hero_from_reward(c["reward"])
+                cond = self._short_condition(c["name"])
+                badge = f"  `\u2705 {count}`" if count else ""
+                lines.append(f"`#{cid}` **{hero}** \u2014 {cond}{badge}")
+            body = "\n".join(lines)
+            pages = list(pagify(body, delims=["\n"], page_length=3900)) or [""]
+            for i, page in enumerate(pages, 1):
+                suffix = f" ({i}/{len(pages)})" if len(pages) > 1 else ""
+                await ctx.send(
+                    embed=discord.Embed(
+                        title=f"{emoji} {role} Sprays ({len(entries)}){suffix}",
+                        description=page,
+                        color=discord.Color(color),
+                    )
+                )
 
     @ow_challenge.command(name="mine")
     async def challenge_mine(self, ctx: commands.Context, member: Optional[discord.Member] = None):
@@ -370,21 +419,24 @@ class Overwatch(commands.Cog):
     @commands.admin_or_permissions(manage_guild=True)
     @ow_challenge.command(name="add")
     async def challenge_add(self, ctx: commands.Context, *, text: str):
-        """Add a challenge. Format: `reward | challenge name`.
+        """Add a challenge. Format: `reward | condition` or `reward | condition | role`.
 
-        e.g. `[p]ow challenge add Cute Venture Spray | Get 4 kills with one Tectonic Shock`
+        Role is optional (Tank/Damage/Support); anything else falls under "Other".
+        e.g. `[p]ow challenge add Cute Shion Spray | <condition> | Damage`
         """
         if "|" not in text:
-            return await ctx.send("Use the format `reward | challenge name`.")
-        reward, _, name = text.partition("|")
-        reward, name = reward.strip()[:REWARD_MAXLEN], name.strip()[:CONDITION_MAXLEN]
+            return await ctx.send("Use the format `reward | condition` (optionally `| role`).")
+        parts = [p.strip() for p in text.split("|")]
+        reward = parts[0][:REWARD_MAXLEN]
+        name = parts[1][:CONDITION_MAXLEN] if len(parts) > 1 else ""
+        role = VALID_BOARD_ROLES.get(parts[2].lower(), "Other") if len(parts) > 2 and parts[2] else "Other"
         if not reward or not name:
-            return await ctx.send("Both a reward and a name are required.")
+            return await ctx.send("Both a reward and a condition are required.")
         next_id = await self.config.guild(ctx.guild).next_id()
         async with self.config.guild(ctx.guild).challenges() as challenges:
-            challenges[str(next_id)] = {"name": name, "reward": reward}
+            challenges[str(next_id)] = {"name": name, "reward": reward, "role": role}
         await self.config.guild(ctx.guild).next_id.set(next_id + 1)
-        await ctx.send(f"Added challenge **#{next_id}**: {name} \u2192 *{reward}*")
+        await ctx.send(f"Added **#{next_id}** to *{role}*: {reward} \u2014 {name}")
 
     @commands.admin_or_permissions(manage_guild=True)
     @ow_challenge.command(name="remove")
@@ -420,11 +472,11 @@ class Overwatch(commands.Cog):
         added = 0
         async with self.config.guild(ctx.guild).challenges() as challenges:
             existing = {c["reward"] for c in challenges.values()}
-            for hero, condition in CUTE_SPRAYS:
+            for hero, condition, role in CUTE_SPRAYS:
                 reward = f"Cute {hero} Spray"
                 if reward in existing:
                     continue
-                challenges[str(next_id)] = {"name": condition, "reward": reward}
+                challenges[str(next_id)] = {"name": condition, "reward": reward, "role": role}
                 existing.add(reward)
                 next_id += 1
                 added += 1
