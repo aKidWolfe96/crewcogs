@@ -1,0 +1,13 @@
+{
+    "author": ["KrustyKrew"],
+    "name": "ChannelGuide",
+    "short": "Posts a guide showing which commands belong in which channels.",
+    "description": "A simple utility cog that posts an embed mapping KrustyKrew bot features to their designated channels. Admin-only command to post or refresh the guide in any channel.",
+    "tags": ["utility", "embed", "guide", "channels", "help"],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog does not store any end user data."
+}
