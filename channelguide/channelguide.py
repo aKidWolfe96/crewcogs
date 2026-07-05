@@ -1,6 +1,10 @@
 import discord
 from redbot.core import commands
 
+__red_end_user_data_statement__ = (
+    "This cog does not store any end user data."
+)
+
 
 class ChannelGuide(commands.Cog):
     """Posts a KrustyKrew channel guide showing which commands go where."""
@@ -74,7 +78,3 @@ class ChannelGuide(commands.Cog):
         await target.send(embed=self.build_embed())
         if channel is not None:
             await ctx.tick()  # react to confirm when posting elsewhere
-
-
-async def setup(bot):
-    await bot.add_cog(ChannelGuide(bot))
