@@ -1,0 +1,13 @@
+{
+    "author": ["KrustyKrew"],
+    "name": "CrewStats",
+    "short": "Weekly cross-cog activity leaderboard.",
+    "description": "Tracks weekly messages, voice time, casino wagering/wins, Pokebot catches/raids/dex/longest pokestop streak, and Overwatch challenge clears, then auto-posts a leaderboard embed and resets each week.",
+    "tags": ["stats", "leaderboard", "activity", "weekly", "casino", "pokebot", "overwatch"],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog stores per-guild, per-user counts of messages sent, seconds spent in voice channels, and the dates of daily Pokestop spins (used to compute the longest weekly streak) for the purpose of a weekly activity leaderboard. It also reads (but does not copy long-term) aggregate stats from the casino, PokeBot, and Overwatch cogs. This owned data is reset weekly and can be removed with Red's data deletion request."
+}
