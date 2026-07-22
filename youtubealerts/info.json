@@ -1,0 +1,20 @@
+{
+    "author": ["aKidWolfe"],
+    "name": "YouTubeAlerts",
+    "short": "YouTube upload and livestream notifications.",
+    "description": "Posts customizable notifications when watched YouTube channels upload new videos or go live.",
+    "tags": [
+        "youtube",
+        "notifications",
+        "streaming",
+        "alerts",
+        "embed"
+    ],
+    "requirements": [
+        "aiohttp"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
