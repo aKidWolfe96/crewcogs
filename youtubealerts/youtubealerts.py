@@ -15,12 +15,12 @@ log = logging.getLogger("red.youtubealerts")
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 DEFAULT_LIVE_MESSAGE = "🔴 **{channel}** is now live on YouTube!"
-DEFAULT_UPLOAD_MESSAGE = "📤 **{channel}** just uploaded: {title}"
+DEFAULT_UPLOAD_MESSAGE = "📤 **{channel}** just uploaded: **{title}**"
 DEFAULT_COLOR = 0xFF0000  # YouTube red
 
 
 class YouTubeAlerts(commands.Cog):
-    """Custom YouTube live and upload notifications."""
+    """Custom YouTube live and upload notifications with rich embeds."""
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -29,11 +29,11 @@ class YouTubeAlerts(commands.Cog):
 
         self.config.register_global(
             api_key=None,
-            interval=300,  # 5 minutes default (YouTube API quota friendly)
+            interval=300,  # seconds
         )
         self.config.register_guild(
             channel=None,
-            channels=[],           # list of YouTube channel IDs or @handles
+            channels=[],           # list of YouTube channel IDs
             live_message=DEFAULT_LIVE_MESSAGE,
             upload_message=DEFAULT_UPLOAD_MESSAGE,
             mention=None,
@@ -42,13 +42,13 @@ class YouTubeAlerts(commands.Cog):
         )
 
         self._seen_live = {}      # channel_id -> video_id
-        self._seen_uploads = {}   # channel_id -> video_id (latest upload)
+        self._seen_uploads = {}   # channel_id -> video_id
         self._seeded = False
         self.check_youtube.start()
 
     def cog_unload(self):
         self.check_youtube.cancel()
-        self.bot.loop.create_task(self.session.close())
+        asyncio.create_task(self.session.close())
 
     # ------------------------------------------------------------------ #
     # API Helpers
@@ -69,34 +69,35 @@ class YouTubeAlerts(commands.Cog):
             log.error("YouTube API error: %s", e)
             return None
 
-    async def _get_channel_id(self, handle_or_id: str) -> Optional[str]:
-        """Resolve @handle or custom URL to channel ID."""
-        if handle_or_id.startswith("@") or "/" in handle_or_id:
-            # Try search
+    async def _get_channel_id(self, identifier: str) -> Optional[str]:
+        identifier = identifier.strip()
+        if identifier.startswith("UC") and len(identifier) > 20:  # likely channel ID
+            return identifier
+        # Search by handle or name
+        data = await self._api_get("search", {
+            "part": "snippet",
+            "q": identifier.replace("@", ""),
+            "type": "channel",
+            "maxResults": 1
+        })
+        if data and data.get("items"):
+            return data["items"][0]["snippet"]["channelId"]
+        return None
+
+    async def _get_live_streams(self, channel_ids):
+        if not channel_ids:
+            return {}
+        live = {}
+        for cid in channel_ids:
             data = await self._api_get("search", {
                 "part": "snippet",
-                "q": handle_or_id,
-                "type": "channel",
+                "channelId": cid,
+                "eventType": "live",
+                "type": "video",
                 "maxResults": 1
             })
             if data and data.get("items"):
-                return data["items"][0]["snippet"]["channelId"]
-        return handle_or_id  # assume it's already a channel ID
-
-    async def _get_live_streams(self, channel_ids: list) -> Dict[str, dict]:
-        if not channel_ids:
-            return {}
-        data = await self._api_get("search", {
-            "part": "snippet",
-            "channelId": ",".join(channel_ids),
-            "eventType": "live",
-            "type": "video",
-            "maxResults": 50
-        })
-        live = {}
-        if data and "items" in data:
-            for item in data["items"]:
-                cid = item["snippet"]["channelId"]
+                item = data["items"][0]
                 live[cid] = {
                     "video_id": item["id"]["videoId"],
                     "title": item["snippet"]["title"],
@@ -106,19 +107,14 @@ class YouTubeAlerts(commands.Cog):
         return live
 
     async def _get_latest_upload(self, channel_id: str) -> Optional[dict]:
-        # Get uploads playlist
-        data = await self._api_get("channels", {
-            "part": "contentDetails",
-            "id": channel_id
-        })
+        data = await self._api_get("channels", {"part": "contentDetails", "id": channel_id})
         if not data or not data.get("items"):
             return None
 
-        uploads_playlist = data["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
-
+        playlist_id = data["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
         data = await self._api_get("playlistItems", {
             "part": "snippet",
-            "playlistId": uploads_playlist,
+            "playlistId": playlist_id,
             "maxResults": 1
         })
         if data and data.get("items"):
@@ -127,29 +123,26 @@ class YouTubeAlerts(commands.Cog):
                 "video_id": item["snippet"]["resourceId"]["videoId"],
                 "title": item["snippet"]["title"],
                 "channel_title": item["snippet"]["channelTitle"],
-                "thumbnail": item["snippet"]["thumbnails"]["high"]["url"],
-                "published": item["snippet"]["publishedAt"]
+                "thumbnail": item["snippet"]["thumbnails"]["high"]["url"]
             }
         return None
 
     # ------------------------------------------------------------------ #
     # Background Task
     # ------------------------------------------------------------------ #
-    @tasks.loop(minutes=5)
+    @tasks.loop(seconds=300)
     async def check_youtube(self):
         all_guilds = await self.config.all_guilds()
         watched = set()
         for gconf in all_guilds.values():
-            for c in gconf.get("channels", []):
-                watched.add(c)
+            watched.update(gconf.get("channels", []))
 
         if not watched:
             return
 
-        # Resolve handles if needed (cache this in production)
         channel_ids = []
         for c in watched:
-            cid = await self._get_channel_id(c)
+            cid = await self._get_channel_id(c) or c
             if cid:
                 channel_ids.append(cid)
 
@@ -164,55 +157,45 @@ class YouTubeAlerts(commands.Cog):
             self._seeded = True
             return
 
-        # Announce new live streams
+        # Live announcements
         for cid, info in live.items():
             if self._seen_live.get(cid) == info["video_id"]:
                 continue
             self._seen_live[cid] = info["video_id"]
-            await self._announce_live(cid, info)
+            await self._announce(cid, info, is_live=True)
 
-        # Check uploads
+        # Upload announcements
         for cid in channel_ids:
             upload = await self._get_latest_upload(cid)
-            if not upload:
-                continue
-            if self._seen_uploads.get(cid) == upload["video_id"]:
+            if not upload or self._seen_uploads.get(cid) == upload["video_id"]:
                 continue
             self._seen_uploads[cid] = upload["video_id"]
-            await self._announce_upload(cid, upload)
+            await self._announce(cid, upload, is_live=False)
 
     @check_youtube.before_loop
     async def _before_check(self):
         await self.bot.wait_until_red_ready()
         interval = await self.config.interval()
-        self.check_youtube.change_interval(minutes=max(3, interval//60))
+        self.check_youtube.change_interval(seconds=max(180, interval))
 
     # ------------------------------------------------------------------ #
-    # Announcement Helpers
+    # Announcement
     # ------------------------------------------------------------------ #
     def _format(self, text: str, data: dict) -> str:
         try:
             return text.format(
-                channel=data.get("channel_title", "Unknown"),
+                channel=data.get("channel_title", "Unknown Channel"),
                 title=data.get("title", ""),
-                url=f"https://youtu.be/{data.get('video_id', '')}",
-                viewers=data.get("viewer_count", "N/A")
+                url=f"https://youtu.be/{data.get('video_id', '')}"
             )
-        except Exception:
+        except:
             return text
 
-    async def _announce_live(self, channel_id: str, data: dict):
-        await self._send_alert(channel_id, data, is_live=True)
-
-    async def _announce_upload(self, channel_id: str, data: dict):
-        await self._send_alert(channel_id, data, is_live=False)
-
-    async def _send_alert(self, channel_id: str, data: dict, is_live: bool):
+    async def _announce(self, channel_id: str, data: dict, is_live: bool):
         all_guilds = await self.config.all_guilds()
         for gid, gconf in all_guilds.items():
-            if channel_id not in [c for c in gconf.get("channels", [])]:
+            if channel_id not in gconf.get("channels", []):
                 continue
-
             ch_id = gconf.get("channel")
             if not ch_id:
                 continue
@@ -223,8 +206,8 @@ class YouTubeAlerts(commands.Cog):
             if not channel:
                 continue
 
-            msg_template = gconf.get("live_message" if is_live else "upload_message")
-            content = self._format(msg_template, data)
+            template = gconf.get("live_message" if is_live else "upload_message")
+            content = self._format(template, data)
 
             mention = gconf.get("mention")
             prefix = ""
@@ -244,13 +227,13 @@ class YouTubeAlerts(commands.Cog):
                 timestamp=datetime.now(timezone.utc),
             )
             embed.set_author(
-                name=f"{data.get('channel_title')} {'is live!' if is_live else 'uploaded a video'}",
+                name=f"{data.get('channel_title')} {'is LIVE!' if is_live else 'uploaded a video'}",
                 url=f"https://youtube.com/channel/{channel_id}"
             )
             if gconf.get("show_thumbnail", True) and data.get("thumbnail"):
                 embed.set_image(url=data["thumbnail"])
 
-            embed.add_field(name="Status", value="🔴 LIVE" if is_live else "📤 New Upload", inline=True)
+            embed.add_field(name="Type", value="🔴 LIVE" if is_live else "📤 Upload", inline=True)
 
             try:
                 await channel.send(
@@ -264,18 +247,18 @@ class YouTubeAlerts(commands.Cog):
     # ------------------------------------------------------------------ #
     # Commands
     # ------------------------------------------------------------------ #
-    @commands.group(aliases=["yalerts"])
+    @commands.group(aliases=["yalerts", "ytalerts"])
     async def youtubset(self, ctx: commands.Context):
-        """Configure YouTube live & upload alerts."""
+        """Configure YouTube alerts."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
 
     @youtubset.command(name="key")
     @commands.is_owner()
-    async def _key(self, ctx, api_key: str):
-        """Set your YouTube Data API v3 key."""
+    async def _key(self, ctx, *, api_key: str):
+        """Set YouTube Data API v3 key (owner only)."""
         await self.config.api_key.set(api_key.strip())
-        await ctx.send("YouTube API key set.")
+        await ctx.send("✅ YouTube API key saved.")
         if ctx.guild:
             try:
                 await ctx.message.delete()
@@ -284,79 +267,83 @@ class YouTubeAlerts(commands.Cog):
 
     @youtubset.command(name="interval")
     @commands.is_owner()
-    async def _interval(self, ctx, minutes: int):
-        """Set polling interval in minutes (min 3)."""
-        minutes = max(3, minutes)
-        await self.config.interval.set(minutes * 60)
-        self.check_youtube.change_interval(minutes=minutes)
-        await ctx.send(f"Polling every {minutes} minutes.")
+    async def _interval(self, ctx, seconds: int):
+        """Set polling interval (minimum 180 seconds)."""
+        seconds = max(180, seconds)
+        await self.config.interval.set(seconds)
+        self.check_youtube.change_interval(seconds=seconds)
+        await ctx.send(f"✅ Polling every {seconds} seconds.")
 
     @youtubset.command(name="channel")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _channel(self, ctx, channel: discord.TextChannel = None):
+        """Set alert channel."""
         channel = channel or ctx.channel
         await self.config.guild(ctx.guild).channel.set(channel.id)
-        await ctx.send(f"Alerts will post in {channel.mention}.")
+        await ctx.send(f"✅ Alerts will be sent to {channel.mention}.")
 
     @youtubset.command(name="add")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
-    async def _add(self, ctx, channel: str):
-        """Add a YouTube channel (Channel ID or @handle)."""
+    async def _add(self, ctx, *, identifier: str):
+        """Add a channel by ID or @handle."""
         if not await self.config.api_key():
             return await ctx.send("Set API key first with `[p]youtubset key`.")
 
-        cid = await self._get_channel_id(channel)
+        cid = await self._get_channel_id(identifier)
         if not cid:
-            return await ctx.send("Could not find that YouTube channel.")
+            return await ctx.send("❌ Could not find that YouTube channel.")
 
         async with self.config.guild(ctx.guild).channels() as chans:
             if cid in chans:
                 return await ctx.send("Already watching that channel.")
             chans.append(cid)
 
-        await ctx.send(f"Now watching **{cid}**.")
-        self._seeded = False  # Reseed
+        self._seeded = False
+        await ctx.send(f"✅ Now watching **{cid}**.")
 
-    @youtubset.command(name="remove")
+    @youtubset.command(name="remove", aliases=["del"])
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
-    async def _remove(self, ctx, channel: str):
+    async def _remove(self, ctx, channel_id: str):
         """Remove a watched channel."""
         async with self.config.guild(ctx.guild).channels() as chans:
-            if channel not in chans:
+            if channel_id not in chans:
                 return await ctx.send("Not watching that channel.")
-            chans.remove(channel)
-        await ctx.send("Stopped watching channel.")
+            chans.remove(channel_id)
+        await ctx.send(f"✅ Stopped watching **{channel_id}**.")
 
     @youtubset.command(name="list")
     @commands.guild_only()
     async def _list(self, ctx):
+        """List watched channels."""
         chans = await self.config.guild(ctx.guild).channels()
-        await ctx.send("Watching: " + ", ".join(chans) if chans else "Nobody yet.")
+        if not chans:
+            return await ctx.send("Not watching any channels yet.")
+        await ctx.send("Watching:\n" + "\n".join(f"• `{c}`" for c in chans))
 
     @youtubset.command(name="livemessage")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _livemessage(self, ctx, *, text: str):
-        """Set live alert message. Placeholders: {channel} {title} {url}"""
+        """Set live stream message. Placeholders: {channel} {title} {url}"""
         await self.config.guild(ctx.guild).live_message.set(text)
-        await ctx.send("Live message updated.")
+        await ctx.send("✅ Live message updated.")
 
     @youtubset.command(name="uploadmessage")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _uploadmessage(self, ctx, *, text: str):
-        """Set upload alert message."""
+        """Set upload message."""
         await self.config.guild(ctx.guild).upload_message.set(text)
-        await ctx.send("Upload message updated.")
+        await ctx.send("✅ Upload message updated.")
 
     @youtubset.command(name="mention")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _mention(self, ctx, value: str = "none"):
-        """Set ping: role, everyone, here, or none."""
+        """Set mention: everyone, here, role, or none."""
         value = value.lower()
         if value == "none":
             await self.config.guild(ctx.guild).mention.set(None)
@@ -369,16 +356,17 @@ class YouTubeAlerts(commands.Cog):
             await self.config.guild(ctx.guild).mention.set(role.id)
             await ctx.send(f"Will ping {role.name}.")
         except commands.BadArgument:
-            await ctx.send("Invalid role.")
+            await ctx.send("Invalid input.")
 
-    @youtubset.command(name="color")
+    @youtubset.command(name="color", aliases=["colour"])
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _color(self, ctx, hex_color: str):
+        """Set embed color (e.g. #FF0000)."""
         try:
             value = int(hex_color.lstrip("#"), 16)
             await self.config.guild(ctx.guild).color.set(value)
-            await ctx.send(embed=discord.Embed(description="Color updated.", color=value))
+            await ctx.send(embed=discord.Embed(description="✅ Embed color updated.", color=value))
         except ValueError:
             await ctx.send("Invalid hex color.")
 
@@ -386,13 +374,41 @@ class YouTubeAlerts(commands.Cog):
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _test(self, ctx, channel: str = None):
-        """Test alert with sample data."""
-        # Implementation similar to Twitch one - omitted for brevity but included in full version
-        await ctx.send("Test command ready (sample live/upload preview).")
+        """Send a test alert."""
+        gconf = await self.config.guild(ctx.guild).all()
+        if not gconf["channels"]:
+            return await ctx.send("Add a channel first.")
 
-    @youtubset.command(name="settings")
+        test_data = {
+            "video_id": "dQw4w9wgxcq",
+            "title": "Test Video / Live Stream",
+            "channel_title": "Test Channel",
+            "thumbnail": "https://i.ytimg.com/vi/dQw4w9wgxcq/maxresdefault.jpg"
+        }
+
+        await ctx.send("**YouTubeAlerts Test** (Live Style)")
+        await self._announce(gconf["channels"][0], test_data, is_live=True)
+
+        await ctx.send("**YouTubeAlerts Test** (Upload Style)")
+        await self._announce(gconf["channels"][0], test_data, is_live=False)
+
+    @youtubset.command(name="settings", aliases=["show"])
     @commands.guild_only()
     async def _settings(self, ctx):
-        """Show current settings."""
-        # Similar embed output as Twitch cog
-        await ctx.send("Settings command ready.")
+        """Show current configuration."""
+        g = await self.config.guild(ctx.guild).all()
+        key_set = "✅ Set" if await self.config.api_key() else "❌ Not set"
+        ch = ctx.guild.get_channel(g["channel"])
+        mention = g["mention"]
+        if isinstance(mention, int):
+            role = ctx.guild.get_role(mention)
+            mention = role.name if role else "deleted"
+
+        embed = discord.Embed(title="YouTubeAlerts Settings", color=g["color"])
+        embed.add_field(name="API Key", value=key_set, inline=True)
+        embed.add_field(name="Alert Channel", value=ch.mention if ch else "Not set", inline=True)
+        embed.add_field(name="Mention", value=mention or "None", inline=True)
+        embed.add_field(name="Watching", value=", ".join(g["channels"]) or "None", inline=False)
+        embed.add_field(name="Live Message", value=g["live_message"][:200] + "..." if len(g["live_message"]) > 200 else g["live_message"], inline=False)
+        embed.add_field(name="Upload Message", value=g["upload_message"][:200] + "..." if len(g["upload_message"]) > 200 else g["upload_message"], inline=False)
+        await ctx.send(embed=embed)
