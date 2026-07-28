@@ -1,10 +1,11 @@
+import logging
 import os
 import random
 
 from discord import Embed, File
 from redbot.core import Config, bank, commands
 
-from .casino_core import mark_played, record_game, safe_deposit, validate_bet
+from .casino_core import mark_played, refund_wager, settle_game, validate_bet
 
 
 class CoinFlip(commands.Cog):
@@ -16,6 +17,7 @@ class CoinFlip(commands.Cog):
         self.CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
     @commands.command()
+    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
     async def coinflip(self, ctx, side: str, bet: int):
         """Bet on heads or tails."""
         side = side.lower()
@@ -32,30 +34,50 @@ class CoinFlip(commands.Cog):
         except ValueError:
             return await ctx.send("Your balance changed before the wager could be placed. Try again.")
 
-        result = random.choice(("heads", "tails"))
-        won = result == side
-        payout = bet * 2 if won else 0
-        deposited = await safe_deposit(ctx.author, payout)
+        settled = False
+        try:
+            result = random.choice(("heads", "tails"))
+            won = result == side
+            payout = bet * 2 if won else 0
+            settlement = await settle_game(
+                ctx.author, "coinflip", bet, payout, "win" if won else "loss"
+            )
+            settled = True
 
-        image_path = os.path.join(os.path.dirname(__file__), "cards", f"{result}.png")
-        file = File(image_path, filename="coin.png")
-        embed = Embed(title="🪙 Coin Flip", description=f"You bet **{bet:,}** on **{side.title()}**.")
-        embed.add_field(name="Result", value=f"**{result.title()}**", inline=False)
-        if won:
-            text = f"🎉 Returned **{deposited:,}** CrewCoin (net **+{deposited - bet:,}**)."
-        else:
-            text = f"💸 You lost **{bet:,}** CrewCoin."
-        embed.add_field(name="Outcome", value=text, inline=False)
-        embed.set_image(url="attachment://coin.png")
-        await ctx.send(embed=embed, file=file)
+            cfg = self.CONFIG.user(ctx.author)
+            await cfg.total_cf_bet.set(await cfg.total_cf_bet() + bet)
+            if won:
+                await cfg.total_cf_wins.set(await cfg.total_cf_wins() + 1)
+            else:
+                await cfg.total_cf_losses.set(await cfg.total_cf_losses() + 1)
 
-        cfg = self.CONFIG.user(ctx.author)
-        await cfg.total_cf_bet.set(await cfg.total_cf_bet() + bet)
-        if won:
-            await cfg.total_cf_wins.set(await cfg.total_cf_wins() + 1)
-        else:
-            await cfg.total_cf_losses.set(await cfg.total_cf_losses() + 1)
-        await record_game(ctx.author, "coinflip", bet, deposited, "win" if won else "loss")
+            image_path = os.path.join(os.path.dirname(__file__), "cards", f"{result}.png")
+            file = File(image_path, filename="coin.png")
+            embed = Embed(title="🪙 Coin Flip", description=f"You bet **{bet:,}** on **{side.title()}**.")
+            embed.add_field(name="Result", value=f"**{result.title()}**", inline=False)
+            if won:
+                text = (
+                    f"🎉 Returned **{settlement.deposited:,}** CrewCoin "
+                    f"(net **{settlement.deposited - bet:+,}**)."
+                )
+                if settlement.capped:
+                    text += " Your payout was limited by the bank balance cap."
+            else:
+                text = f"💸 You lost **{bet:,}** CrewCoin."
+            embed.add_field(name="Outcome", value=text, inline=False)
+            embed.set_image(url="attachment://coin.png")
+            await ctx.send(embed=embed, file=file)
+        except Exception:
+            if not settled:
+                await refund_wager(ctx.author, "coinflip", bet, reason="command failure before settlement")
+            logging.getLogger("red.crewcogs.casino.coinflip").exception(
+                "Coin Flip failed for user %s", ctx.author.id
+            )
+            await ctx.send(
+                "Coin Flip settled, but the result message or legacy stats failed."
+                if settled
+                else "Coin Flip hit an unexpected error. The unsettled wager was refunded."
+            )
 
     @commands.command()
     async def cfstats(self, ctx):

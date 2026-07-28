@@ -10,9 +10,7 @@ from typing import Dict, List, Optional, TypedDict
 import discord
 from PIL import Image
 from redbot.core import Config, bank, commands
-from redbot.core.errors import BalanceTooHigh
-
-from .casino_core import mark_played, record_game, validate_bet
+from .casino_core import mark_played, refund_wager, settle_game, validate_bet
 
 
 CONFIG = Config.get_conf(None, identifier=1234567890)
@@ -149,21 +147,6 @@ class Blackjack(commands.Cog):
     def _lock_for(self, user_id: int) -> asyncio.Lock:
         return self._locks.setdefault(user_id, asyncio.Lock())
 
-    async def _safe_deposit(self, member: discord.Member, amount: int) -> int:
-        """Deposit up to the user's maximum balance and return the amount deposited."""
-        if amount <= 0:
-            return 0
-
-        try:
-            await bank.deposit_credits(member, amount)
-            return amount
-        except BalanceTooHigh as exc:
-            current = await bank.get_balance(member)
-            room = max(0, exc.max_balance - current)
-            if room:
-                await bank.deposit_credits(member, room)
-            return room
-
     async def _edit_expired_message(self, game: GameState, view: BlackjackView) -> None:
         message = game.get("message") or view.message
         if message is None:
@@ -219,7 +202,7 @@ class Blackjack(commands.Cog):
                 view.message = message
             except Exception:
                 self.games.pop(user_id, None)
-                refunded = await self._safe_deposit(ctx.author, bet)
+                refunded = await refund_wager(ctx.author, "blackjack", bet, reason="failed to create game message")
                 self.log.exception("Failed to start blackjack for user %s", user_id)
                 await ctx.send(
                     "The hand could not be created. "
@@ -337,7 +320,7 @@ class Blackjack(commands.Cog):
 
             game["settled"] = True
             bet = game["bet"]
-            deposited = await self._safe_deposit(ctx.author, bet)
+            deposited = await refund_wager(ctx.author, "blackjack", bet, reason="hand timeout")
             self.games.pop(user_id, None)
 
         await self._edit_expired_message(game, view)
@@ -389,7 +372,6 @@ class Blackjack(commands.Cog):
             outcome = "loss"
             if busted or player_value < dealer_value <= 21:
                 result = f"You lose! Dealer: {' '.join(format_card(card) for card in dealer_hand)} ({dealer_value})."
-                await user_config.total_losses.set(await user_config.total_losses() + 1)
             elif player_value > dealer_value or dealer_value > 21:
                 payout = bet * 2
                 outcome = "win"
@@ -397,7 +379,6 @@ class Blackjack(commands.Cog):
                     f"You win! Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
                     f"({dealer_value}). You earned {payout:,} CrewCoin."
                 )
-                await user_config.total_wins.set(await user_config.total_wins() + 1)
             else:
                 payout = bet
                 outcome = "push"
@@ -406,9 +387,16 @@ class Blackjack(commands.Cog):
                     f"({dealer_value}). Your bet was returned."
                 )
 
-            deposited = await self._safe_deposit(ctx.author, payout)
-            await user_config.total_bet.set(await user_config.total_bet() + bet)
-            await record_game(ctx.author, "blackjack", bet, deposited, outcome)
+            settlement = await settle_game(ctx.author, "blackjack", bet, payout, outcome)
+            deposited = settlement.deposited
+            try:
+                await user_config.total_bet.set(await user_config.total_bet() + bet)
+                if outcome == "win":
+                    await user_config.total_wins.set(await user_config.total_wins() + 1)
+                elif outcome == "loss":
+                    await user_config.total_losses.set(await user_config.total_losses() + 1)
+            except Exception:
+                self.log.exception("Failed to update legacy blackjack stats for user %s", user_id)
             self.games.pop(user_id, None)
 
         try:

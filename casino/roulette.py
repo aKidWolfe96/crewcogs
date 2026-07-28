@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import random
 import tempfile
@@ -9,7 +10,7 @@ import discord
 from PIL import Image, ImageDraw, ImageFont
 from redbot.core import Config, bank, commands
 
-from .casino_core import mark_played, record_game, safe_deposit, validate_bet
+from .casino_core import mark_played, refund_wager, settle_game, validate_bet
 
 ROULETTE_CONFIG_ID = 8642097531
 WHEEL_ORDER = ["0", "28", "9", "26", "30", "11", "7", "20", "32", "17", "5", "22", "34", "15", "3", "24", "36", "13", "1", "00", "27", "10", "25", "29", "12", "8", "19", "31", "18", "6", "21", "33", "16", "4", "23", "35", "14", "2"]
@@ -76,6 +77,7 @@ class Roulette(commands.Cog):
         self.active_players = set()
 
     @commands.command(aliases=["roul"])
+    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
     async def roulette(self, ctx: commands.Context, bet: int, choice: str):
         if ctx.author.id in self.active_players:
             return await ctx.send("You already have a roulette spin in progress.")
@@ -105,8 +107,10 @@ class Roulette(commands.Cog):
 
             won = is_winner(parsed_bet, winning_pocket)
             payout = bet * payout_multiplier(parsed_bet) if won else 0
-            deposited = await safe_deposit(ctx.author, payout)
             outcome = "win" if won else "loss"
+            settlement = await settle_game(ctx.author, "roulette", bet, payout, outcome)
+            deposited = settlement.deposited
+            settled = True
 
             cfg = self.config.user(ctx.author)
             await cfg.total_roulette_bet.set(await cfg.total_roulette_bet() + bet)
@@ -116,9 +120,6 @@ class Roulette(commands.Cog):
                     await cfg.biggest_roulette_win.set(deposited)
             else:
                 await cfg.total_roulette_losses.set(await cfg.total_roulette_losses() + 1)
-            await record_game(ctx.author, "roulette", bet, deposited, outcome)
-            settled = True
-
             result_path = self._make_result_image(winning_index)
             color_name = pocket_color(winning_pocket)
             emoji = {"red":"🔴", "black":"⚫", "green":"🟢"}[color_name]
@@ -134,8 +135,15 @@ class Roulette(commands.Cog):
             await message.edit(embed=result_embed, attachments=[result_file])
         except Exception:
             if withdrawn and not settled:
-                await safe_deposit(ctx.author, bet)
-            raise
+                await refund_wager(ctx.author, "roulette", bet, reason="command failure before settlement")
+            logging.getLogger("red.crewcogs.casino.roulette").exception(
+                "Roulette failed for user %s", ctx.author.id
+            )
+            await ctx.send(
+                "Roulette settled, but the result message or legacy stats failed."
+                if settled
+                else "Roulette hit an unexpected error. The unsettled wager was refunded."
+            )
         finally:
             self.active_players.discard(ctx.author.id)
             for path in (animation_path, result_path):

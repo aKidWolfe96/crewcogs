@@ -4,7 +4,7 @@ from pathlib import Path
 import discord
 from redbot.core import bank, commands
 
-from .casino_core import record_game, safe_deposit
+from .casino_core import safe_deposit, settle_game
 
 
 class DailySpin(commands.Cog):
@@ -18,6 +18,7 @@ class DailySpin(commands.Cog):
         )
 
     @commands.command()
+    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
     @commands.guild_only()
     async def dailyspin(self, ctx: commands.Context):
         """Claim daily CrewCoin or risk it in a higher/lower dice game."""
@@ -77,7 +78,7 @@ class DailySpin(commands.Cog):
         await ctx.send(file=second_file, content=f"🎲 Second roll: **{second}**")
 
         if second == first:
-            await record_game(
+            settlement = await settle_game(
                 ctx.author,
                 "dailyspin",
                 wager=amount,
@@ -85,7 +86,10 @@ class DailySpin(commands.Cog):
                 outcome="push",
                 include_economy=False,
             )
-            return await ctx.send("😐 It's a tie! No win and no loss.")
+            text = f"😐 It's a tie! Your **{settlement.deposited:,} CrewCoin** reward was returned."
+            if settlement.capped:
+                text += " The bank balance cap limited the deposit."
+            return await ctx.send(text)
 
         correct = (
             guess.content.lower() == "higher" and second > first
@@ -95,20 +99,20 @@ class DailySpin(commands.Cog):
 
         if correct:
             payout = amount * 2
-            deposited = await safe_deposit(ctx.author, payout)
-            await record_game(
+            settlement = await settle_game(
                 ctx.author,
                 "dailyspin",
                 wager=amount,
-                payout=deposited,
+                payout=payout,
                 outcome="win",
                 include_economy=False,
             )
-            await ctx.send(
-                f"🔥 You won the gamble! **{deposited:,} CrewCoin** was added to your balance."
-            )
+            text = f"🔥 You won the gamble! **{settlement.deposited:,} CrewCoin** was added to your balance."
+            if settlement.capped:
+                text += " The bank balance cap limited the deposit."
+            await ctx.send(text)
         else:
-            await record_game(
+            await settle_game(
                 ctx.author,
                 "dailyspin",
                 wager=amount,
