@@ -10,12 +10,13 @@ from redbot.core import Config, bank
 from redbot.core.errors import BalanceTooHigh
 
 CASINO_CONFIG_ID = 2468135790
-ACTIVE_GAMES = ("blackjack", "coinflip", "slots", "roulette")
+ACTIVE_GAMES = ("blackjack", "coinflip", "slots", "roulette", "highlow")
 DEFAULT_GAME_SETTINGS = {
     "blackjack": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 3},
     "coinflip": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 3},
     "slots": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 3},
     "roulette": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 5},
+    "highlow": {"enabled": True, "min_bet": 1, "max_bet": 0, "payout_cap": 0, "cooldown": 3},
 }
 
 CONFIG = Config.get_conf(None, identifier=CASINO_CONFIG_ID, force_registration=True)

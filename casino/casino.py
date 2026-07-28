@@ -164,7 +164,9 @@ class Casino(commands.Cog):
             setting = dict(DEFAULT_GAME_SETTINGS[game])
             setting.update(games.get(game, {}))
             maximum = f"{setting['max_bet']:,}" if setting["max_bet"] else "Unlimited"
-            lines.append(f"**{game.title()}** — {'Enabled' if setting['enabled'] else 'Disabled'} | Min: {setting['min_bet']:,} | Max: {maximum} | Cooldown: {setting['cooldown']}s")
+            payout_cap = setting.get("payout_cap", 0)
+            cap_text = f" | Payout cap: {payout_cap:,}" if payout_cap else (" | Payout cap: Unlimited" if "payout_cap" in setting else "")
+            lines.append(f"**{game.title()}** — {'Enabled' if setting['enabled'] else 'Disabled'} | Min: {setting['min_bet']:,} | Max: {maximum}{cap_text} | Cooldown: {setting['cooldown']}s")
         await ctx.send(embed=discord.Embed(title="⚙️ Casino Settings", description="\n".join(lines), color=discord.Color.gold()))
 
     async def _set_value(self, ctx, game: str, key: str, value):
@@ -188,6 +190,19 @@ class Casino(commands.Cog):
         if amount < 0:
             return await ctx.send("Maximum bet cannot be negative. Use 0 for unlimited.")
         await self._set_value(ctx, game, "max_bet", amount)
+
+
+    @casino.command(name="setpayoutcap", aliases=["setcap"])
+    @checks.admin_or_permissions(manage_guild=True)
+    async def setpayoutcap(self, ctx, game: str, amount: int):
+        game = game.lower()
+        if game not in ACTIVE_GAMES:
+            return await ctx.send(f"Game must be one of: {', '.join(ACTIVE_GAMES)}")
+        if "payout_cap" not in DEFAULT_GAME_SETTINGS[game]:
+            return await ctx.send(f"**{game.title()}** does not use a configurable payout cap.")
+        if amount < 0:
+            return await ctx.send("Payout cap cannot be negative. Use 0 for unlimited.")
+        await self._set_value(ctx, game, "payout_cap", amount)
 
     @casino.command(name="setcooldown")
     @checks.admin_or_permissions(manage_guild=True)
