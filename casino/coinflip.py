@@ -22,7 +22,7 @@ class CoinFlip(commands.Cog):
         """Bet on heads or tails."""
         side = side.lower()
         if side not in ("heads", "tails"):
-            return await ctx.send("Choose either `heads` or `tails`.")
+            return await ctx.send("Ruthless Dealer says to choose either `heads` or `tails`.")
 
         error = await validate_bet(ctx, "coinflip", bet)
         if error:
@@ -32,7 +32,7 @@ class CoinFlip(commands.Cog):
             await bank.withdraw_credits(ctx.author, bet)
             mark_played(ctx.guild.id, ctx.author.id, "coinflip")
         except ValueError:
-            return await ctx.send("Your balance changed before the wager could be placed. Try again.")
+            return await ctx.send("Ruthless Dealer could not place the wager because your balance changed. Try again.")
 
         settled = False
         try:
@@ -53,7 +53,7 @@ class CoinFlip(commands.Cog):
 
             image_path = os.path.join(os.path.dirname(__file__), "cards", f"{result}.png")
             file = File(image_path, filename="coin.png")
-            embed = Embed(title="🪙 Coin Flip", description=f"You bet **{bet:,}** on **{side.title()}**.")
+            embed = Embed(title="🪙 Ruthless Dealer • Coin Flip", description=f"You bet **{bet:,}** on **{side.title()}**.")
             embed.add_field(name="Result", value=f"**{result.title()}**", inline=False)
             if won:
                 text = (
@@ -74,16 +74,16 @@ class CoinFlip(commands.Cog):
                 "Coin Flip failed for user %s", ctx.author.id
             )
             await ctx.send(
-                "Coin Flip settled, but the result message or legacy stats failed."
+                "Ruthless Dealer’s Coin Flip settled, but the result message or legacy stats failed."
                 if settled
-                else "Coin Flip hit an unexpected error. The unsettled wager was refunded."
+                else "Ruthless Dealer’s Coin Flip hit an unexpected error. The unsettled wager was refunded."
             )
 
     @commands.command()
     async def cfstats(self, ctx):
         """Show your legacy coinflip stats."""
         data = await self.CONFIG.user(ctx.author).all()
-        await ctx.send(f"Coinflip Wins: {data['total_cf_wins']}, Losses: {data['total_cf_losses']}, Bet total: {data['total_cf_bet']:,}")
+        await ctx.send(f"Ruthless Dealer Coin Flip — Wins: {data['total_cf_wins']}, Losses: {data['total_cf_losses']}, Bet total: {data['total_cf_bet']:,}")
 
 
 async def setup(bot):

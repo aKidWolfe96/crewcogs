@@ -208,7 +208,7 @@ class HighLow(commands.Cog):
     ) -> discord.Embed:
         multiplier = MULTIPLIERS[view.streak - 1] if view.streak else 0
         return_amount = f"{view.current_payout:,}" if view.streak else "—"
-        embed = discord.Embed(title="🃏 High/Low", description=description, color=color)
+        embed = discord.Embed(title="🃏 Ruthless Dealer • High/Low", description=description, color=color)
         embed.add_field(name="Current Card", value=format_card(view.current), inline=False)
         embed.add_field(name="Wager", value=f"**{view.bet:,}**", inline=True)
         embed.add_field(name="Streak", value=f"**{view.streak}/{MAX_STREAK}**", inline=True)
@@ -226,7 +226,7 @@ class HighLow(commands.Cog):
     async def highlow(self, ctx: commands.Context, bet: int):
         """Start a seven-step card High/Low game."""
         if ctx.author.id in self.active_players:
-            return await ctx.send("You already have a High/Low game in progress.")
+            return await ctx.send("Ruthless Dealer says you already have a High/Low game in progress.")
         error = await validate_bet(ctx, GAME, bet)
         if error:
             return await ctx.send(error)
@@ -249,7 +249,7 @@ class HighLow(commands.Cog):
             if withdrawn:
                 await refund_wager(ctx.author, GAME, bet, reason="High/Low failed before interaction began")
             self.active_players.discard(ctx.author.id)
-            await ctx.send("High/Low could not start. Any withdrawn wager was refunded.")
+            await ctx.send("Ruthless Dealer could not start High/Low. Any withdrawn wager was refunded.")
 
     @commands.command(name="highlowpayouts", aliases=["hlpayouts"])
     async def highlowpayouts(self, ctx: commands.Context):
@@ -257,7 +257,7 @@ class HighLow(commands.Cog):
         settings = await get_game_settings(ctx.guild, GAME) if ctx.guild else {"payout_cap": 0}
         cap = settings.get("payout_cap", 0)
         lines.append(f"\n**Configured payout cap:** {cap:,}" if cap else "\n**Configured payout cap:** Unlimited")
-        await ctx.send(embed=discord.Embed(title="🃏 High/Low Payout Ladder", description="\n".join(lines), color=discord.Color.gold()))
+        await ctx.send(embed=discord.Embed(title="🃏 Ruthless Dealer • High/Low Payout Ladder", description="\n".join(lines), color=discord.Color.gold()))
 
 
 async def setup(bot):

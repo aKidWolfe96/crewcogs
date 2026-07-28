@@ -152,7 +152,7 @@ class Blackjack(commands.Cog):
         if message is None:
             return
 
-        embed = message.embeds[0].copy() if message.embeds else discord.Embed(title="Blackjack")
+        embed = message.embeds[0].copy() if message.embeds else discord.Embed(title="🃏 Ruthless Dealer • Blackjack")
         embed.description = "⏱️ This hand expired. The wager was refunded."
         with suppress(discord.HTTPException, discord.NotFound):
             await message.edit(embed=embed, view=view)
@@ -165,7 +165,7 @@ class Blackjack(commands.Cog):
         async with self._lock_for(user_id):
             existing = self.games.get(user_id)
             if existing and not existing.get("settled", False):
-                await ctx.send("You already have an active blackjack hand. Finish it before starting another.")
+                await ctx.send("Ruthless Dealer says you already have an active blackjack hand. Finish it before starting another.")
                 return
 
             error = await validate_bet(ctx, "blackjack", bet)
@@ -177,7 +177,7 @@ class Blackjack(commands.Cog):
                 await bank.withdraw_credits(ctx.author, bet)
                 mark_played(ctx.guild.id, ctx.author.id, "blackjack")
             except ValueError:
-                await ctx.send("Your balance changed before the wager could be placed. Try again.")
+                await ctx.send("Ruthless Dealer could not place the wager because your balance changed. Try again.")
                 return
 
             deck = make_deck()
@@ -277,14 +277,14 @@ class Blackjack(commands.Cog):
                 else f"{format_card(dealer_hand[0])} ??"
             )
 
-            embed = discord.Embed(title="Blackjack")
+            embed = discord.Embed(title="🃏 Ruthless Dealer • Blackjack")
             embed.add_field(
                 name="Your Hand",
                 value=f"{player_text} ({hand_value(player_hand)})",
                 inline=False,
             )
             embed.add_field(
-                name="Dealer Shows",
+                name="Ruthless Dealer Shows",
                 value=dealer_text if start else f"{dealer_text} ({hand_value(dealer_hand)})",
                 inline=False,
             )
@@ -371,19 +371,19 @@ class Blackjack(commands.Cog):
             payout = 0
             outcome = "loss"
             if busted or player_value < dealer_value <= 21:
-                result = f"You lose! Dealer: {' '.join(format_card(card) for card in dealer_hand)} ({dealer_value})."
+                result = f"You lose! Ruthless Dealer: {' '.join(format_card(card) for card in dealer_hand)} ({dealer_value})."
             elif player_value > dealer_value or dealer_value > 21:
                 payout = bet * 2
                 outcome = "win"
                 result = (
-                    f"You win! Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
+                    f"You win! Ruthless Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
                     f"({dealer_value}). You earned {payout:,} CrewCoin."
                 )
             else:
                 payout = bet
                 outcome = "push"
                 result = (
-                    f"Push! Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
+                    f"Push! Ruthless Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
                     f"({dealer_value}). Your bet was returned."
                 )
 

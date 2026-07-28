@@ -80,10 +80,10 @@ class Roulette(commands.Cog):
     @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
     async def roulette(self, ctx: commands.Context, bet: int, choice: str):
         if ctx.author.id in self.active_players:
-            return await ctx.send("You already have a roulette spin in progress.")
+            return await ctx.send("Ruthless Dealer says you already have a Krew Roulette spin in progress.")
         parsed_bet = parse_bet(choice)
         if parsed_bet is None:
-            return await ctx.send("Invalid bet. Use 0–36, 00, red, black, odd, even, low, high, 1st12, 2nd12, 3rd12, or column1–3.")
+            return await ctx.send("Ruthless Dealer rejected that Krew Roulette bet. Use 0–36, 00, red, black, odd, even, low, high, 1st12, 2nd12, 3rd12, or column1–3.")
         error = await validate_bet(ctx, "roulette", bet)
         if error:
             return await ctx.send(error)
@@ -99,7 +99,7 @@ class Roulette(commands.Cog):
             winning_pocket = random.choice(WHEEL_ORDER)
             winning_index = WHEEL_ORDER.index(winning_pocket)
             animation_path = self._make_spin_gif(winning_index)
-            embed = discord.Embed(title="🎡 Roulette", description=f"**{ctx.author.display_name}** bet **{bet:,}** on **{display_bet(parsed_bet)}**.\n\nThe wheel is spinning...", color=discord.Color.gold())
+            embed = discord.Embed(title="🎡 Ruthless Dealer • Krew Roulette", description=f"**{ctx.author.display_name}** bet **{bet:,}** on **{display_bet(parsed_bet)}**.\n\nRuthless Dealer is spinning the wheel...", color=discord.Color.gold())
             file = discord.File(animation_path, filename="roulette_spin.gif")
             embed.set_image(url="attachment://roulette_spin.gif")
             message = await ctx.send(embed=embed, file=file)
@@ -129,7 +129,7 @@ class Roulette(commands.Cog):
             else:
                 result_text = f"💸 **You lost.**\nLoss: **{bet:,}** CrewCoin"
                 embed_color = discord.Color.red()
-            result_embed = discord.Embed(title="🎡 Roulette Result", description=f"The ball landed on {emoji} **{winning_pocket} {color_name.title()}**.\n\nYour bet: **{display_bet(parsed_bet)}** for **{bet:,}** CrewCoin\n\n{result_text}", color=embed_color)
+            result_embed = discord.Embed(title="🎡 Krew Roulette Result • Ruthless Dealer", description=f"The ball landed on {emoji} **{winning_pocket} {color_name.title()}**.\n\nYour bet: **{display_bet(parsed_bet)}** for **{bet:,}** CrewCoin\n\n{result_text}", color=embed_color)
             result_file = discord.File(result_path, filename="roulette_result.png")
             result_embed.set_image(url="attachment://roulette_result.png")
             await message.edit(embed=result_embed, attachments=[result_file])
@@ -140,9 +140,9 @@ class Roulette(commands.Cog):
                 "Roulette failed for user %s", ctx.author.id
             )
             await ctx.send(
-                "Roulette settled, but the result message or legacy stats failed."
+                "Krew Roulette settled, but Ruthless Dealer could not post the result or update legacy stats."
                 if settled
-                else "Roulette hit an unexpected error. The unsettled wager was refunded."
+                else "Krew Roulette hit an unexpected error. Ruthless Dealer refunded the unsettled wager."
             )
         finally:
             self.active_players.discard(ctx.author.id)
@@ -153,14 +153,14 @@ class Roulette(commands.Cog):
     @commands.command()
     async def roulettebets(self, ctx):
         description = "**Straight number** — `0`, `00`, or `1–36`: **35:1**\n**Color** — `red` or `black`: **1:1**\n**Parity** — `odd` or `even`: **1:1**\n**Range** — `low` or `high`: **1:1**\n**Dozens** — `1st12`, `2nd12`, `3rd12`: **2:1**\n**Columns** — `column1`, `column2`, `column3`: **2:1**"
-        await ctx.send(embed=discord.Embed(title="🎡 Roulette Bets", description=description, color=discord.Color.gold()))
+        await ctx.send(embed=discord.Embed(title="🎡 Ruthless Dealer • Krew Roulette Bets", description=description, color=discord.Color.gold()))
 
     @commands.command()
     async def roulettestats(self, ctx):
         data = await self.config.user(ctx.author).all()
         games = data["total_roulette_wins"] + data["total_roulette_losses"]
         rate = data["total_roulette_wins"] / games * 100 if games else 0
-        embed = discord.Embed(title=f"🎡 {ctx.author.display_name}'s Roulette Stats", color=discord.Color.gold())
+        embed = discord.Embed(title=f"🎡 Ruthless Dealer • {ctx.author.display_name}'s Krew Roulette Stats", color=discord.Color.gold())
         embed.add_field(name="Record", value=f"Wins: **{data['total_roulette_wins']:,}**\nLosses: **{data['total_roulette_losses']:,}**\nWin rate: **{rate:.1f}%**")
         embed.add_field(name="Wagering", value=f"Total bet: **{data['total_roulette_bet']:,}**\nBiggest return: **{data['biggest_roulette_win']:,}**")
         await ctx.send(embed=embed)
@@ -204,7 +204,7 @@ class Roulette(commands.Cog):
             draw.text((x-(box[2]-box[0])/2, y-(box[3]-box[1])/2), pocket, fill="white", font=font)
         draw.ellipse((center-inner_radius, center-inner_radius, center+inner_radius, center+inner_radius), fill=(195,151,55,255), outline=(245,220,145,255), width=4)
         draw.ellipse((center-82, center-82, center+82, center+82), fill=(49,55,62,255))
-        label = "CREW\nROULETTE"
+        label = "KREW\nROULETTE"
         box = draw.multiline_textbbox((0,0), label, font=center_font, align="center")
         draw.multiline_text((center-(box[2]-box[0])/2, center-(box[3]-box[1])/2), label, font=center_font, fill="white", align="center")
         draw.polygon([(center,10),(center-18,48),(center+18,48)], fill=(245,205,68,255), outline="white")

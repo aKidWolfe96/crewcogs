@@ -12,7 +12,7 @@ from .casino_core import CONFIG, safe_deposit
 # Five early/mid-game title achievements award credits. Five prestige titles are
 # cosmetic bragging rights. The other ten achievements award permanent badges.
 ACHIEVEMENTS: Tuple[dict, ...] = (
-    {"id":"first_steps","emoji":"🎲","name":"First Steps","description":"Play 50 casino games.","stat":"total_games","goal":50,"reward":5000,"title":"🎲 Regular"},
+    {"id":"first_steps","emoji":"🎲","name":"First Steps","description":"Play 50 Ruthless Dealer casino games.","stat":"total_games","goal":50,"reward":5000,"title":"🎲 Regular"},
     {"id":"high_roller","emoji":"💵","name":"High Roller","description":"Wager 100,000 total.","stat":"total_wagered","goal":100000,"reward":10000,"title":"💵 High Roller"},
     {"id":"jackpot_hunter","emoji":"🎰","name":"Jackpot Hunter","description":"Record a single payout of 25,000 or more.","stat":"biggest_payout","goal":25000,"reward":15000,"title":"🎰 Jackpot Hunter"},
     {"id":"card_shark","emoji":"🃏","name":"Card Shark","description":"Reach seven correct guesses in High/Low.","stat":"best_highlow_streak","goal":7,"reward":20000,"title":"🃏 Card Shark"},
@@ -21,9 +21,9 @@ ACHIEVEMENTS: Tuple[dict, ...] = (
     {"id":"whale","emoji":"🐋","name":"Whale","description":"Wager 1,000,000 total.","stat":"total_wagered","goal":1000000,"reward":0,"title":"🐋 Whale"},
     {"id":"blackjack_pro","emoji":"♠️","name":"Blackjack Pro","description":"Win 100 Blackjack hands.","stat":"games.blackjack.wins","goal":100,"reward":0,"title":"♠️ Blackjack Pro"},
     {"id":"coin_king","emoji":"🪙","name":"Coin King","description":"Win 100 Coin Flip games.","stat":"games.coinflip.wins","goal":100,"reward":0,"title":"🪙 Coin King"},
-    {"id":"casino_legend","emoji":"👑","name":"Casino Legend","description":"Unlock the other 19 achievements.","stat":"achievement_count","goal":19,"reward":0,"title":"👑 Casino Legend"},
-    {"id":"seasoned_player","emoji":"🏦","name":"Seasoned Player","description":"Play 500 casino games.","stat":"total_games","goal":500,"reward":0},
-    {"id":"lucky_devil","emoji":"🍀","name":"Lucky Devil","description":"Win 250 casino games.","stat":"wins","goal":250,"reward":0},
+    {"id":"casino_legend","emoji":"👑","name":"Ruthless Casino Legend","description":"Unlock the other 19 achievements.","stat":"achievement_count","goal":19,"reward":0,"title":"👑 Casino Legend"},
+    {"id":"seasoned_player","emoji":"🏦","name":"Seasoned Player","description":"Play 500 Ruthless Dealer casino games.","stat":"total_games","goal":500,"reward":0},
+    {"id":"lucky_devil","emoji":"🍀","name":"Lucky Devil","description":"Win 250 Ruthless Dealer casino games.","stat":"wins","goal":250,"reward":0},
     {"id":"wheel_regular","emoji":"🎡","name":"Wheel Regular","description":"Win 75 Roulette games.","stat":"games.roulette.wins","goal":75,"reward":0},
     {"id":"slot_regular","emoji":"💎","name":"Reel Regular","description":"Win 75 Slots games.","stat":"games.slots.wins","goal":75,"reward":0},
     {"id":"highlow_regular","emoji":"🂡","name":"Higher or Lower","description":"Win 50 High/Low games.","stat":"games.highlow.wins","goal":50,"reward":0},
@@ -36,10 +36,10 @@ ACHIEVEMENTS: Tuple[dict, ...] = (
 ACHIEVEMENT_MAP = {a["id"]: a for a in ACHIEVEMENTS}
 
 DAILY_POOL: Tuple[dict, ...] = (
-    {"id":"d_play_12","category":"play","name":"Table Hopper","description":"Play 12 casino games.","metric":"games","goal":12,"reward":2500},
+    {"id":"d_play_12","category":"play","name":"Table Hopper","description":"Play 12 Ruthless Dealer casino games.","metric":"games","goal":12,"reward":2500},
     {"id":"d_blackjack_5","category":"play","name":"Blackjack Session","description":"Play 5 Blackjack hands.","metric":"game.blackjack.games","goal":5,"reward":2500},
     {"id":"d_roulette_5","category":"play","name":"Spin the Wheel","description":"Play 5 Roulette games.","metric":"game.roulette.games","goal":5,"reward":2500},
-    {"id":"d_win_6","category":"win","name":"Winning Ways","description":"Win 6 casino games.","metric":"wins","goal":6,"reward":3500},
+    {"id":"d_win_6","category":"win","name":"Winning Ways","description":"Win 6 Ruthless Dealer casino games.","metric":"wins","goal":6,"reward":3500},
     {"id":"d_coinflip_3","category":"win","name":"Heads or Tails","description":"Win 3 Coin Flip games.","metric":"game.coinflip.wins","goal":3,"reward":3000},
     {"id":"d_slots_3","category":"win","name":"Reel Results","description":"Win 3 Slots games.","metric":"game.slots.wins","goal":3,"reward":3000},
     {"id":"d_wager_15000","category":"economy","name":"Put It on the Table","description":"Wager 15,000 total today.","metric":"wagered","goal":15000,"reward":4000},
@@ -49,10 +49,10 @@ DAILY_POOL: Tuple[dict, ...] = (
 )
 
 WEEKLY_POOL: Tuple[dict, ...] = (
-    {"id":"w_play_100","category":"play","name":"Casino Marathon","description":"Play 100 casino games.","metric":"games","goal":100,"reward":15000},
+    {"id":"w_play_100","category":"play","name":"Ruthless Casino Marathon","description":"Play 100 Ruthless Dealer casino games.","metric":"games","goal":100,"reward":15000},
     {"id":"w_blackjack_30","category":"play","name":"Blackjack Week","description":"Play 30 Blackjack hands.","metric":"game.blackjack.games","goal":30,"reward":12000},
-    {"id":"w_all_games","category":"play","name":"Full Circuit","description":"Play each wagered casino game at least 10 times.","metric":"all_games_played","goal":10,"reward":18000},
-    {"id":"w_win_40","category":"win","name":"Winning Week","description":"Win 40 casino games.","metric":"wins","goal":40,"reward":18000},
+    {"id":"w_all_games","category":"play","name":"Full Circuit","description":"Play each Ruthless Dealer wagered game at least 10 times.","metric":"all_games_played","goal":10,"reward":18000},
+    {"id":"w_win_40","category":"win","name":"Winning Week","description":"Win 40 Ruthless Dealer casino games.","metric":"wins","goal":40,"reward":18000},
     {"id":"w_coinflip_15","category":"win","name":"Coin Collector","description":"Win 15 Coin Flip games.","metric":"game.coinflip.wins","goal":15,"reward":14000},
     {"id":"w_roulette_12","category":"win","name":"Wheel Work","description":"Win 12 Roulette games.","metric":"game.roulette.wins","goal":12,"reward":14000},
     {"id":"w_wager_200000","category":"economy","name":"High Stakes","description":"Wager 200,000 this week.","metric":"wagered","goal":200000,"reward":22000},

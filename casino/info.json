@@ -2,8 +2,8 @@
   "author": [
     "aKidWolfe96"
   ],
-  "name": "Casino",
-  "description": "Unified casino games with profiles, achievements, titles, rotating challenges, and generated profile cards.",
+  "name": "Ruthless Dealer Casino",
+  "description": "Ruthless Dealer unified casino games with profiles, achievements, titles, rotating challenges, and generated profile cards.",
   "install_msg": "Good luck, don't lose it all.",
   "requirements": [
     "Pillow"

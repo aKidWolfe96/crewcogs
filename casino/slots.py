@@ -47,12 +47,12 @@ class Slots(commands.Cog):
             await bank.withdraw_credits(ctx.author, bet)
             mark_played(ctx.guild.id, ctx.author.id, "slots")
         except ValueError:
-            return await ctx.send("Your balance changed before the wager could be placed. Try again.")
+            return await ctx.send("Ruthless Dealer could not place the wager because your balance changed. Try again.")
 
         settled = False
         try:
             reels = self.spin_reels()
-            embed = Embed(title="🎰 Slots", description=f"Bet: **{bet:,}** CrewCoin")
+            embed = Embed(title="🎰 Ruthless Dealer • Slots", description=f"Bet: **{bet:,}** CrewCoin")
             embed.add_field(name="Reels", value="[ ❓ | ❓ | ❓ ]", inline=False)
             message = await ctx.send(embed=embed)
             shown = ["❓", "❓", "❓"]
@@ -94,22 +94,22 @@ class Slots(commands.Cog):
                 "Slots failed for user %s", ctx.author.id
             )
             await ctx.send(
-                "Slots settled, but the result message or legacy stats failed."
+                "Ruthless Dealer’s slots settled, but the result message or legacy stats failed."
                 if settled
-                else "Slots hit an unexpected error. The unsettled wager was refunded."
+                else "Ruthless Dealer’s slots hit an unexpected error. The unsettled wager was refunded."
             )
 
     @commands.command()
     async def slotstats(self, ctx):
         data = await self.config.user(ctx.author).all()
-        await ctx.send(f"Slots — Wins: {data['total_slot_wins']}, Losses: {data['total_slot_losses']}, Bet total: {data['total_slot_bet']:,}, Biggest win: {data['biggest_slot_win']:,}")
+        await ctx.send(f"Ruthless Dealer Slots — Wins: {data['total_slot_wins']}, Losses: {data['total_slot_losses']}, Bet total: {data['total_slot_bet']:,}, Biggest win: {data['biggest_slot_win']:,}")
 
     @commands.command()
     async def slotpayouts(self, ctx):
         lines = ["**Three of a kind** (total return):"]
         lines.extend(f"{sym} {sym} {sym} → {mult}x" for sym, mult in TRIPLE_PAYOUTS.items())
         lines.append(f"\n**Any two matching** → {PAIR_PAYOUT}x")
-        await ctx.send(embed=Embed(title="🎰 Slots Payouts", description="\n".join(lines), color=0xFFD700))
+        await ctx.send(embed=Embed(title="🎰 Ruthless Dealer • Slots Payouts", description="\n".join(lines), color=0xFFD700))
 
 
 async def setup(bot):

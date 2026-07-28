@@ -102,7 +102,7 @@ async def get_game_settings(guild: discord.Guild, game: str) -> dict:
 
 async def validate_bet(ctx, game: str, bet: int) -> Optional[str]:
     if ctx.guild is None:
-        return "Casino games can only be played in a server."
+        return "Ruthless Dealer casino games can only be played in a server."
     if bet <= 0:
         return "Your wager must be greater than zero."
 

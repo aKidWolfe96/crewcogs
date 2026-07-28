@@ -32,8 +32,8 @@ class DailySpin(commands.Cog):
 
         amount = random.randint(100, 1000)
         await ctx.send(
-            f"🎉 You earned **{amount:,} CrewCoin**!\n"
-            "Type `accept` to claim it or `risk` to gamble it in a **Higher or Lower** dice roll."
+            f"🎲 **Ruthless Dealer Daily Spin**\nYou earned **{amount:,} CrewCoin**!\n"
+            "Ruthless Dealer offers: type `accept` to claim it or `risk` to gamble it in a **Higher or Lower** dice roll."
         )
 
         def accept_check(message):
@@ -46,19 +46,19 @@ class DailySpin(commands.Cog):
         try:
             choice = await self.bot.wait_for("message", timeout=30, check=accept_check)
         except TimeoutError:
-            return await ctx.send("⏰ Timed out. No reward was given.")
+            return await ctx.send("⏰ Ruthless Dealer closed the offer. No reward was given.")
 
         if choice.content.lower() == "accept":
             deposited = await safe_deposit(ctx.author, amount)
             return await ctx.send(
-                f"✅ You accepted and received **{deposited:,} CrewCoin**."
+                f"✅ Ruthless Dealer paid you **{deposited:,} CrewCoin**."
             )
 
         first = random.randint(1, 6)
         first_file = discord.File(self.dice_path / f"{first}.png", filename="first.png")
         await ctx.send(
             file=first_file,
-            content=f"🎲 First roll: **{first}**\nGuess: `higher` or `lower`?",
+            content=f"🎲 **Ruthless Dealer Gamble**\nFirst roll: **{first}**\nGuess: `higher` or `lower`?",
         )
 
         def guess_check(message):
@@ -71,7 +71,7 @@ class DailySpin(commands.Cog):
         try:
             guess = await self.bot.wait_for("message", timeout=20, check=guess_check)
         except TimeoutError:
-            return await ctx.send("⏰ Timed out. No reward was given.")
+            return await ctx.send("⏰ Ruthless Dealer closed the offer. No reward was given.")
 
         second = random.randint(1, 6)
         second_file = discord.File(self.dice_path / f"{second}.png", filename="second.png")
@@ -123,4 +123,4 @@ class DailySpin(commands.Cog):
                 include_economy=False,
                 channel=ctx.channel,
             )
-            await ctx.send("💀 You lost the gamble. Your reward was forfeited.")
+            await ctx.send("💀 Ruthless Dealer wins. Your reward was forfeited.")

@@ -26,8 +26,8 @@ class Casino(commands.Cog):
         net = data["total_paid"] - data["total_wagered"]
         win_rate = data["wins"] / data["total_games"] * 100 if data["total_games"] else 0
         favorite = max(data["games"].items(), key=lambda item: item[1].get("games", 0))[0].title() if data["games"] else "None"
-        equipped = data.get("equipped_title") or "Casino Player"
-        embed = discord.Embed(title=f"🎰 {member.display_name} — {equipped}", color=discord.Color.gold())
+        equipped = data.get("equipped_title") or "Ruthless Player"
+        embed = discord.Embed(title=f"🎰 Ruthless Dealer Casino • {member.display_name} — {equipped}", color=discord.Color.gold())
         embed.add_field(name="Record", value=f"Games: **{data['total_games']:,}**\nWins: **{data['wins']:,}**\nLosses: **{data['losses']:,}**\nPushes: **{data['pushes']:,}**\nWin rate: **{win_rate:.1f}%**")
         embed.add_field(name="Economy", value=f"Wagered: **{data['total_wagered']:,}**\nReturned: **{data['total_paid']:,}**\nNet: **{net:+,}**\nBiggest payout: **{data['biggest_payout']:,}**")
         embed.add_field(name="Favorite Game", value=f"**{favorite}**", inline=False)
@@ -44,7 +44,7 @@ class Casino(commands.Cog):
                 statuses.append(f"{'✅' if ready else '⏳'} {label}")
             balance = await bank.get_balance(member)
             claim_ready = balance < int(free["claim_threshold"]) and now - float(data.get("bailout_claimed_at", 0)) >= int(free["claim_cooldown"])
-            statuses.append(f"{'✅' if claim_ready else '⏳'} Pit Boss Bailout")
+            statuses.append(f"{'✅' if claim_ready else '⏳'} Ruthless Dealer Bailout")
             embed.add_field(name="Free Credits", value="\n".join(statuses), inline=False)
         embed.set_footer(text="Unified tracking begins when this update is installed; legacy per-game stats remain available.")
         await ctx.send(embed=embed)
@@ -82,12 +82,12 @@ class Casino(commands.Cog):
         """Collect a modest daily casino stipend."""
         settings = await self._freebie_settings(ctx.guild)
         if not settings["daily_enabled"]:
-            return await ctx.send("The daily stipend is currently disabled.")
+            return await ctx.send("Ruthless Dealer’s daily stipend is currently disabled.")
         now = time.time()
         last = float(await CONFIG.member(ctx.author).daily_stipend_at())
         remaining = int(settings["daily_cooldown"] - (now - last))
         if remaining > 0:
-            return await ctx.send(f"You already collected your stipend. Try again in **{self._cooldown_text(remaining)}**.")
+            return await ctx.send(f"Ruthless Dealer already paid your stipend. Try again in **{self._cooldown_text(remaining)}**.")
         low = max(0, int(settings["daily_min"]))
         high = max(low, int(settings["daily_max"]))
         requested = random.randint(low, high)
@@ -95,8 +95,8 @@ class Casino(commands.Cog):
         await CONFIG.member(ctx.author).daily_stipend_at.set(now)
         currency = await bank.get_currency_name(ctx.guild)
         if deposited < requested:
-            return await ctx.send(f"🎁 **Daily Stipend**\nYou collected **{deposited:,} {currency}** before reaching the bank limit.")
-        await ctx.send(f"🎁 **Daily Stipend**\nYou collected **{deposited:,} {currency}**. Come back tomorrow for another stipend!")
+            return await ctx.send(f"🎁 **Ruthless Dealer Daily Stipend**\nYou collected **{deposited:,} {currency}** before reaching the bank limit.")
+        await ctx.send(f"🎁 **Ruthless Dealer Daily Stipend**\nYou collected **{deposited:,} {currency}**. Come back tomorrow for another stipend!")
 
     @casino.command(name="claim", aliases=["bailout", "pitboss"])
     @commands.guild_only()
@@ -105,22 +105,22 @@ class Casino(commands.Cog):
         """Claim a small emergency bailout when your balance is very low."""
         settings = await self._freebie_settings(ctx.guild)
         if not settings["claim_enabled"]:
-            return await ctx.send("Pit Boss bailouts are currently disabled.")
+            return await ctx.send("Ruthless Dealer bailouts are currently disabled.")
         balance = await bank.get_balance(ctx.author)
         threshold = max(0, int(settings["claim_threshold"]))
         if balance >= threshold:
             currency = await bank.get_currency_name(ctx.guild)
-            return await ctx.send(f"The Pit Boss only helps players below **{threshold:,} {currency}**. Your balance is **{balance:,}**.")
+            return await ctx.send(f"Ruthless Dealer only helps players below **{threshold:,} {currency}**. Your balance is **{balance:,}**.")
         now = time.time()
         last = float(await CONFIG.member(ctx.author).bailout_claimed_at())
         remaining = int(settings["claim_cooldown"] - (now - last))
         if remaining > 0:
-            return await ctx.send(f"The Pit Boss already helped you recently. Try again in **{self._cooldown_text(remaining)}**.")
+            return await ctx.send(f"Ruthless Dealer already helped you recently. Try again in **{self._cooldown_text(remaining)}**.")
         requested = max(0, int(settings["claim_amount"]))
         deposited = await safe_deposit(ctx.author, requested)
         await CONFIG.member(ctx.author).bailout_claimed_at.set(now)
         currency = await bank.get_currency_name(ctx.guild)
-        await ctx.send(f"🎩 **Pit Boss Favor**\nThe Pit Boss slides you **{deposited:,} {currency}** in chips.\n*“Good luck... you'll need it.”*")
+        await ctx.send(f"🎩 **Ruthless Dealer Favor**\nRuthless Dealer slides you **{deposited:,} {currency}** in chips.\n*“Good luck... you'll need it.”*")
 
     @commands.command(name="scratch", aliases=["scratchticket"])
     @commands.guild_only()
@@ -129,12 +129,12 @@ class Casino(commands.Cog):
         """Use one conservative free scratch ticket each day."""
         settings = await self._freebie_settings(ctx.guild)
         if not settings["scratch_enabled"]:
-            return await ctx.send("Daily scratch tickets are currently disabled.")
+            return await ctx.send("Ruthless Dealer’s daily scratch tickets are currently disabled.")
         now = time.time()
         last = float(await CONFIG.member(ctx.author).scratch_claimed_at())
         remaining = int(settings["scratch_cooldown"] - (now - last))
         if remaining > 0:
-            return await ctx.send(f"You already scratched today's ticket. Try again in **{self._cooldown_text(remaining)}**.")
+            return await ctx.send(f"Ruthless Dealer already gave you today’s scratch ticket. Try again in **{self._cooldown_text(remaining)}**.")
         prizes = [0, 250, 500, 1000, 2500, 5000, 10000]
         weights = [3500, 3200, 2000, 900, 300, 90, 10]
         requested = random.choices(prizes, weights=weights, k=1)[0]
@@ -142,11 +142,11 @@ class Casino(commands.Cog):
         await CONFIG.member(ctx.author).scratch_claimed_at.set(now)
         currency = await bank.get_currency_name(ctx.guild)
         if requested == 0:
-            return await ctx.send("🎟️ **Daily Scratch Ticket**\nNo prize this time. Better luck tomorrow!")
+            return await ctx.send("🎟️ **Ruthless Dealer Daily Scratch Ticket**\nNo prize this time. Better luck tomorrow!")
         if requested >= 5000:
-            await ctx.send(f"🎟️ **Daily Scratch Ticket — Big Winner!**\nYou scratched off **{deposited:,} {currency}**!")
+            await ctx.send(f"🎟️ **Ruthless Dealer Daily Scratch Ticket — Big Winner!**\nYou scratched off **{deposited:,} {currency}**!")
         else:
-            await ctx.send(f"🎟️ **Daily Scratch Ticket**\nYou won **{deposited:,} {currency}**!")
+            await ctx.send(f"🎟️ **Ruthless Dealer Daily Scratch Ticket**\nYou won **{deposited:,} {currency}**!")
 
 
     async def _send_casinoboard(
@@ -212,7 +212,7 @@ class Casino(commands.Cog):
         title_game = f" — {game.title()}" if game else ""
         display_metric = {"games": "played", "payout": "biggest win"}.get(metric, metric)
         embed = discord.Embed(
-            title=f"🎰 Casino Board{title_game}",
+            title=f"🎰 Ruthless Dealer Casino Board{title_game}",
             description=f"Top players by **{display_metric}**",
             color=discord.Color.gold(),
         )
@@ -254,7 +254,7 @@ class Casino(commands.Cog):
                     f"{achievement['description']} `({min(value, achievement['goal']):,}/{achievement['goal']:,})`{reward}{title}"
                 )
             pages.append(discord.Embed(
-                title=f"🏆 {member.display_name}'s Achievements ({len(unlocked)}/20)",
+                title=f"🏆 Ruthless Dealer • {member.display_name}'s Achievements ({len(unlocked)}/20)",
                 description="\n\n".join(lines), color=discord.Color.gold()
             ))
         for embed in pages:
@@ -272,7 +272,7 @@ class Casino(commands.Cog):
         member = member or ctx.author
         daily_ids, weekly_ids = await ensure_rotations(ctx.guild)
         data = await CONFIG.member(member).all()
-        embed = discord.Embed(title=f"📋 {member.display_name}'s Casino Challenges", color=discord.Color.blurple())
+        embed = discord.Embed(title=f"📋 {member.display_name}'s Ruthless Dealer Challenges", color=discord.Color.blurple())
         for label, ids, weekly in (("☀️ Daily", daily_ids, False), ("🗓️ Weekly", weekly_ids, True)):
             state = data.get("weekly_state" if weekly else "daily_state", {})
             progress = state.get("progress", {})
@@ -295,7 +295,7 @@ class Casino(commands.Cog):
         titles = [a["title"] for a in ACHIEVEMENTS if a.get("title") and a["id"] in unlocked_ids]
         equipped = data.get("equipped_title") or "None"
         text = "\n".join(f"`{index}` {title}" for index, title in enumerate(titles, 1)) or "No titles unlocked yet."
-        await ctx.send(embed=discord.Embed(title="🎖️ Casino Titles", description=f"**Equipped:** {equipped}\n\n{text}\n\nUse `{ctx.clean_prefix}casino title equip <number>`.", color=discord.Color.gold()))
+        await ctx.send(embed=discord.Embed(title="🎖️ Ruthless Dealer Casino Titles", description=f"**Equipped:** {equipped}\n\n{text}\n\nUse `{ctx.clean_prefix}casino title equip <number>`.", color=discord.Color.gold()))
 
     @title_group.command(name="equip")
     async def title_equip(self, ctx: commands.Context, selection: int):
@@ -306,12 +306,12 @@ class Casino(commands.Cog):
             return await ctx.send("Choose a title number from your unlocked title list.")
         chosen = titles[selection - 1]
         await CONFIG.member(ctx.author).equipped_title.set(chosen)
-        await ctx.send(f"Equipped **{chosen}**.")
+        await ctx.send(f"Ruthless Dealer equipped **{chosen}**.")
 
     @title_group.command(name="clear")
     async def title_clear(self, ctx: commands.Context):
         await CONFIG.member(ctx.author).equipped_title.set("")
-        await ctx.send("Your casino title has been cleared.")
+        await ctx.send("Ruthless Dealer cleared your casino title.")
 
     @casino.command(name="profile")
     @commands.guild_only()
@@ -329,7 +329,7 @@ class Casino(commands.Cog):
             font_big = ImageFont.truetype("DejaVuSans.ttf", 34)
             font = ImageFont.truetype("DejaVuSans.ttf", 22)
             card.paste(avatar, (35, 45))
-            title = data.get("equipped_title") or "Casino Player"
+            title = data.get("equipped_title") or "Ruthless Player"
             draw.text((245, 45), member.display_name, fill="white", font=font_big)
             draw.text((245, 92), title, fill=(255, 207, 64), font=font)
             net = data.get("total_paid", 0) - data.get("total_wagered", 0)
@@ -352,7 +352,7 @@ class Casino(commands.Cog):
             output = BytesIO(); card.save(output, format="PNG"); output.seek(0)
             await ctx.send(file=discord.File(output, filename="casino-profile.png"))
         except Exception:
-            await ctx.send("Profile-card rendering is unavailable, so here is the standard profile instead.")
+            await ctx.send("Ruthless Dealer could not render the profile card, so here is the standard casino profile instead.")
             await ctx.invoke(self.casino, member=member)
 
     @commands.command(name="casinoboard", aliases=["casinoleaderboard"])
@@ -391,9 +391,9 @@ class Casino(commands.Cog):
         edge = house_profit / data["total_wagered"] * 100 if data["total_wagered"] else 0
         winner = ctx.guild.get_member(data["biggest_payout_user"])
         winner_text = winner.display_name if winner else "Unknown"
-        embed = discord.Embed(title="📊 Casino Analytics", color=discord.Color.blurple())
+        embed = discord.Embed(title="📊 Ruthless Dealer Casino Analytics", color=discord.Color.blurple())
         embed.add_field(name="Volume", value=f"Games: **{data['total_games']:,}**\nWagered: **{data['total_wagered']:,}**\nPaid out: **{data['total_paid']:,}**")
-        embed.add_field(name="House", value=f"Profit: **{house_profit:+,}**\nObserved edge: **{edge:.2f}%**")
+        embed.add_field(name="Ruthless Dealer", value=f"Profit: **{house_profit:+,}**\nObserved edge: **{edge:.2f}%**")
         embed.add_field(name="Results", value=f"Wins: **{data['total_wins']:,}**\nLosses: **{data['total_losses']:,}**\nPushes: **{data['total_pushes']:,}**")
         embed.add_field(name="Largest Return", value=f"**{data['biggest_payout']:,}** to **{winner_text}** via **{data['biggest_payout_game'].title() or 'Unknown'}**", inline=False)
         await ctx.send(embed=embed)
@@ -479,10 +479,10 @@ class Casino(commands.Cog):
             "",
             "**Free Credit Systems**",
             f"Daily stipend: {'Enabled' if free['daily_enabled'] else 'Disabled'} | {int(free['daily_min']):,}–{int(free['daily_max']):,} | {int(free['daily_cooldown']) // 3600}h",
-            f"Pit Boss: {'Enabled' if free['claim_enabled'] else 'Disabled'} | Below {int(free['claim_threshold']):,} grants {int(free['claim_amount']):,} | {int(free['claim_cooldown']) // 3600}h",
+            f"Ruthless Dealer: {'Enabled' if free['claim_enabled'] else 'Disabled'} | Below {int(free['claim_threshold']):,} grants {int(free['claim_amount']):,} | {int(free['claim_cooldown']) // 3600}h",
             f"Scratch ticket: {'Enabled' if free['scratch_enabled'] else 'Disabled'} | {int(free['scratch_cooldown']) // 3600}h",
         ])
-        await ctx.send(embed=discord.Embed(title="⚙️ Casino Settings", description="\n".join(lines), color=discord.Color.gold()))
+        await ctx.send(embed=discord.Embed(title="⚙️ Ruthless Dealer Casino Settings", description="\n".join(lines), color=discord.Color.gold()))
 
     async def _set_value(self, ctx, game: str, key: str, value):
         game = game.lower()
