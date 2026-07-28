@@ -398,6 +398,69 @@ class Casino(commands.Cog):
         embed.add_field(name="Largest Return", value=f"**{data['biggest_payout']:,}** to **{winner_text}** via **{data['biggest_payout_game'].title() or 'Unknown'}**", inline=False)
         await ctx.send(embed=embed)
 
+    @casino.command(name="resetprogress", aliases=["freshstart"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def resetprogress(self, ctx: commands.Context, confirmation: str = ""):
+        """Reset all casino statistics and progression without changing bank balances.
+
+        This also clears casino leaderboards and guild analytics. Free-credit
+        cooldowns and casino settings are preserved. Run with CONFIRM to proceed.
+        """
+        if confirmation.upper() != "CONFIRM":
+            return await ctx.send(
+                "⚠️ This resets **all casino statistics, achievements, titles, streaks, "
+                "challenge progress, leaderboards, and analytics** for this server. "
+                "Bank balances, casino settings, and free-credit cooldowns are preserved.\n\n"
+                f"Run `{ctx.clean_prefix}casino resetprogress CONFIRM` to continue."
+            )
+
+        all_members = await CONFIG.all_members(ctx.guild)
+        reset_count = 0
+        for user_id in all_members:
+            member_conf = CONFIG.member_from_ids(ctx.guild.id, int(user_id))
+            async with member_conf.all() as data:
+                data.update({
+                    "total_wagered": 0,
+                    "total_paid": 0,
+                    "total_games": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "pushes": 0,
+                    "biggest_bet": 0,
+                    "biggest_payout": 0,
+                    "games": {},
+                    "achievements": [],
+                    "equipped_title": "",
+                    "current_win_streak": 0,
+                    "longest_win_streak": 0,
+                    "best_highlow_streak": 0,
+                    "daily_completed": 0,
+                    "weekly_completed": 0,
+                    "daily_state": {},
+                    "weekly_state": {},
+                })
+            reset_count += 1
+
+        guild_conf = CONFIG.guild(ctx.guild)
+        async with guild_conf.all() as data:
+            data.update({
+                "total_wagered": 0,
+                "total_paid": 0,
+                "total_games": 0,
+                "total_wins": 0,
+                "total_losses": 0,
+                "total_pushes": 0,
+                "biggest_payout": 0,
+                "biggest_payout_user": 0,
+                "biggest_payout_game": "",
+            })
+
+        await ctx.send(
+            f"✅ Casino progression has been reset for **{reset_count:,}** tracked members. "
+            "Everyone now starts at zero; bank balances and free-credit cooldowns were preserved."
+        )
+
     @casino.command(name="settings")
     @checks.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
