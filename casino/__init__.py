@@ -12,3 +12,4 @@ async def setup(bot):
     await bot.add_cog(DailySpin(bot))
     await bot.add_cog(HorseRace(bot))
     await bot.add_cog(Slots(bot))
+    await bot.add_cog(Roulette(bot))
