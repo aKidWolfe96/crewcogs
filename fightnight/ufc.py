@@ -19,6 +19,7 @@ Commands
 import asyncio
 import aiohttp
 import discord
+from datetime import datetime, timezone, timedelta
 from redbot.core import commands, Config, checks, bank
 from redbot.core.bot import Red
 
@@ -29,11 +30,34 @@ from .api import (
 from . import embeds
 
 MAX_BETS = 3   # max active bets per user per card
+STALE_EVENT_GRACE = timedelta(hours=36)
 
 
 def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
+
+
+def _event_is_stale(meta: dict) -> bool:
+    """Return True only when a stored event is safely beyond its live window."""
+    now = datetime.now(timezone.utc)
+    compact = str(meta.get("date_compact", "") or "")
+    if len(compact) == 8 and compact.isdigit():
+        try:
+            # ESPN dates identify the event day, not the exact closing time.
+            # Treat the card as stale only after the following day plus grace.
+            start = datetime.strptime(compact, "%Y%m%d").replace(tzinfo=timezone.utc)
+            return now >= start + timedelta(days=1) + STALE_EVENT_GRACE
+        except ValueError:
+            return False
+    return False
+
+
+def _all_entries(mapping: dict):
+    """Yield (fight_key, uid, value) from a fight-keyed user mapping."""
+    for fight_key, users in (mapping or {}).items():
+        for uid, value in (users or {}).items():
+            yield fight_key, uid, value
 
 def _merge_deltas(total: dict, part: dict):
     for uid, d in part.items():
@@ -484,6 +508,9 @@ class UFC(commands.Cog):
             total_payouts = {}        # uid -> credits to deposit
             bet_outcomes = {}         # uid -> {net, won, lost}
             resolved_bets_by_event = {}
+            stale_events = set()
+            stale_pick_count = 0
+            stale_refunds = {}       # uid -> stake returned for orphaned old bets
 
             if date:
                 ymd = date.replace("-", "").replace("/", "")
@@ -509,8 +536,9 @@ class UFC(commands.Cog):
                 for eid, bucket in evs.items():
                     meta = bucket.get("meta", {})
                     ymd = meta.get("date_compact", "")
-                    results = (await get_event_by_id(self.session, eid, ymd)
-                               or await get_event_on_date(self.session, ymd))
+                    # Exact-id lookup only. Never score a bucket against a
+                    # different event merely because it occurred on the same day.
+                    results = await get_event_by_id(self.session, eid, ymd)
                     if not results:
                         continue
                     d, r = _score_picks(bucket.get("picks", {}), results)
@@ -522,6 +550,23 @@ class UFC(commands.Cog):
                     _merge_payouts(total_payouts, p)
                     _merge_outcomes(bet_outcomes, o)
                     resolved_bets_by_event.setdefault(eid, []).extend(br)
+
+                    # Once a card is safely old, anything still unresolved is an
+                    # orphaned/cancelled fight. Picks are discarded and stakes
+                    # are refunded. Current and future cards never enter here.
+                    if _event_is_stale(meta):
+                        resolved_pick_set = set(r)
+                        resolved_bet_set = set(br)
+                        for fight_key, uid, _picked in _all_entries(bucket.get("picks", {})):
+                            if (fight_key, uid) not in resolved_pick_set:
+                                stale_pick_count += 1
+                        for fight_key, uid, bet in _all_entries(bucket.get("bets", {})):
+                            if (fight_key, uid) not in resolved_bet_set:
+                                amount = int((bet or {}).get("amount", 0) or 0)
+                                if amount > 0:
+                                    stale_refunds[uid] = stale_refunds.get(uid, 0) + amount
+                        stale_events.add(eid)
+                        settled_names.append(meta.get("shortname", results["shortname"]))
                 if legacy:
                     results = await get_recent_event(self.session)
                     if results:
@@ -531,7 +576,7 @@ class UFC(commands.Cog):
                         _merge_deltas(total_deltas, d)
                         resolved_legacy.extend(r)
 
-        if not total_deltas and not bet_outcomes:
+        if not total_deltas and not bet_outcomes and not stale_events:
             return await ctx.send(embed=embeds.error_embed(
                 "No finished fights matched the locked-in picks yet.\n"
                 "Run `!ufc settle` once results are posted, or settle a specific "
@@ -556,6 +601,20 @@ class UFC(commands.Cog):
                 except Exception:
                     pass  # member may be unreachable; stats still recorded below
 
+        # Refund unresolved bets from safely expired cards. These are treated
+        # as void bets and do not affect lifetime betting W-L or net stats.
+        refunded_total = 0
+        refunded_bets = 0
+        for uid, amt in stale_refunds.items():
+            member = guild.get_member(int(uid))
+            if member and amt > 0:
+                try:
+                    await bank.deposit_credits(member, amt)
+                    refunded_total += amt
+                    refunded_bets += 1
+                except Exception:
+                    pass
+
         # lifetime betting stats (net P/L and W-L)
         if bet_outcomes:
             async with self.config.guild(guild).betting() as betting:
@@ -567,7 +626,7 @@ class UFC(commands.Cog):
 
         # remove resolved picks AND bets; drop an event only when both are empty
         async with self.config.guild(guild).events() as evs_w:
-            touched = set(resolved_by_event) | set(resolved_bets_by_event)
+            touched = set(resolved_by_event) | set(resolved_bets_by_event) | stale_events
             for eid in touched:
                 if eid not in evs_w:
                     continue
@@ -583,7 +642,7 @@ class UFC(commands.Cog):
                         del bmap[fight_key][uid]
                     if fight_key in bmap and not bmap[fight_key]:
                         del bmap[fight_key]
-                if not pmap and not bmap:
+                if eid in stale_events or (not pmap and not bmap):
                     del evs_w[eid]
         if resolved_legacy:
             async with self.config.guild(guild).picks() as legacy_w:
@@ -615,6 +674,14 @@ class UFC(commands.Cog):
                 emoji = "💸" if net >= 0 else "📉"
                 lines.append(f"{emoji} **{disp}**: {sign}{abs(net):,} {currency} "
                              f"({o['won']}W-{o['lost']}L)")
+
+        if stale_events:
+            currency = await bank.get_currency_name(guild)
+            lines.append(f"\n**🧹 Old-card cleanup:** removed **{stale_pick_count}** "
+                         f"unresolved pick(s) from **{len(stale_events)}** expired event(s).")
+            if refunded_total:
+                lines.append(f"Refunded **{refunded_total:,} {currency}** across "
+                             f"**{refunded_bets}** user account(s) for void bets.")
 
         leftover = sum(len(fp) for b in (await self.config.guild(guild).events()).values()
                        for fp in b.get("picks", {}).values())

@@ -231,9 +231,9 @@ async def get_event_by_id(session: aiohttp.ClientSession, eid: str,
         for e in (data or {}).get("events", []):
             if str(e.get("id")) == eid:
                 return _fmt_event(e)
-        evs = (data or {}).get("events", [])
-        if evs:
-            return _fmt_event(evs[0])
+        # Do not fall back to an arbitrary event from the same date. Multiple
+        # UFC/ESPN events can share a scoreboard date, and settling the wrong
+        # card would corrupt picks and payouts.
     # last resort: current scoreboard
     for e in await _scoreboard(session):
         if str(e.get("id")) == eid:
