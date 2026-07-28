@@ -4,6 +4,7 @@ from .leaderboard import CasinoLeaderboard
 from .dailyspin import DailySpin
 from .horserace import HorseRace
 from .slots import Slots
+from .roulette import Roulette
 
 async def setup(bot):
     await bot.add_cog(Blackjack())
