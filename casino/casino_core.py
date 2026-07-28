@@ -31,6 +31,19 @@ CONFIG.register_guild(
     biggest_payout=0,
     biggest_payout_user=0,
     biggest_payout_game="",
+    progression={"daily_key":"", "daily_ids":[], "previous_daily_ids":[], "weekly_key":"", "weekly_ids":[], "previous_weekly_ids":[]},
+    freebies={
+        "daily_enabled": True,
+        "daily_min": 750,
+        "daily_max": 1250,
+        "daily_cooldown": 86400,
+        "claim_enabled": True,
+        "claim_threshold": 250,
+        "claim_amount": 500,
+        "claim_cooldown": 43200,
+        "scratch_enabled": True,
+        "scratch_cooldown": 86400,
+    },
 )
 CONFIG.register_member(
     total_wagered=0,
@@ -42,6 +55,18 @@ CONFIG.register_member(
     biggest_bet=0,
     biggest_payout=0,
     games={},
+    achievements=[],
+    equipped_title="",
+    current_win_streak=0,
+    longest_win_streak=0,
+    best_highlow_streak=0,
+    daily_completed=0,
+    weekly_completed=0,
+    daily_state={},
+    weekly_state={},
+    daily_stipend_at=0.0,
+    bailout_claimed_at=0.0,
+    scratch_claimed_at=0.0,
 )
 
 LOG = logging.getLogger("red.crewcogs.casino")
@@ -212,6 +237,8 @@ async def settle_game(
     outcome: str,
     *,
     include_economy: bool = True,
+    metadata: Optional[dict] = None,
+    channel=None,
 ) -> SettlementResult:
     """Deposit a result and record it through one shared settlement path.
 
@@ -250,6 +277,12 @@ async def settle_game(
             deposited,
             outcome,
         )
+
+    try:
+        from .progression import process_progress
+        await process_progress(member, game, wager, deposited, outcome, metadata=metadata, channel=channel)
+    except Exception:
+        LOG.exception("Casino progression failed after settlement for user=%s game=%s", member.id, game)
 
     LOG.info(
         "Casino settled: user=%s guild=%s game=%s wager=%s requested_payout=%s "

@@ -108,7 +108,7 @@ class Roulette(commands.Cog):
             won = is_winner(parsed_bet, winning_pocket)
             payout = bet * payout_multiplier(parsed_bet) if won else 0
             outcome = "win" if won else "loss"
-            settlement = await settle_game(ctx.author, "roulette", bet, payout, outcome)
+            settlement = await settle_game(ctx.author, "roulette", bet, payout, outcome, channel=ctx.channel)
             deposited = settlement.deposited
             settled = True
 

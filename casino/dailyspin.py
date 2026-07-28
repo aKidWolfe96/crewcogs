@@ -85,6 +85,7 @@ class DailySpin(commands.Cog):
                 payout=amount,
                 outcome="push",
                 include_economy=False,
+                channel=ctx.channel,
             )
             text = f"😐 It's a tie! Your **{settlement.deposited:,} CrewCoin** reward was returned."
             if settlement.capped:
@@ -106,6 +107,7 @@ class DailySpin(commands.Cog):
                 payout=payout,
                 outcome="win",
                 include_economy=False,
+                channel=ctx.channel,
             )
             text = f"🔥 You won the gamble! **{settlement.deposited:,} CrewCoin** was added to your balance."
             if settlement.capped:
@@ -119,5 +121,6 @@ class DailySpin(commands.Cog):
                 payout=0,
                 outcome="loss",
                 include_economy=False,
+                channel=ctx.channel,
             )
             await ctx.send("💀 You lost the gamble. Your reward was forfeited.")

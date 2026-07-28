@@ -64,7 +64,7 @@ class Slots(commands.Cog):
 
             payout, kind = self.evaluate(reels, bet)
             result = "win" if payout else "loss"
-            settlement = await settle_game(ctx.author, "slots", bet, payout, result)
+            settlement = await settle_game(ctx.author, "slots", bet, payout, result, channel=ctx.channel)
             settled = True
 
             cfg = self.config.user(ctx.author)

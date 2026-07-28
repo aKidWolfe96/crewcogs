@@ -194,7 +194,10 @@ class HighLow(commands.Cog):
         return min(payout, cap) if cap else payout
 
     async def finish(self, view: HighLowView, outcome: str, payout: int):
-        return await settle_game(view.ctx.author, GAME, view.bet, payout, outcome)
+        return await settle_game(
+            view.ctx.author, GAME, view.bet, payout, outcome,
+            metadata={"highlow_streak": view.streak}, channel=view.ctx.channel
+        )
 
     def make_embed(
         self,

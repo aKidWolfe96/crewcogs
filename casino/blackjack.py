@@ -387,7 +387,7 @@ class Blackjack(commands.Cog):
                     f"({dealer_value}). Your bet was returned."
                 )
 
-            settlement = await settle_game(ctx.author, "blackjack", bet, payout, outcome)
+            settlement = await settle_game(ctx.author, "blackjack", bet, payout, outcome, channel=ctx.channel)
             deposited = settlement.deposited
             try:
                 await user_config.total_bet.set(await user_config.total_bet() + bet)
