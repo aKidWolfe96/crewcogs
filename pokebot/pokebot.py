@@ -49,7 +49,7 @@ from .embeds import (
 from .pokeapi import (
     MAX_POKEMON, build_pokemon_instance, calculate_type_effectiveness,
     catch_rate, effectiveness_label, fetch_move_data, fetch_pokemon,
-    get_random_pokemon_id, resolve_pokemon_id, set_cache_dir,
+    get_random_pokemon_id, resolve_pokemon_id, set_cache_dir, pokemon_rarity,
     new_uid, ensure_uids, ensure_party, party_mons, uid_index,
     estimate_hit, boss_counter_damage,
 )
@@ -419,6 +419,11 @@ class PokéBot(commands.Cog):
             "max_pokemon":      500,     # collection cap per trainer
             "shop_prices":      _default_shop_prices,
             "tm_prices":        _default_tm_prices,
+            "encounter_stats": {
+                "wild_spawns": 0, "shiny_spawns": 0, "legendary_spawns": 0,
+                "mythical_spawns": 0, "wild_catches": 0, "shiny_catches": 0,
+                "fled": 0, "raid_wins": 0, "raid_catches": 0,
+            },
         }
         # NOTE: credits field removed — balance lives in Red's bank now.
         default_member = {
@@ -913,6 +918,16 @@ class PokéBot(commands.Cog):
             log.warning(f"[PokéBot] Failed to fetch Pokémon ID {pokemon_id}: {exc}")
             return
 
+        stats = await self.config.guild(channel.guild).encounter_stats()
+        stats["wild_spawns"] = stats.get("wild_spawns", 0) + 1
+        if pokemon.get("shiny"):
+            stats["shiny_spawns"] = stats.get("shiny_spawns", 0) + 1
+        if pokemon.get("rarity") == "legendary":
+            stats["legendary_spawns"] = stats.get("legendary_spawns", 0) + 1
+        elif pokemon.get("rarity") == "mythical":
+            stats["mythical_spawns"] = stats.get("mythical_spawns", 0) + 1
+        await self.config.guild(channel.guild).encounter_stats.set(stats)
+
         spawn_id = str(uuid.uuid4())
         self._spawn_cache[channel.id] = {
             "pokemon":   pokemon,
@@ -933,11 +948,15 @@ class PokéBot(commands.Cog):
         )
         if pokemon.get("spriteUrl"):
             embed.set_image(url=pokemon["spriteUrl"])
-        embed.set_footer(text=f"Use `catch <ball>` to catch it! It will flee in 4 hours if ignored.")
+        flee_timeout = await self.config.guild(channel.guild).flee_timeout()
+        rarity = pokemon.get("rarity", "common")
+        if rarity in ("legendary", "mythical"):
+            embed.description += f"\n\n🌟 **{rarity.upper()} ENCOUNTER!**"
+        flee_minutes = max(1, round(flee_timeout / 60))
+        embed.set_footer(text=f"Use `catch <ball>` to catch it! It will flee in about {flee_minutes} minutes if ignored.")
         await channel.send(embed=embed)
 
         # Cancel any existing flee timer for this channel then start a fresh one
-        flee_timeout = await self.config.guild(channel.guild).flee_timeout()
         self._cancel_flee_task(channel.id)
         self._flee_tasks[channel.id] = self.bot.loop.create_task(
             self._flee_timer(channel, pokemon, spawn_id, flee_timeout)
@@ -951,6 +970,9 @@ class PokéBot(commands.Cog):
         cached = self._spawn_cache.get(channel.id)
         if cached and cached.get("spawnId") == spawn_id:
             self._spawn_cache.pop(channel.id, None)
+            stats = await self.config.guild(channel.guild).encounter_stats()
+            stats["fled"] = stats.get("fled", 0) + 1
+            await self.config.guild(channel.guild).encounter_stats.set(stats)
             try:
                 embed = discord.Embed(
                     description=(
@@ -1294,7 +1316,7 @@ class PokéBot(commands.Cog):
 
         chosen = next(s for s in STARTERS if s["name"].lower() == msg.content.strip().lower())
         async with ctx.typing():
-            pokemon = await build_pokemon_instance(self._session, chosen["id"], level=5)
+            pokemon = await build_pokemon_instance(self._session, chosen["id"], level=5, allow_shiny=False)
         pokemon["stats"]["hp"] = pokemon["stats"]["maxHp"]
         await self._create_player(ctx.author, pokemon)
 
@@ -1953,7 +1975,10 @@ class PokéBot(commands.Cog):
         lvl_diff   = active_lvl - wild_lvl   # positive = trainer stronger
         # Sigmoid-like linear clamp: ±0.04 per level difference, capped at ±0.40
         lvl_mult   = 1.0 + max(-0.40, min(0.40, lvl_diff * 0.04))
-        chance = min(base_chance * berry_effect["catch_mult"] * lvl_mult, 0.95)
+        rarity_mult = {"rare": 0.85, "legendary": 0.55, "mythical": 0.45}.get(
+            pokemon.get("rarity", "common"), 1.0
+        )
+        chance = min(base_chance * berry_effect["catch_mult"] * lvl_mult * rarity_mult, 0.95)
         caught = random.random() < chance
 
         shakes     = 3 if caught else random.randint(0, 2)
@@ -1991,6 +2016,11 @@ class PokéBot(commands.Cog):
         lvl_msgs = self._check_level_up(active_poke)
 
         if caught:
+            stats = await self.config.guild(ctx.guild).encounter_stats()
+            stats["wild_catches"] = stats.get("wild_catches", 0) + 1
+            if pokemon.get("shiny"):
+                stats["shiny_catches"] = stats.get("shiny_catches", 0) + 1
+            await self.config.guild(ctx.guild).encounter_stats.set(stats)
             # Pokémon caught — cancel flee timer and remove from spawn cache
             self._cancel_flee_task(ctx.channel.id)
             self._spawn_cache.pop(ctx.channel.id, None)
@@ -2861,6 +2891,25 @@ class PokéBot(commands.Cog):
 
     # ── Help ──────────────────────────────────────────────────────────────────
 
+    @commands.command(name="pokestats")
+    async def pokestats(self, ctx: commands.Context) -> None:
+        """Show server-wide encounter and rarity statistics."""
+        st = await self.config.guild(ctx.guild).encounter_stats()
+        spawns = st.get("wild_spawns", 0)
+        shiny = st.get("shiny_spawns", 0)
+        rate = f"1 in {spawns / shiny:.1f}" if shiny else "No recorded shinies yet"
+        embed = discord.Embed(title="📊 PokéBot Server Statistics", color=COLORS["blue"])
+        embed.add_field(name="Wild encounters", value=f"{spawns:,}", inline=True)
+        embed.add_field(name="Wild catches", value=f"{st.get('wild_catches', 0):,}", inline=True)
+        embed.add_field(name="Fled", value=f"{st.get('fled', 0):,}", inline=True)
+        embed.add_field(name="Shiny spawns", value=f"{shiny:,}\n{rate}", inline=True)
+        embed.add_field(name="Legendary spawns", value=f"{st.get('legendary_spawns', 0):,}", inline=True)
+        embed.add_field(name="Mythical spawns", value=f"{st.get('mythical_spawns', 0):,}", inline=True)
+        embed.add_field(name="Raid wins", value=f"{st.get('raid_wins', 0):,}", inline=True)
+        embed.add_field(name="Raid catches", value=f"{st.get('raid_catches', 0):,}", inline=True)
+        embed.set_footer(text="Statistics begin when this updated cog is installed.")
+        await ctx.send(embed=embed)
+
     @commands.command(name="pokehelp")
     async def pokehelp(self, ctx: commands.Context) -> None:
         """Show all PokéBot commands."""
@@ -3705,12 +3754,11 @@ class PokéBot(commands.Cog):
     _RAID_TIER_WEIGHTS = {"pseudo": 35, "legendary": 40, "greater": 18, "mythical": 7}
 
     def _pick_random_raid_boss(self) -> Dict:
-        """Pick a random boss from the pool using tier weights."""
-        weighted: List[Dict] = []
-        for entry in self.RAID_BOSS_POOL:
-            w = self._RAID_TIER_WEIGHTS.get(entry["tier"], 10)
-            weighted.extend([entry] * w)
-        return random.choice(weighted)
+        """Pick a tier first, then a boss, so tier odds are not distorted by pool size."""
+        tiers = list(self._RAID_TIER_WEIGHTS)
+        weights = [self._RAID_TIER_WEIGHTS[t] for t in tiers]
+        chosen_tier = random.choices(tiers, weights=weights, k=1)[0]
+        return random.choice([e for e in self.RAID_BOSS_POOL if e["tier"] == chosen_tier])
 
     # ── Raid helpers ──────────────────────────────────────────────────────────
 
@@ -4033,6 +4081,11 @@ class PokéBot(commands.Cog):
         boss_is_shiny = random.random() < shiny_chance
         if boss_is_shiny:
             boss["shiny"] = True
+            boss["spriteUrl"] = boss.get("shinySpriteUrl") or boss.get("spriteUrl")
+
+        raid_stats = await self.config.guild(guild).encounter_stats()
+        raid_stats["raid_wins"] = raid_stats.get("raid_wins", 0) + 1
+        await self.config.guild(guild).encounter_stats.set(raid_stats)
 
         lines = []
         for participant in raid["participants"]:
@@ -4070,10 +4123,10 @@ class PokéBot(commands.Cog):
             throw_lines  = []
             for throw_num in range(1, n_balls + 1):
                 if random.random() < per_ball:
-                    caught_count += 1
+                    caught_count = 1
                     throw_lines.append(f"  🔵 Ball {throw_num}: ✅ **Caught!**")
-                else:
-                    throw_lines.append(f"  🔵 Ball {throw_num}: 💨 Broke free...")
+                    break
+                throw_lines.append(f"  🔵 Ball {throw_num}: 💨 Broke free...")
 
             max_pokemon    = await self.config.guild(guild).max_pokemon()
             actually_added = 0
@@ -4090,6 +4143,9 @@ class PokéBot(commands.Cog):
                     actually_added += 1
             if actually_added:
                 await self._save_player(member, p_data)
+                raid_stats = await self.config.guild(guild).encounter_stats()
+                raid_stats["raid_catches"] = raid_stats.get("raid_catches", 0) + actually_added
+                await self.config.guild(guild).encounter_stats.set(raid_stats)
 
             caught_str = (
                 f"🎉 **Caught {actually_added}× {boss['displayName']}{'  ✨' if boss_is_shiny else ''}!**"
@@ -4149,7 +4205,7 @@ class PokéBot(commands.Cog):
             if pokemon_name.strip():
                 slug = pokemon_name.lower().strip().replace(" ", "-")
                 try:
-                    boss = await build_pokemon_instance(self._session, slug, level=random.randint(60, 100))
+                    boss = await build_pokemon_instance(self._session, slug, level=random.randint(60, 100), allow_shiny=False)
                 except Exception:
                     await ctx.send(embed=error_embed(f"Couldn't find **{pokemon_name}**. Check the spelling!"))
                     return
@@ -4158,10 +4214,10 @@ class PokéBot(commands.Cog):
                 slug  = str(pick.get("name", pick["id"])).lower()
                 level = random.randint(70, 100) if pick["tier"] in ("greater", "mythical") else random.randint(55, 90)
                 try:
-                    boss = await build_pokemon_instance(self._session, slug, level=level)
+                    boss = await build_pokemon_instance(self._session, slug, level=level, allow_shiny=False)
                 except Exception:
                     boss = await build_pokemon_instance(
-                        self._session, get_random_pokemon_id(), level=random.randint(55, 100)
+                        self._session, get_random_pokemon_id(), level=random.randint(55, 100), allow_shiny=False
                     )
 
         stars, star_label = self._raid_star_tier(boss["level"])

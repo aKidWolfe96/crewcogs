@@ -14,6 +14,36 @@ import aiohttp
 
 MAX_POKEMON = 1025
 
+SHINY_CHANCE = 1 / 256
+LEGENDARY_SPAWN_CHANCE = 1 / 250
+MYTHICAL_SPAWN_CHANCE = 1 / 1000
+
+# National Pokédex IDs. Forms resolve through FORM_OVERRIDES where needed.
+MYTHICAL_IDS = {
+    151, 251, 385, 386, 489, 490, 491, 492, 493, 494, 647, 648, 649,
+    719, 720, 721, 801, 802, 807, 808, 809, 893, 1025,
+}
+LEGENDARY_IDS = {
+    144,145,146,150,243,244,245,249,250,377,378,379,380,381,382,383,384,
+    480,481,482,483,484,485,486,487,488,638,639,640,641,642,643,644,645,646,
+    716,717,718,772,773,785,786,787,788,789,790,791,792,800,888,889,890,
+    894,895,896,897,898,905,1001,1002,1003,1004,1007,1008,1014,1015,1016,
+    1017,1024,
+}
+RARE_IDS = {
+    147,148,149,246,247,248,371,372,373,374,375,376,443,444,445,633,634,635,
+    704,705,706,782,783,784,885,886,887,996,997,998,
+}
+
+def pokemon_rarity(pokemon_id: int) -> str:
+    if pokemon_id in MYTHICAL_IDS:
+        return "mythical"
+    if pokemon_id in LEGENDARY_IDS:
+        return "legendary"
+    if pokemon_id in RARE_IDS:
+        return "rare"
+    return "common"
+
 # Some Pokémon have alternate-form IDs on PokéAPI that differ from their Pokédex number.
 # Map any problem IDs to their correct API slug so fetches don't silently fail.
 FORM_OVERRIDES: Dict[int, str] = {
@@ -85,7 +115,20 @@ async def fetch_move_data(session: aiohttp.ClientSession, move_name: str) -> Dic
 
 
 def get_random_pokemon_id() -> int:
-    return random.randint(1, MAX_POKEMON)
+    """Choose a wild species with explicit rarity tiers."""
+    roll = random.random()
+    if roll < MYTHICAL_SPAWN_CHANCE:
+        return random.choice(tuple(MYTHICAL_IDS))
+    if roll < MYTHICAL_SPAWN_CHANCE + LEGENDARY_SPAWN_CHANCE:
+        return random.choice(tuple(LEGENDARY_IDS))
+    # Rare families are uncommon but substantially more available than legends.
+    if roll < MYTHICAL_SPAWN_CHANCE + LEGENDARY_SPAWN_CHANCE + 0.02:
+        return random.choice(tuple(RARE_IDS))
+    excluded = LEGENDARY_IDS | MYTHICAL_IDS | RARE_IDS
+    while True:
+        pokemon_id = random.randint(1, MAX_POKEMON)
+        if pokemon_id not in excluded:
+            return pokemon_id
 
 
 def resolve_pokemon_id(id_or_name) -> str:
@@ -96,7 +139,7 @@ def resolve_pokemon_id(id_or_name) -> str:
 
 
 def is_shiny() -> bool:
-    return random.random() < (1 / 512)
+    return random.random() < SHINY_CHANCE
 
 
 async def build_pokemon_instance(
@@ -104,11 +147,12 @@ async def build_pokemon_instance(
     id_or_name,
     level: Optional[int] = None,
     force_shiny: bool = False,
+    allow_shiny: bool = True,
 ) -> Dict:
     slug = resolve_pokemon_id(id_or_name)
     raw = await fetch_pokemon(session, slug)
     lvl = level if level is not None else random.randint(2, 21)
-    shiny = force_shiny or is_shiny()
+    shiny = force_shiny or (allow_shiny and is_shiny())
     types = [t["type"]["name"] for t in raw["types"]]
 
     learnable = [
@@ -151,6 +195,8 @@ async def build_pokemon_instance(
         "xp": 0,
         "xpToNext": lvl * lvl * 10,
         "shiny": shiny,
+        "rarity": pokemon_rarity(raw["id"]),
+        "shinySpriteUrl": raw["sprites"].get("front_shiny") or raw["sprites"]["front_default"],
         "moves": selected_moves,
         "stats": stats,
         "spriteUrl": sprite_url,
