@@ -1,0 +1,59 @@
+COG:
+  Casino:
+    1480285926151160000: true
+    1499218723368734831: true
+    1480285772849352786: true
+    1493785521317478430: true
+    1480285845645955254: true
+    1531734965023408128: true
+    1531754413381783635: true
+    default: false
+  Blackjack:
+    1480285772849352786: true
+    default: false
+  Battleship:
+    1496308219172356207: true 
+    default: false
+  Trivia:
+    1496308508247855134: true 
+    default: false
+  CoinFlip:
+    1499218723368734831: true
+    default: false
+  DailySpin:
+    1480285926151160000: true
+    default: false
+  FortniteStats:
+    1493752940912050296: true
+    1350546941766930576: true
+    default: false
+  HorseRace:
+    1480285845645955254: true
+    default: false
+  Overwatch:
+    1493752940912050296: true
+    1350546941766930576: true
+    default: false
+  PokéBot:
+    1492801872262725813: true
+    1480479406626570250: true
+    default: false
+  Slots:
+    1493785521317478430: true
+    default: false
+  UFC:
+    1515373883849572592: true
+    1492931006028709948: true
+    default: false
+  TwitchAlerts:
+    1493752940912050296: true
+    default: false
+  Economy:
+    1480285926151160000: true
+    default: false
+  Roulette:
+    1531734965023408128: true
+    default: false
+  HighLow:
+    1531754413381783635: true
+    default: false
