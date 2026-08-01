@@ -33,7 +33,6 @@ COG:
     default: false
   PokéBot:
     1492801872262725813: true
-    1480479406626570250: true
     default: false
   Slots:
     1493785521317478430: true
@@ -43,7 +42,7 @@ COG:
     1492931006028709948: true
     default: false
   TwitchAlerts:
-    1493752940912050296: true
+    1525353570260619354: true
     default: false
   Economy:
     1480285926151160000: true
