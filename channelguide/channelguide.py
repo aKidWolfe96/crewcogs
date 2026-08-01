@@ -13,12 +13,11 @@ class ChannelGuide(commands.Cog):
 
     CONFIG_FILE = Path(__file__).with_name("config.yaml")
 
-    # Friendly names and ordering for public-facing features. The generic
-    # Casino permission entry is intentionally omitted because it is a parent
-    # rule spanning all casino channels, not a separate destination.
+    # The generic Casino permission entry is intentionally omitted because it
+    # is a parent rule spanning all casino channels, not a separate destination.
     SECTIONS = (
         (
-            "🎰 Casino & Economy",
+            "━━ 🎰  CASINO & ECONOMY  ━━",
             (
                 ("Blackjack", "🃏 Blackjack"),
                 ("CoinFlip", "🪙 Coin Flip"),
@@ -30,23 +29,22 @@ class ChannelGuide(commands.Cog):
             ),
         ),
         (
-            "🎮 Party Games",
+            "━━ 🎮  PARTY GAMES  ━━",
             (
                 ("Battleship", "🚢 Battleship"),
                 ("Trivia", "❓ Trivia"),
             ),
         ),
         (
-            "📊 Game Stats",
+            "━━ 📊  GAME STATS  ━━",
             (
                 ("PokéBot", "⚡ PokéBot"),
-                ("FortniteStats", "🟦 Fortnite"),
-                ("Overwatch", "🟧 Overwatch"),
+                (("FortniteStats", "Overwatch"), "🎮 Fortnite / Overwatch"),
                 ("UFC", "🥊 UFC / Fight Night"),
             ),
         ),
         (
-            "🔔 Alerts",
+            "━━ 🔔  ALERTS  ━━",
             (("TwitchAlerts", "📺 Twitch Alerts"),),
         ),
     )
@@ -89,6 +87,16 @@ class ChannelGuide(commands.Cog):
             return "*No channel configured*"
         return " ".join(f"<#{channel_id}>" for channel_id in channel_ids)
 
+    @staticmethod
+    def _combined_channels(rules: Dict[str, List[int]], cog_names) -> List[int]:
+        """Combine channels for grouped cogs while preserving YAML order."""
+        combined: List[int] = []
+        for cog_name in cog_names:
+            for channel_id in rules.get(cog_name, []):
+                if channel_id not in combined:
+                    combined.append(channel_id)
+        return combined
+
     def build_embed(self) -> discord.Embed:
         rules = self._load_rules()
 
@@ -103,10 +111,18 @@ class ChannelGuide(commands.Cog):
 
         for section_title, entries in self.SECTIONS:
             lines = []
-            for cog_name, label in entries:
-                if cog_name not in rules:
-                    continue
-                lines.append(f"**{label}** → {self._channel_mentions(rules[cog_name])}")
+            for cog_key, label in entries:
+                if isinstance(cog_key, tuple):
+                    present = [name for name in cog_key if name in rules]
+                    if not present:
+                        continue
+                    channel_ids = self._combined_channels(rules, present)
+                else:
+                    if cog_key not in rules:
+                        continue
+                    channel_ids = rules[cog_key]
+
+                lines.append(f"**{label}** → {self._channel_mentions(channel_ids)}")
 
             if lines:
                 embed.add_field(
