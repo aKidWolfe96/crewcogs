@@ -65,6 +65,7 @@ CONFIG.register_member(
     daily_state={},
     weekly_state={},
     daily_stipend_at=0.0,
+    daily_spin_at=0.0,
     bailout_claimed_at=0.0,
     scratch_claimed_at=0.0,
 )

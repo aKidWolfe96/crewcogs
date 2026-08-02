@@ -1,10 +1,11 @@
 import random
+import time
 from pathlib import Path
 
 import discord
 from redbot.core import bank, commands
 
-from .casino_core import safe_deposit, settle_game
+from .casino_core import CONFIG, safe_deposit, settle_game
 
 
 class DailySpin(commands.Cog):
@@ -13,23 +14,25 @@ class DailySpin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.dice_path = Path(__file__).parent / "dice"
-        self._spin_cooldowns = commands.CooldownMapping.from_cooldown(
-            1, 86400, commands.BucketType.user
-        )
 
     @commands.command()
     @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
     @commands.guild_only()
     async def dailyspin(self, ctx: commands.Context):
         """Claim daily CrewCoin or risk it in a higher/lower dice game."""
-        bucket = self._spin_cooldowns.get_bucket(ctx.message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            retry_timestamp = int(ctx.message.created_at.timestamp() + retry_after)
+        now = time.time()
+        last = float(await CONFIG.member(ctx.author).daily_spin_at())
+        cooldown = 86400
+        remaining = int(cooldown - (now - last))
+        if remaining > 0:
+            retry_timestamp = int(now + remaining)
             return await ctx.send(
                 f"🕒 You already claimed your daily spin. Try again <t:{retry_timestamp}:R>."
             )
 
+        # Start the cooldown as soon as the offer is generated, matching the old
+        # command cooldown behavior even if the player lets the offer expire.
+        await CONFIG.member(ctx.author).daily_spin_at.set(now)
         amount = random.randint(100, 1000)
         await ctx.send(
             f"🎲 **Ruthless Dealer Daily Spin**\nYou earned **{amount:,} CrewCoin**!\n"

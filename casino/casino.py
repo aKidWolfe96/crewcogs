@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import random
 import time
@@ -74,6 +75,98 @@ class Casino(commands.Cog):
         stored = await CONFIG.guild(guild).freebies()
         defaults.update(stored or {})
         return defaults
+
+    @commands.command(name="timer", aliases=["timers", "cooldowns", "rewardtimer"])
+    @commands.guild_only()
+    async def reward_timers(self, ctx: commands.Context):
+        """Show every persistent casino reward cooldown and challenge reset."""
+        settings = await self._freebie_settings(ctx.guild)
+        data = await CONFIG.member(ctx.author).all()
+        now = time.time()
+        balance = await bank.get_balance(ctx.author)
+        currency = await bank.get_currency_name(ctx.guild)
+        reward_ready_times = []
+
+        def timer_line(label: str, emoji: str, last_key: str, cooldown: int, enabled: bool = True) -> str:
+            if not enabled:
+                return f"⚫ **{label}** — Disabled"
+            remaining = int(cooldown - (now - float(data.get(last_key, 0.0))))
+            if remaining <= 0:
+                reward_ready_times.append((0, label))
+                return f"✅ **{label}** — Ready now"
+            ready_at = int(now + remaining)
+            reward_ready_times.append((remaining, label))
+            return f"{emoji} **{label}** — <t:{ready_at}:R> (`{self._cooldown_text(remaining)}`)"
+
+        reward_lines = [
+            timer_line(
+                "Daily Stipend", "🎁", "daily_stipend_at",
+                int(settings["daily_cooldown"]), bool(settings["daily_enabled"]),
+            ),
+            timer_line("Daily Spin", "🎲", "daily_spin_at", 86400),
+            timer_line(
+                "Scratch Ticket", "🎟️", "scratch_claimed_at",
+                int(settings["scratch_cooldown"]), bool(settings["scratch_enabled"]),
+            ),
+        ]
+
+        if not settings["claim_enabled"]:
+            reward_lines.append("⚫ **Ruthless Dealer Bailout** — Disabled")
+        else:
+            threshold = max(0, int(settings["claim_threshold"]))
+            remaining = int(
+                int(settings["claim_cooldown"])
+                - (now - float(data.get("bailout_claimed_at", 0.0)))
+            )
+            if balance >= threshold:
+                reward_lines.append(
+                    f"🔒 **Ruthless Dealer Bailout** — Balance must be below "
+                    f"**{threshold:,} {currency}** (yours: **{balance:,}**)"
+                )
+            elif remaining <= 0:
+                reward_ready_times.append((0, "Ruthless Dealer Bailout"))
+                reward_lines.append("✅ **Ruthless Dealer Bailout** — Ready now")
+            else:
+                ready_at = int(now + remaining)
+                reward_ready_times.append((remaining, "Ruthless Dealer Bailout"))
+                reward_lines.append(
+                    f"🎩 **Ruthless Dealer Bailout** — <t:{ready_at}:R> "
+                    f"(`{self._cooldown_text(remaining)}`)"
+                )
+
+        now_utc = datetime.now(timezone.utc)
+        next_daily = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        days_until_monday = 7 - now_utc.weekday()
+        next_weekly = (now_utc + timedelta(days=days_until_monday)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        daily_remaining = max(0, int((next_daily - now_utc).total_seconds()))
+        weekly_remaining = max(0, int((next_weekly - now_utc).total_seconds()))
+        reset_lines = [
+            f"☀️ **Daily Challenges** — <t:{int(next_daily.timestamp())}:R> "
+            f"(`{self._cooldown_text(daily_remaining)}`)",
+            f"🗓️ **Weekly Challenges** — <t:{int(next_weekly.timestamp())}:R> "
+            f"(`{self._cooldown_text(weekly_remaining)}`)",
+        ]
+
+        embed = discord.Embed(
+            title="⏱️ Ruthless Dealer Timers",
+            color=discord.Color.gold(),
+        )
+        embed.add_field(name="🎁 Reward Cooldowns", value="\n".join(reward_lines), inline=False)
+        embed.add_field(name="🎯 Challenge Resets", value="\n".join(reset_lines), inline=False)
+
+        if reward_ready_times:
+            ready_now = [label for remaining, label in reward_ready_times if remaining <= 0]
+            if ready_now:
+                next_text = "Ready now: " + ", ".join(ready_now)
+            else:
+                remaining, label = min(reward_ready_times)
+                next_text = f"Next reward: {label} in {self._cooldown_text(remaining)}"
+            embed.set_footer(text=f"{next_text} • Challenge resets use UTC.")
+        else:
+            embed.set_footer(text="Challenge resets use UTC.")
+        await ctx.send(embed=embed)
 
     @commands.command(name="daily", aliases=["stipend"])
     @commands.guild_only()
