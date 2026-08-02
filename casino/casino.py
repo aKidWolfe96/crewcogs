@@ -76,7 +76,7 @@ class Casino(commands.Cog):
         defaults.update(stored or {})
         return defaults
 
-    @commands.command(name="timer", aliases=["timers", "cooldowns", "rewardtimer"])
+    @commands.command(name="cooldowns", aliases=["rewardcooldowns"])
     @commands.guild_only()
     async def reward_timers(self, ctx: commands.Context):
         """Show every persistent casino reward cooldown and challenge reset."""
