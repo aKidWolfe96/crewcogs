@@ -250,13 +250,22 @@ class UFC(commands.Cog):
         async with ctx.typing():
             results = await espn_api_status(self.session)
         lines = [f"aiohttp: {getattr(aiohttp, '__version__', 'unknown')}"]
+        healthy = True
         for label, ok, detail in results:
-            lines.append(f"{'OK' if ok else 'FAIL'} {label}: {detail}")
+            legacy = "(legacy)" in label
+            if ok:
+                state = "OK"
+            elif legacy:
+                state = "WARN"
+            else:
+                state = "FAIL"
+                healthy = False
+            lines.append(f"{state} {label}: {detail}")
         text = "\n".join(lines)
         e = discord.Embed(
             title="🥊 UFC API Status",
             description=f"```text\n{text[:3800]}\n```",
-            color=0x2ECC71 if all(x[1] for x in results) else 0xE67E22,
+            color=0x2ECC71 if healthy else 0xE67E22,
         )
         e.set_footer(text="ESPN endpoint diagnostics • safe to paste back here")
         await ctx.send(embed=e)

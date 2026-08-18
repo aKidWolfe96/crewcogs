@@ -12,6 +12,7 @@ Everything degrades gracefully: if one source is down, the others still answer.
 import re
 import logging
 import time
+import asyncio
 import aiohttp
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
@@ -23,6 +24,8 @@ log = logging.getLogger("red.akidwolfe.fightnight.api")
 # ── endpoints ─────────────────────────────────────────────────────────────────
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
 ESPN_SEARCH     = "https://site.web.api.espn.com/apis/common/v3/search"
+ESPN_WEB_HEADER = "https://site.web.api.espn.com/apis/v2/scoreboard/header"
+ESPN_FIGHTCENTER = "https://site.web.api.espn.com/apis/common/v3/sports/mma/ufc/fightcenter/{id}"
 
 # athlete detail has moved around over the years — we try each in order
 ESPN_ATHLETE_ENDPOINTS = [
@@ -40,7 +43,9 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/html, */*",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.espn.com/",
 }
 
 
@@ -91,6 +96,203 @@ def _norm(s: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 #  EVENTS  (card / results)
 # ════════════════════════════════════════════════════════════════════════════
+
+
+
+async def _web_header_data(session: aiohttp.ClientSession, ymd: str) -> Optional[dict]:
+    """Fetch ESPN's web scoreboard header for a single date.
+
+    This is hosted on site.web.api.espn.com, which is separate from the
+    site.api.espn.com scoreboard host that may return Akamai 403s to bots.
+    """
+    url = (
+        f"{ESPN_WEB_HEADER}?sport=mma&league=ufc&region=us&lang=en"
+        f"&contentorigin=espn&buyWindow=1m&showAirings=buy%2Clive%2Creplay"
+        f"&tz=America%2FNew_York&dates={ymd}"
+    )
+    return await _get_json(session, url)
+
+
+def _web_header_events_from_data(data: dict) -> list:
+    """Extract events from the web scoreboard/header response."""
+    if not isinstance(data, dict):
+        return []
+    direct = data.get("events")
+    if isinstance(direct, list):
+        return direct
+    for sport in (data.get("sports") or []):
+        for league in ((sport or {}).get("leagues") or []):
+            events = (league or {}).get("events") or []
+            if isinstance(events, list) and events:
+                return events
+    return []
+
+
+async def _web_header_events(session: aiohttp.ClientSession, ymd: str) -> list:
+    data = await _web_header_data(session, ymd)
+    return _web_header_events_from_data(data or {})
+
+
+async def _web_find_event(session: aiohttp.ClientSession, *, forward: bool,
+                          days: int = 21, exact_ymd: str = "") -> Optional[dict]:
+    """Find a real UFC event using the site.web.api scoreboard/header feed."""
+    now = datetime.now(timezone.utc)
+    if exact_ymd:
+        dates = [exact_ymd]
+    else:
+        base = now.date()
+        offsets = range(0, days + 1)
+        if not forward:
+            offsets = range(0, days + 1)
+        dates = []
+        for i in offsets:
+            d = base + timedelta(days=i if forward else -i)
+            dates.append(d.strftime("%Y%m%d"))
+
+    for ymd in dates:
+        events = await _web_header_events(session, ymd)
+        real = [e for e in events if _is_ufc_event(e)]
+        if not real:
+            continue
+        parsed = [(d, e) for e in real if (d := _parse_date(e))]
+        if not parsed:
+            # If ESPN omitted the date but returned a single real UFC event for
+            # the explicitly requested day, keep it rather than failing.
+            return real[0]
+        if forward:
+            eligible = [(d, e) for d, e in parsed if d >= now - LIVE_WINDOW]
+            if eligible:
+                eligible.sort(key=lambda x: x[0])
+                return eligible[0][1]
+        else:
+            eligible = [(d, e) for d, e in parsed if d <= now]
+            if eligible:
+                eligible.sort(key=lambda x: x[0], reverse=True)
+                return eligible[0][1]
+    return None
+
+
+async def _fightcenter_data(session: aiohttp.ClientSession, eid: str) -> Optional[dict]:
+    if not eid:
+        return None
+    url = (
+        ESPN_FIGHTCENTER.format(id=eid)
+        + "?region=us&lang=en&contentorigin=espn"
+        + "&showAirings=buy%2Clive%2Creplay&buyWindow=1m"
+    )
+    return await _get_json(session, url)
+
+
+def _fightcenter_location(event: dict) -> str:
+    venue = event.get("venue") or {}
+    name = venue.get("fullName", "") or venue.get("name", "")
+    addr = venue.get("address") or {}
+    city = addr.get("city", "")
+    state = addr.get("state", "")
+    country = addr.get("country", "")
+    place = ", ".join(x for x in (city, state, country) if x)
+    if name and place:
+        return f"{name} — {place}"
+    return name or place or event.get("location", "") or ""
+
+
+def _fmt_fightcenter(data: dict) -> Optional[dict]:
+    """Normalize site.web.api ESPN FightCenter JSON into the cog event shape."""
+    if not isinstance(data, dict):
+        return None
+    event = data.get("event") or {}
+    if not event:
+        return None
+
+    competitions = []
+    cards = data.get("cards") or {}
+    # ESPN has used main/prelims1/prelims2 and a few naming variants.
+    preferred = ("main", "prelims1", "prelims2", "prelims", "earlyPrelims", "early")
+    seen = set()
+    for key in preferred:
+        card = cards.get(key) or {}
+        for comp in (card.get("competitions") or []):
+            cid = str((comp or {}).get("id", ""))
+            marker = cid or id(comp)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            competitions.append(comp or {})
+    for key, card in cards.items():
+        if key in preferred or not isinstance(card, dict):
+            continue
+        for comp in (card.get("competitions") or []):
+            cid = str((comp or {}).get("id", ""))
+            marker = cid or id(comp)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            competitions.append(comp or {})
+
+    fights = []
+    for comp in competitions:
+        competitors = comp.get("competitors") or []
+        if len(competitors) < 2:
+            continue
+        red_c, blue_c = competitors[0] or {}, competitors[1] or {}
+        winner = ""
+        for c in competitors:
+            if (c or {}).get("winner"):
+                winner = _athlete_name(c or {})
+                break
+
+        status = comp.get("status") or {}
+        status_type = status.get("type") or {}
+        result = status.get("result") or {}
+        method = (
+            result.get("displayName", "")
+            or result.get("shortDisplayName", "")
+            or status_type.get("description", "")
+            or ""
+        )
+        completed = bool(status_type.get("completed") or winner)
+        weight_class = _competition_label(comp)
+        notes = comp.get("notes") or []
+        note_blob = " ".join(str((n or {}).get("text", "") or "") for n in notes)
+        title_blob = f"{weight_class} {comp.get('note', '')} {note_blob}".lower()
+
+        fights.append({
+            "red": _athlete_name(red_c),
+            "blue": _athlete_name(blue_c),
+            "red_record": _athlete_record(red_c),
+            "blue_record": _athlete_record(blue_c),
+            "weight_class": weight_class,
+            "is_title": "title" in title_blob or "championship" in title_blob,
+            "winner": winner,
+            "method": method,
+            "round": str(status.get("period", "") or ""),
+            "time": status.get("displayClock", "") or "",
+            "completed": completed,
+        })
+
+    dt = _parse_date(event)
+    return {
+        "id": str(event.get("id", "")),
+        "name": event.get("name", "UFC Event"),
+        "shortname": event.get("shortName", event.get("name", "UFC Event")),
+        "date": dt.strftime("%B %d, %Y") if dt else "",
+        "date_compact": dt.strftime("%Y%m%d") if dt else "",
+        "timestamp": int(dt.timestamp()) if dt else None,
+        "location": _fightcenter_location(event),
+        "fights": fights,
+    }
+
+
+async def _web_event_full(session: aiohttp.ClientSession, header_event: dict) -> Optional[dict]:
+    """Resolve a web-header event to its full FightCenter card."""
+    eid = str((header_event or {}).get("id", ""))
+    data = await _fightcenter_data(session, eid)
+    full = _fmt_fightcenter(data or {})
+    if full:
+        return full
+    # Last-resort normalization if FightCenter is temporarily unavailable.
+    return _fmt_event(header_event) if header_event else None
+
 
 async def _scoreboard_data(session: aiohttp.ClientSession, ymd: str = "") -> Optional[dict]:
     url = ESPN_SCOREBOARD if not ymd else f"{ESPN_SCOREBOARD}?dates={ymd}"
@@ -194,6 +396,8 @@ def _athlete_name(competitor: dict) -> str:
 
 
 def _athlete_record(competitor: dict) -> str:
+    if competitor.get("displayRecord"):
+        return str(competitor.get("displayRecord") or "")
     for stat in (competitor.get("statistics") or []):
         if stat.get("name") == "record":
             return stat.get("displayValue", "")
@@ -312,47 +516,42 @@ async def _calendar_ufc_entries(session: aiohttp.ClientSession) -> list:
 
 
 async def get_upcoming_event(session: aiohttp.ClientSession) -> Optional[dict]:
-    """Return the live/recently-started UFC card or the next actual UFC card.
+    """Return the current/next actual UFC card.
 
-    The default ESPN UFC scoreboard is frequently centered on Dana White's
-    Contender Series. First inspect that feed, then make ONE bounded date-range
-    request so the next true UFC card can be selected without a chain of dated
-    requests. Calendar walking remains only as a final fallback.
+    Primary path uses site.web.api ESPN endpoints because some networks receive
+    HTTP 403 from site.api.espn.com's scoreboard while site.web.api remains
+    reachable. The legacy scoreboard remains as a fallback.
     """
-    now = datetime.now(timezone.utc)
+    header = await _web_find_event(session, forward=True, days=21)
+    if header:
+        full = await _web_event_full(session, header)
+        if full:
+            return full
 
+    now = datetime.now(timezone.utc)
     raw = _select_current_or_next(await _scoreboard(session), now)
     if raw:
         return _fmt_event(raw)
-
     start = (now - timedelta(days=1)).strftime("%Y%m%d")
     end = (now + timedelta(days=21)).strftime("%Y%m%d")
     raw = _select_current_or_next(await _scoreboard_range(session, start, end), now)
-    if raw:
-        return _fmt_event(raw)
-
-    # Final fallback for an ESPN response that ignores/changes the range filter.
-    entries = await _calendar_ufc_entries(session)
-    candidates = [(d, e) for d, e in entries if d <= now and (now - d) <= LIVE_WINDOW]
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    candidates += sorted(((d, e) for d, e in entries if d > now), key=lambda x: x[0])
-    for _, entry in candidates[:2]:
-        raw = await _fetch_calendar_entry(session, entry)
-        if raw and _is_ufc_event(raw):
-            return _fmt_event(raw)
-    return None
+    return _fmt_event(raw) if raw else None
 
 
 async def get_recent_event(session: aiohttp.ClientSession) -> Optional[dict]:
     """Return the most recent actual UFC card, excluding DWCS/feeder events."""
-    now = datetime.now(timezone.utc)
+    header = await _web_find_event(session, forward=False, days=21)
+    if header:
+        full = await _web_event_full(session, header)
+        if full:
+            return full
 
+    now = datetime.now(timezone.utc)
     direct = [e for e in await _scoreboard(session) if _is_ufc_event(e)]
     past = [(d, e) for e in direct if (d := _parse_date(e)) and d < now]
     if past:
         past.sort(key=lambda x: x[0], reverse=True)
         return _fmt_event(past[0][1])
-
     start = (now - timedelta(days=21)).strftime("%Y%m%d")
     end = now.strftime("%Y%m%d")
     ranged = [e for e in await _scoreboard_range(session, start, end) if _is_ufc_event(e)]
@@ -360,23 +559,19 @@ async def get_recent_event(session: aiohttp.ClientSession) -> Optional[dict]:
     if past:
         past.sort(key=lambda x: x[0], reverse=True)
         return _fmt_event(past[0][1])
-
-    entries = await _calendar_ufc_entries(session)
-    past_entries = sorted(((d, e) for d, e in entries if d < now), key=lambda x: x[0], reverse=True)
-    for _, entry in past_entries[:2]:
-        raw = await _fetch_calendar_entry(session, entry)
-        dt = _parse_date(raw) if raw else None
-        if raw and _is_ufc_event(raw) and dt and dt < now:
-            return _fmt_event(raw)
     return None
 
 
 async def get_event_on_date(session: aiohttp.ClientSession, ymd: str) -> Optional[dict]:
-    """Fetch an actual UFC event on a specific ESPN scoreboard date."""
+    """Fetch an actual UFC event on a specific ESPN date."""
     if not ymd:
         return None
-    events = await _scoreboard(session, ymd)
-    for event in events:
+    for event in await _web_header_events(session, ymd):
+        if _is_ufc_event(event):
+            full = await _web_event_full(session, event)
+            if full:
+                return full
+    for event in await _scoreboard(session, ymd):
         if _is_ufc_event(event):
             return _fmt_event(event)
     return None
@@ -384,17 +579,24 @@ async def get_event_on_date(session: aiohttp.ClientSession, ymd: str) -> Optiona
 
 async def get_event_by_id(session: aiohttp.ClientSession, eid: str,
                           ymd: str = "") -> Optional[dict]:
-    """Fetch a specific event by id, using its stored date when available."""
+    """Fetch a specific event by id. FightCenter allows direct ID lookup."""
     eid = str(eid)
+    full = _fmt_fightcenter((await _fightcenter_data(session, eid)) or {})
+    if full:
+        return full
+
     if ymd:
-        # ESPN's dated bucket can land on an adjacent UTC/local day. Search the
-        # stored date plus one day on either side, but only accept an exact id.
         try:
             base = datetime.strptime(ymd, "%Y%m%d").replace(tzinfo=timezone.utc)
             ym_dates = [(base + timedelta(days=o)).strftime("%Y%m%d") for o in (0, -1, 1)]
         except ValueError:
             ym_dates = [ymd]
         for day in ym_dates:
+            for event in await _web_header_events(session, day):
+                if str(event.get("id")) == eid:
+                    resolved = await _web_event_full(session, event)
+                    if resolved:
+                        return resolved
             for event in await _scoreboard(session, day):
                 if str(event.get("id")) == eid:
                     return _fmt_event(event)
@@ -406,13 +608,18 @@ async def get_event_by_id(session: aiohttp.ClientSession, eid: str,
 
 
 async def espn_api_status(session: aiohttp.ClientSession) -> list:
-    """Probe the ESPN endpoints used by this cog and return Discord-safe results."""
+    """Probe both ESPN event routes plus fighter search."""
     now = datetime.now(timezone.utc)
+    today = now.strftime("%Y%m%d")
     start = (now - timedelta(days=1)).strftime("%Y%m%d")
     end = (now + timedelta(days=21)).strftime("%Y%m%d")
     probes = [
-        ("scoreboard", ESPN_SCOREBOARD),
-        ("date-range", f"{ESPN_SCOREBOARD}?dates={start}-{end}&limit=100"),
+        ("scoreboard (legacy)", ESPN_SCOREBOARD),
+        ("date-range (legacy)", f"{ESPN_SCOREBOARD}?dates={start}-{end}&limit=100"),
+        ("web-header (primary)",
+         f"{ESPN_WEB_HEADER}?sport=mma&league=ufc&region=us&lang=en&contentorigin=espn&dates={today}"),
+        ("fightcenter (primary)",
+         ESPN_FIGHTCENTER.format(id="600060493") + "?region=us&lang=en&contentorigin=espn"),
         ("fighter-search", f"{ESPN_SEARCH}?query={quote('Islam Makhachev')}&limit=3"),
     ]
     out = []

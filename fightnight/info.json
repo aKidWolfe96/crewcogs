@@ -1,11 +1,11 @@
 {
     "name": "UFC",
     "short": "UFC fight cards, results, fighter stats, and server picks.",
-    "description": "Display upcoming UFC fight cards, recent event results, fighter stats, and run a server-wide pick-em game with a leaderboard.",
+    "description": "Display upcoming UFC fight cards, recent event results, fighter stats, and run a server-wide pick-em game with a leaderboard. Uses ESPN web/FightCenter endpoints with legacy scoreboard fallback.",
     "author": [
         "aKidWolfe"
     ],
-    "version": "5.1.2",
+    "version": "5.1.3",
     "min_bot_version": "3.4.0",
     "min_python_version": [
         3,
