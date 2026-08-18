@@ -10,11 +10,15 @@ Sources (in order of preference, all free / no key):
 Everything degrades gracefully: if one source is down, the others still answer.
 """
 import re
+import logging
+import time
 import aiohttp
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from bs4 import BeautifulSoup
+
+log = logging.getLogger("red.akidwolfe.fightnight.api")
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
@@ -43,14 +47,29 @@ HEADERS = {
 # ── low-level fetch helpers ───────────────────────────────────────────────────
 
 async def _get_json(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
+    """Fetch JSON and log the real failure instead of silently swallowing it."""
     try:
-        async with session.get(url, headers=HEADERS,
-                               timeout=aiohttp.ClientTimeout(total=12)) as r:
-            if r.status == 200:
+        async with session.get(
+            url,
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True,
+        ) as r:
+            if r.status != 200:
+                try:
+                    body = (await r.text())[:300].replace("\n", " ")
+                except Exception:
+                    body = "<unreadable body>"
+                log.warning("HTTP %s fetching %s :: %s", r.status, url, body)
+                return None
+            try:
                 return await r.json(content_type=None)
-    except Exception:
-        pass
-    return None
+            except Exception as exc:
+                log.warning("Invalid JSON from %s: %r", url, exc)
+                return None
+    except Exception as exc:
+        log.warning("Request failed for %s: %s: %s", url, type(exc).__name__, exc)
+        return None
 
 
 async def _get_html(session: aiohttp.ClientSession, url: str) -> Optional[str]:
@@ -81,6 +100,32 @@ async def _scoreboard_data(session: aiohttp.ClientSession, ymd: str = "") -> Opt
 async def _scoreboard(session: aiohttp.ClientSession, ymd: str = "") -> list:
     data = await _scoreboard_data(session, ymd)
     return data.get("events", []) if data else []
+
+
+async def _scoreboard_range(session: aiohttp.ClientSession, start_ymd: str, end_ymd: str) -> list:
+    """Return ESPN events over a date range in one request.
+
+    ESPN's default UFC scoreboard can be centered on DWCS. A range request is
+    considerably more reliable than walking calendar dates one request at a
+    time and is supported by the same scoreboard backend.
+    """
+    url = f"{ESPN_SCOREBOARD}?dates={start_ymd}-{end_ymd}&limit=100"
+    data = await _get_json(session, url)
+    return data.get("events", []) if data else []
+
+
+def _select_current_or_next(events: list, now: datetime) -> Optional[dict]:
+    real = [e for e in (events or []) if _is_ufc_event(e)]
+    parsed = [(d, e) for e in real if (d := _parse_date(e))]
+    live = [(d, e) for d, e in parsed if d <= now and (now - d) <= LIVE_WINDOW]
+    if live:
+        live.sort(key=lambda x: x[0], reverse=True)
+        return live[0][1]
+    future = [(d, e) for d, e in parsed if d > now]
+    if future:
+        future.sort(key=lambda x: x[0])
+        return future[0][1]
+    return None
 
 
 def _parse_date(event: dict) -> Optional[datetime]:
@@ -269,32 +314,29 @@ async def _calendar_ufc_entries(session: aiohttp.ClientSession) -> list:
 async def get_upcoming_event(session: aiohttp.ClientSession) -> Optional[dict]:
     """Return the live/recently-started UFC card or the next actual UFC card.
 
-    ESPN mixes Dana White's Contender Series into the same league feed. This
-    function deliberately filters feeder shows and uses ESPN's calendar to find
-    the next UFC card even when the default scoreboard is currently showing DWCS.
+    The default ESPN UFC scoreboard is frequently centered on Dana White's
+    Contender Series. First inspect that feed, then make ONE bounded date-range
+    request so the next true UFC card can be selected without a chain of dated
+    requests. Calendar walking remains only as a final fallback.
     """
     now = datetime.now(timezone.utc)
 
-    # Prefer a fully populated UFC event already present in the default feed.
-    direct = [e for e in await _scoreboard(session) if _is_ufc_event(e)]
-    parsed = [(d, e) for e in direct if (d := _parse_date(e))]
-    live = [(d, e) for d, e in parsed if d <= now and (now - d) <= LIVE_WINDOW]
-    if live:
-        live.sort(key=lambda x: x[0], reverse=True)
-        return _fmt_event(live[0][1])
-    future = [(d, e) for d, e in parsed if d > now]
-    if future:
-        future.sort(key=lambda x: x[0])
-        return _fmt_event(future[0][1])
+    raw = _select_current_or_next(await _scoreboard(session), now)
+    if raw:
+        return _fmt_event(raw)
 
-    # The default scoreboard is often centered on DWCS. Use the calendar to
-    # locate the nearest actual UFC card and then fetch its dated scoreboard.
+    start = (now - timedelta(days=1)).strftime("%Y%m%d")
+    end = (now + timedelta(days=21)).strftime("%Y%m%d")
+    raw = _select_current_or_next(await _scoreboard_range(session, start, end), now)
+    if raw:
+        return _fmt_event(raw)
+
+    # Final fallback for an ESPN response that ignores/changes the range filter.
     entries = await _calendar_ufc_entries(session)
     candidates = [(d, e) for d, e in entries if d <= now and (now - d) <= LIVE_WINDOW]
     candidates.sort(key=lambda x: x[0], reverse=True)
     candidates += sorted(((d, e) for d, e in entries if d > now), key=lambda x: x[0])
-
-    for _, entry in candidates[:4]:
+    for _, entry in candidates[:2]:
         raw = await _fetch_calendar_entry(session, entry)
         if raw and _is_ufc_event(raw):
             return _fmt_event(raw)
@@ -311,9 +353,17 @@ async def get_recent_event(session: aiohttp.ClientSession) -> Optional[dict]:
         past.sort(key=lambda x: x[0], reverse=True)
         return _fmt_event(past[0][1])
 
+    start = (now - timedelta(days=21)).strftime("%Y%m%d")
+    end = now.strftime("%Y%m%d")
+    ranged = [e for e in await _scoreboard_range(session, start, end) if _is_ufc_event(e)]
+    past = [(d, e) for e in ranged if (d := _parse_date(e)) and d < now]
+    if past:
+        past.sort(key=lambda x: x[0], reverse=True)
+        return _fmt_event(past[0][1])
+
     entries = await _calendar_ufc_entries(session)
     past_entries = sorted(((d, e) for d, e in entries if d < now), key=lambda x: x[0], reverse=True)
-    for _, entry in past_entries[:4]:
+    for _, entry in past_entries[:2]:
         raw = await _fetch_calendar_entry(session, entry)
         dt = _parse_date(raw) if raw else None
         if raw and _is_ufc_event(raw) and dt and dt < now:
@@ -353,6 +403,44 @@ async def get_event_by_id(session: aiohttp.ClientSession, eid: str,
         if str(event.get("id")) == eid:
             return _fmt_event(event)
     return None
+
+
+async def espn_api_status(session: aiohttp.ClientSession) -> list:
+    """Probe the ESPN endpoints used by this cog and return Discord-safe results."""
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=1)).strftime("%Y%m%d")
+    end = (now + timedelta(days=21)).strftime("%Y%m%d")
+    probes = [
+        ("scoreboard", ESPN_SCOREBOARD),
+        ("date-range", f"{ESPN_SCOREBOARD}?dates={start}-{end}&limit=100"),
+        ("fighter-search", f"{ESPN_SEARCH}?query={quote('Islam Makhachev')}&limit=3"),
+    ]
+    out = []
+    for label, url in probes:
+        t0 = time.perf_counter()
+        try:
+            async with session.get(
+                url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as r:
+                elapsed = int((time.perf_counter() - t0) * 1000)
+                body = await r.text()
+                json_ok = False
+                if r.status == 200:
+                    try:
+                        import json
+                        json.loads(body)
+                        json_ok = True
+                    except Exception:
+                        pass
+                detail = f"HTTP {r.status}, {elapsed}ms, json={'yes' if json_ok else 'no'}"
+                if r.status != 200:
+                    detail += f", body={body[:100].replace(chr(10), ' ')}"
+                out.append((label, r.status == 200 and json_ok, detail))
+        except Exception as exc:
+            elapsed = int((time.perf_counter() - t0) * 1000)
+            out.append((label, False, f"{type(exc).__name__}: {exc} ({elapsed}ms)"))
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════════

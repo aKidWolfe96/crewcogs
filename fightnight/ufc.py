@@ -26,7 +26,7 @@ from redbot.core.bot import Red
 
 from .api import (
     get_upcoming_event, get_recent_event,
-    get_event_on_date, get_event_by_id, get_fighter,
+    get_event_on_date, get_event_by_id, get_fighter, espn_api_status,
 )
 from . import embeds
 
@@ -219,7 +219,8 @@ class UFC(commands.Cog):
                 event = await get_upcoming_event(self.session)
             if not event:
                 return await ctx.send(embed=embeds.error_embed(
-                    "Couldn't fetch the upcoming UFC card from ESPN right now."))
+                    "Couldn't fetch the upcoming UFC card from ESPN right now.\n\n"
+                    f"Run `{ctx.clean_prefix}ufc apistatus` and send me the output."))
             try:
                 card = embeds.card_embed(event)
             except Exception:
@@ -241,6 +242,24 @@ class UFC(commands.Cog):
             await ctx.send(embed=embeds.error_embed(
                 "ESPN responded, but the card data could not be parsed. "
                 "Check the Red console for `Unexpected error in ufc card`."))
+
+    @ufc.command(name="apistatus")
+    @checks.admin_or_permissions(administrator=True)
+    async def ufc_apistatus(self, ctx):
+        """Test the ESPN endpoints used by the cog and report failures in Discord."""
+        async with ctx.typing():
+            results = await espn_api_status(self.session)
+        lines = [f"aiohttp: {getattr(aiohttp, '__version__', 'unknown')}"]
+        for label, ok, detail in results:
+            lines.append(f"{'OK' if ok else 'FAIL'} {label}: {detail}")
+        text = "\n".join(lines)
+        e = discord.Embed(
+            title="🥊 UFC API Status",
+            description=f"```text\n{text[:3800]}\n```",
+            color=0x2ECC71 if all(x[1] for x in results) else 0xE67E22,
+        )
+        e.set_footer(text="ESPN endpoint diagnostics • safe to paste back here")
+        await ctx.send(embed=e)
 
     @ufc.command(name="results")
     async def ufc_results(self, ctx):
