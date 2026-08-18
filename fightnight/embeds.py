@@ -325,7 +325,7 @@ def bets_embed(member, bets: list, currency="credits", max_bets=3) -> discord.Em
     """bets: list of {fighter, opponent, amount}"""
     e = discord.Embed(title=f"💰  {member.display_name}'s Active Bets", color=UFC_GOLD)
     if not bets:
-        e.description = ("No active bets.\nUse `!ufc bet <fighter> <amount>` to place one "
+        e.description = ("No active bets.\nUse `!ufc bet <amount> <fighter>` to place one "
                          f"(max {max_bets} per card).")
         return e
     lines, total = [], 0

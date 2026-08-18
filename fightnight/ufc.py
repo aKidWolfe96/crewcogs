@@ -393,6 +393,7 @@ class UFC(commands.Cog):
                 "You don't have a bet on that fight."))
 
         refund = bet["amount"]
+        bet_pick = bet.get("pick", picked)
         await bank.deposit_credits(ctx.author, refund)
 
         async with self.config.guild(ctx.guild).events() as evs_w:
@@ -410,7 +411,7 @@ class UFC(commands.Cog):
                (await self.config.guild(ctx.guild).events()).get(eid, {}).get("bets", {}).items()
                if uid in ub})
         await ctx.send(embed=embeds.unbet_embed(
-            ctx.author, picked, refund, currency=currency, slots_left=MAX_BETS - used))
+            ctx.author, bet_pick, refund, currency=currency, slots_left=MAX_BETS - used))
 
     # ── bets ───────────────────────────────────────────────────────────────-
 
@@ -521,6 +522,15 @@ class UFC(commands.Cog):
                         "Use the event date as `YYYY-MM-DD`."))
                 settled_names.append(results["shortname"])
                 for eid, bucket in evs.items():
+                    # A forced date must never score unrelated event buckets.
+                    # Prefer the exact ESPN event id; the stored date is only a
+                    # migration fallback for older buckets.
+                    meta = bucket.get("meta", {})
+                    stored_date = str(meta.get("date_compact", "") or "")
+                    if str(eid) != str(results.get("id", "")) and stored_date not in {
+                        ymd, str(results.get("date_compact", "") or "")
+                    }:
+                        continue
                     d, r = _score_picks(bucket.get("picks", {}), results)
                     _merge_deltas(total_deltas, d)
                     resolved_by_event.setdefault(eid, []).extend(r)
@@ -540,6 +550,21 @@ class UFC(commands.Cog):
                     # different event merely because it occurred on the same day.
                     results = await get_event_by_id(self.session, eid, ymd)
                     if not results:
+                        # This is the case that used to leave old picks/bets
+                        # stuck forever: once ESPN stopped returning the card,
+                        # settle simply skipped the bucket. If the stored card
+                        # is safely expired, void it and refund all open bets.
+                        if _event_is_stale(meta):
+                            stale_pick_count += sum(
+                                1 for _fight_key, _uid, _picked
+                                in _all_entries(bucket.get("picks", {}))
+                            )
+                            for _fight_key, uid, bet in _all_entries(bucket.get("bets", {})):
+                                amount = int((bet or {}).get("amount", 0) or 0)
+                                if amount > 0:
+                                    stale_refunds[uid] = stale_refunds.get(uid, 0) + amount
+                            stale_events.add(eid)
+                            settled_names.append(meta.get("shortname", meta.get("name", "Expired event")))
                         continue
                     d, r = _score_picks(bucket.get("picks", {}), results)
                     if r:

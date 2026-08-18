@@ -73,8 +73,13 @@ def _norm(s: str) -> str:
 #  EVENTS  (card / results)
 # ════════════════════════════════════════════════════════════════════════════
 
-async def _scoreboard(session: aiohttp.ClientSession) -> list:
-    data = await _get_json(session, ESPN_SCOREBOARD)
+async def _scoreboard_data(session: aiohttp.ClientSession, ymd: str = "") -> Optional[dict]:
+    url = ESPN_SCOREBOARD if not ymd else f"{ESPN_SCOREBOARD}?dates={ymd}"
+    return await _get_json(session, url)
+
+
+async def _scoreboard(session: aiohttp.ClientSession, ymd: str = "") -> list:
+    data = await _scoreboard_data(session, ymd)
     return data.get("events", []) if data else []
 
 
@@ -83,6 +88,53 @@ def _parse_date(event: dict) -> Optional[datetime]:
         return datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _is_ufc_name(name: str) -> bool:
+    """True for actual UFC cards/Fight Nights, excluding DWCS and other feeder shows."""
+    n = _norm(name)
+    return n.startswith("ufc ") or n.startswith("noche ufc")
+
+
+def _is_ufc_event(event: dict) -> bool:
+    return _is_ufc_name(event.get("name", "") or event.get("shortName", ""))
+
+
+def _calendar_event_id(entry: dict) -> str:
+    ref = str((entry.get("event") or {}).get("$ref", ""))
+    m = re.search(r"/events/(\d+)", ref)
+    return m.group(1) if m else ""
+
+
+def _calendar_date(entry: dict) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(entry.get("startDate", "")).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+async def _fetch_calendar_entry(session: aiohttp.ClientSession, entry: dict) -> Optional[dict]:
+    """Resolve a calendar entry to the full scoreboard event.
+
+    ESPN's calendar start date can be offset from the scoreboard's dated bucket,
+    so search the calendar day plus one day on either side and match by event id.
+    """
+    target_id = _calendar_event_id(entry)
+    dt = _calendar_date(entry)
+    if not dt:
+        return None
+
+    for offset in (0, -1, 1):
+        ymd = (dt + timedelta(days=offset)).strftime("%Y%m%d")
+        events = await _scoreboard(session, ymd)
+        if target_id:
+            for event in events:
+                if str(event.get("id", "")) == target_id:
+                    return event
+        for event in events:
+            if _is_ufc_event(event) and _norm(event.get("name", "")) == _norm(entry.get("label", "")):
+                return event
+    return None
 
 
 def _athlete_record(competitor: dict) -> str:
@@ -108,6 +160,17 @@ def _event_location(raw: dict) -> str:
     return raw.get("location", "")
 
 
+def _competition_label(comp: dict) -> str:
+    ctype = comp.get("type", {}) or {}
+    return (
+        ctype.get("text", "")
+        or ctype.get("displayName", "")
+        or ctype.get("abbreviation", "")
+        or comp.get("note", "")
+        or ""
+    )
+
+
 def _fmt_event(raw: dict) -> dict:
     fights = []
     for comp in raw.get("competitions", []):
@@ -127,21 +190,23 @@ def _fmt_event(raw: dict) -> dict:
             if any(k in t.lower() for k in ["ko", "tko", "sub", "decision", "round"]):
                 method = t
                 break
-        # some payloads expose method on the status type
         if not method:
             st = comp.get("status", {}).get("type", {})
             method = st.get("description", "") if st.get("completed") else ""
 
         status = comp.get("status", {})
         completed = bool(status.get("type", {}).get("completed"))
+        weight_class = _competition_label(comp)
+        note_blob = " ".join(str(n.get("text", "")) for n in comp.get("notes", []))
+        title_blob = f"{weight_class} {comp.get('note', '')} {note_blob}".lower()
 
         fights.append({
             "red":         red_c.get("athlete", {}).get("displayName", "TBD"),
             "blue":        blue_c.get("athlete", {}).get("displayName", "TBD"),
             "red_record":  _athlete_record(red_c),
             "blue_record": _athlete_record(blue_c),
-            "weight_class": comp.get("type", {}).get("text", "") or comp.get("note", ""),
-            "is_title":    "title" in (comp.get("type", {}).get("text", "") or "").lower(),
+            "weight_class": weight_class,
+            "is_title":    "title" in title_blob or "championship" in title_blob,
             "winner":      winner,
             "method":      method,
             "round":       str(status.get("period", "") or ""),
@@ -167,77 +232,107 @@ def _fmt_event(raw: dict) -> dict:
 LIVE_WINDOW = timedelta(hours=24)
 
 
-async def get_upcoming_event(session: aiohttp.ClientSession) -> Optional[dict]:
-    """
-    Return the current or next event.
+async def _calendar_ufc_entries(session: aiohttp.ClientSession) -> list:
+    data = await _scoreboard_data(session)
+    if not data:
+        return []
+    entries = []
+    leagues = data.get("leagues") or [{}]
+    for entry in leagues[0].get("calendar", []):
+        if not _is_ufc_name(entry.get("label", "")):
+            continue
+        dt = _calendar_date(entry)
+        if dt:
+            entries.append((dt, entry))
+    return entries
 
-    A live event (started within the last 24h) counts as "current" — otherwise
-    the moment a card begins it would stop being "upcoming" and `card`/`picks`
-    would break mid-event. Falls back to the soonest future event.
+
+async def get_upcoming_event(session: aiohttp.ClientSession) -> Optional[dict]:
+    """Return the live/recently-started UFC card or the next actual UFC card.
+
+    ESPN mixes Dana White's Contender Series into the same league feed. This
+    function deliberately filters feeder shows and uses ESPN's calendar to find
+    the next UFC card even when the default scoreboard is currently showing DWCS.
     """
     now = datetime.now(timezone.utc)
-    events = await _scoreboard(session)
-    parsed = [(d, e) for e in events if (d := _parse_date(e))]
-    if not parsed:
-        return None
 
-    # 1) live / just-started events (most recent first)
+    # Prefer a fully populated UFC event already present in the default feed.
+    direct = [e for e in await _scoreboard(session) if _is_ufc_event(e)]
+    parsed = [(d, e) for e in direct if (d := _parse_date(e))]
     live = [(d, e) for d, e in parsed if d <= now and (now - d) <= LIVE_WINDOW]
     if live:
         live.sort(key=lambda x: x[0], reverse=True)
         return _fmt_event(live[0][1])
-
-    # 2) soonest genuinely-future event
     future = [(d, e) for d, e in parsed if d > now]
     if future:
         future.sort(key=lambda x: x[0])
         return _fmt_event(future[0][1])
 
+    # The default scoreboard is often centered on DWCS. Use the calendar to
+    # locate the nearest actual UFC card and then fetch its dated scoreboard.
+    entries = await _calendar_ufc_entries(session)
+    candidates = [(d, e) for d, e in entries if d <= now and (now - d) <= LIVE_WINDOW]
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates += sorted(((d, e) for d, e in entries if d > now), key=lambda x: x[0])
+
+    for _, entry in candidates[:4]:
+        raw = await _fetch_calendar_entry(session, entry)
+        if raw and _is_ufc_event(raw):
+            return _fmt_event(raw)
     return None
 
 
 async def get_recent_event(session: aiohttp.ClientSession) -> Optional[dict]:
-    """Most recent PAST event in the scoreboard window. Never returns a future card."""
+    """Return the most recent actual UFC card, excluding DWCS/feeder events."""
     now = datetime.now(timezone.utc)
-    events = await _scoreboard(session)
-    past = [(d, e) for e in events if (d := _parse_date(e)) and d < now]
-    if not past:
-        return None  # do NOT fall back to a future event
-    past.sort(key=lambda x: x[0], reverse=True)
-    return _fmt_event(past[0][1])
+
+    direct = [e for e in await _scoreboard(session) if _is_ufc_event(e)]
+    past = [(d, e) for e in direct if (d := _parse_date(e)) and d < now]
+    if past:
+        past.sort(key=lambda x: x[0], reverse=True)
+        return _fmt_event(past[0][1])
+
+    entries = await _calendar_ufc_entries(session)
+    past_entries = sorted(((d, e) for d, e in entries if d < now), key=lambda x: x[0], reverse=True)
+    for _, entry in past_entries[:4]:
+        raw = await _fetch_calendar_entry(session, entry)
+        dt = _parse_date(raw) if raw else None
+        if raw and _is_ufc_event(raw) and dt and dt < now:
+            return _fmt_event(raw)
+    return None
 
 
 async def get_event_on_date(session: aiohttp.ClientSession, ymd: str) -> Optional[dict]:
-    """
-    Fetch the event on a specific date (ymd = 'YYYYMMDD') via ESPN's dated
-    scoreboard. Works even after the event has dropped out of the default window
-    — this is what lets settle find the RIGHT past card.
-    """
+    """Fetch an actual UFC event on a specific ESPN scoreboard date."""
     if not ymd:
         return None
-    data = await _get_json(session, f"{ESPN_SCOREBOARD}?dates={ymd}")
-    events = data.get("events", []) if data else []
-    if not events:
-        return None
-    return _fmt_event(events[0])
+    events = await _scoreboard(session, ymd)
+    for event in events:
+        if _is_ufc_event(event):
+            return _fmt_event(event)
+    return None
 
 
 async def get_event_by_id(session: aiohttp.ClientSession, eid: str,
                           ymd: str = "") -> Optional[dict]:
-    """Fetch a specific event by id, using its date to query the dated scoreboard."""
+    """Fetch a specific event by id, using its stored date when available."""
     eid = str(eid)
     if ymd:
-        data = await _get_json(session, f"{ESPN_SCOREBOARD}?dates={ymd}")
-        for e in (data or {}).get("events", []):
-            if str(e.get("id")) == eid:
-                return _fmt_event(e)
-        # Do not fall back to an arbitrary event from the same date. Multiple
-        # UFC/ESPN events can share a scoreboard date, and settling the wrong
-        # card would corrupt picks and payouts.
-    # last resort: current scoreboard
-    for e in await _scoreboard(session):
-        if str(e.get("id")) == eid:
-            return _fmt_event(e)
+        # ESPN's dated bucket can land on an adjacent UTC/local day. Search the
+        # stored date plus one day on either side, but only accept an exact id.
+        try:
+            base = datetime.strptime(ymd, "%Y%m%d").replace(tzinfo=timezone.utc)
+            ym_dates = [(base + timedelta(days=o)).strftime("%Y%m%d") for o in (0, -1, 1)]
+        except ValueError:
+            ym_dates = [ymd]
+        for day in ym_dates:
+            for event in await _scoreboard(session, day):
+                if str(event.get("id")) == eid:
+                    return _fmt_event(event)
+
+    for event in await _scoreboard(session):
+        if str(event.get("id")) == eid:
+            return _fmt_event(event)
     return None
 
 
