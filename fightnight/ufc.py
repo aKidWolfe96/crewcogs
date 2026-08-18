@@ -18,6 +18,7 @@ Commands
 """
 import asyncio
 import aiohttp
+import logging
 import discord
 from datetime import datetime, timezone, timedelta
 from redbot.core import commands, Config, checks, bank
@@ -148,6 +149,9 @@ def _merge_outcomes(total: dict, part: dict):
         s["lost"] += o["lost"]
 
 
+log = logging.getLogger("red.akidwolfe.fightnight")
+
+
 class UFC(commands.Cog):
     """UFC fight cards, results, fighter stats, and a server pick-em game."""
 
@@ -210,12 +214,33 @@ class UFC(commands.Cog):
 
     @ufc.command(name="card")
     async def ufc_card(self, ctx):
-        async with ctx.typing():
-            event = await get_upcoming_event(self.session)
-        if not event:
-            return await ctx.send(embed=embeds.error_embed(
-                "Couldn't fetch the upcoming card right now. Try again shortly."))
-        await ctx.send(embed=embeds.card_embed(event))
+        try:
+            async with ctx.typing():
+                event = await get_upcoming_event(self.session)
+            if not event:
+                return await ctx.send(embed=embeds.error_embed(
+                    "Couldn't fetch the upcoming UFC card from ESPN right now."))
+            try:
+                card = embeds.card_embed(event)
+            except Exception:
+                log.exception("Failed to build UFC card embed for event %s", event.get("id"))
+                # Keep the command useful even if ESPN slips in an unexpected field.
+                card = discord.Embed(
+                    title=f"🥊  {event.get('name') or 'Upcoming UFC Event'}",
+                    color=0xD20A0A,
+                    description=(
+                        f"📅  {event.get('date') or 'Date TBD'}\n"
+                        f"📍  {event.get('location') or 'Location TBD'}\n\n"
+                        "ESPN returned the event, but one or more bout fields could not be formatted."
+                    ),
+                )
+                card.set_footer(text="UFC • via ESPN")
+            await ctx.send(embed=card)
+        except Exception:
+            log.exception("Unexpected error in ufc card")
+            await ctx.send(embed=embeds.error_embed(
+                "ESPN responded, but the card data could not be parsed. "
+                "Check the Red console for `Unexpected error in ufc card`."))
 
     @ufc.command(name="results")
     async def ufc_results(self, ctx):

@@ -137,27 +137,39 @@ async def _fetch_calendar_entry(session: aiohttp.ClientSession, entry: dict) -> 
     return None
 
 
+def _athlete_name(competitor: dict) -> str:
+    """Return a safe display name even when ESPN sends a null athlete object."""
+    athlete = competitor.get("athlete") or {}
+    return (
+        athlete.get("displayName")
+        or athlete.get("fullName")
+        or athlete.get("shortName")
+        or "TBD"
+    )
+
+
 def _athlete_record(competitor: dict) -> str:
-    for s in competitor.get("statistics", []):
-        if s.get("name") == "record":
-            return s.get("displayValue", "")
-    rec = competitor.get("records")
+    for stat in (competitor.get("statistics") or []):
+        if stat.get("name") == "record":
+            return stat.get("displayValue", "")
+    rec = competitor.get("records") or []
     if isinstance(rec, list) and rec:
-        return rec[0].get("summary", "")
-    return competitor.get("athlete", {}).get("record", "") or ""
+        return (rec[0] or {}).get("summary", "")
+    athlete = competitor.get("athlete") or {}
+    return athlete.get("record", "") or ""
 
 
 def _event_location(raw: dict) -> str:
-    comps = raw.get("competitions", [])
+    comps = raw.get("competitions") or []
     if comps:
-        venue = comps[0].get("venue", {})
+        venue = (comps[0] or {}).get("venue") or {}
         loc = venue.get("fullName", "")
-        addr = venue.get("address", {})
+        addr = venue.get("address") or {}
         city = addr.get("city", "")
         if loc and city:
             return f"{loc} — {city}"
-        return loc or raw.get("location", "")
-    return raw.get("location", "")
+        return loc or raw.get("location", "") or ""
+    return raw.get("location", "") or ""
 
 
 def _competition_label(comp: dict) -> str:
@@ -173,36 +185,41 @@ def _competition_label(comp: dict) -> str:
 
 def _fmt_event(raw: dict) -> dict:
     fights = []
-    for comp in raw.get("competitions", []):
-        competitors = comp.get("competitors", [])
+    for comp in (raw.get("competitions") or []):
+        comp = comp or {}
+        competitors = comp.get("competitors") or []
         if len(competitors) < 2:
             continue
-        red_c, blue_c = competitors[0], competitors[1]
+        red_c, blue_c = (competitors[0] or {}), (competitors[1] or {})
 
         winner = ""
         for c in competitors:
+            c = c or {}
             if c.get("winner"):
-                winner = c.get("athlete", {}).get("displayName", "")
+                winner = _athlete_name(c)
 
+        notes = comp.get("notes") or []
         method = ""
-        for note in comp.get("notes", []):
-            t = note.get("text", "")
+        for note in notes:
+            note = note or {}
+            t = str(note.get("text", "") or "")
             if any(k in t.lower() for k in ["ko", "tko", "sub", "decision", "round"]):
                 method = t
                 break
-        if not method:
-            st = comp.get("status", {}).get("type", {})
-            method = st.get("description", "") if st.get("completed") else ""
 
-        status = comp.get("status", {})
-        completed = bool(status.get("type", {}).get("completed"))
+        status = comp.get("status") or {}
+        status_type = status.get("type") or {}
+        if not method:
+            method = status_type.get("description", "") if status_type.get("completed") else ""
+
+        completed = bool(status_type.get("completed"))
         weight_class = _competition_label(comp)
-        note_blob = " ".join(str(n.get("text", "")) for n in comp.get("notes", []))
+        note_blob = " ".join(str((n or {}).get("text", "") or "") for n in notes)
         title_blob = f"{weight_class} {comp.get('note', '')} {note_blob}".lower()
 
         fights.append({
-            "red":         red_c.get("athlete", {}).get("displayName", "TBD"),
-            "blue":        blue_c.get("athlete", {}).get("displayName", "TBD"),
+            "red":         _athlete_name(red_c),
+            "blue":        _athlete_name(blue_c),
             "red_record":  _athlete_record(red_c),
             "blue_record": _athlete_record(blue_c),
             "weight_class": weight_class,
@@ -237,8 +254,10 @@ async def _calendar_ufc_entries(session: aiohttp.ClientSession) -> list:
     if not data:
         return []
     entries = []
-    leagues = data.get("leagues") or [{}]
-    for entry in leagues[0].get("calendar", []):
+    leagues = data.get("leagues") or []
+    if not leagues:
+        return []
+    for entry in ((leagues[0] or {}).get("calendar") or []):
         if not _is_ufc_name(entry.get("label", "")):
             continue
         dt = _calendar_date(entry)
