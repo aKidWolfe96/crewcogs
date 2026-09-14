@@ -1,0 +1,13 @@
+{
+    "author": ["aKidWolfe96"],
+    "name": "KrewFantasy",
+    "short": "Full Sleeper fantasy football automation and analytics for Krusty.",
+    "description": "Connects a Sleeper NFL league to Discord with scoreboards, standings, matchup previews, automatic trade and waiver reports, lineup alerts, 10 weekly trophies, optimal-lineup analysis, all-play win matrix, luck index, power rankings, trophy case, recaps, playoff brackets, trending players, FAAB and season charts.",
+    "install_msg": "KrewFantasy installed. Load it, then run `[p]ff setup <Sleeper league URL or ID>` and `[p]ff link @member <Sleeper team name>`. Use `[p]ff schedule` to see automatic report times.",
+    "requirements": ["Pillow>=10.0"],
+    "tags": ["fantasy", "football", "nfl", "sleeper", "sports"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
