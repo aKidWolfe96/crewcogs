@@ -30,6 +30,7 @@ class YouTubeAlerts(commands.Cog):
         self.config.register_global(
             api_key=None,
             interval=300,  # seconds
+            seen={},       # channel_id -> {last_upload, last_live}
         )
         self.config.register_guild(
             channel=None,
@@ -41,9 +42,6 @@ class YouTubeAlerts(commands.Cog):
             show_thumbnail=True,
         )
 
-        self._seen_live = {}      # channel_id -> video_id
-        self._seen_uploads = {}   # channel_id -> video_id
-        self._seeded = False
         self.check_youtube.start()
 
     def cog_unload(self):
@@ -107,6 +105,7 @@ class YouTubeAlerts(commands.Cog):
         return live
 
     async def _get_latest_upload(self, channel_id: str) -> Optional[dict]:
+        """Return the newest normal upload, ignoring livestreams and stream replays."""
         data = await self._api_get("channels", {"part": "contentDetails", "id": channel_id})
         if not data or not data.get("items"):
             return None
@@ -115,16 +114,58 @@ class YouTubeAlerts(commands.Cog):
         data = await self._api_get("playlistItems", {
             "part": "snippet",
             "playlistId": playlist_id,
-            "maxResults": 1
+            "maxResults": 10
         })
-        if data and data.get("items"):
-            item = data["items"][0]
+        if not data or not data.get("items"):
+            return None
+
+        candidates = []
+        for item in data["items"]:
+            snippet = item.get("snippet", {})
+            resource = snippet.get("resourceId", {})
+            video_id = resource.get("videoId")
+            if video_id:
+                candidates.append((video_id, snippet))
+
+        if not candidates:
+            return None
+
+        details = await self._api_get("videos", {
+            "part": "snippet,liveStreamingDetails",
+            "id": ",".join(video_id for video_id, _ in candidates),
+            "maxResults": len(candidates),
+        })
+        if not details or not details.get("items"):
+            return None
+
+        details_by_id = {item.get("id"): item for item in details["items"] if item.get("id")}
+
+        # Playlist items are newest-first. Skip anything that is/was a livestream.
+        for video_id, playlist_snippet in candidates:
+            video = details_by_id.get(video_id)
+            if not video:
+                continue
+            if video.get("liveStreamingDetails"):
+                continue
+
+            snippet = video.get("snippet", playlist_snippet)
+            thumbnails = snippet.get("thumbnails", {})
+            thumbnail = (
+                thumbnails.get("maxres")
+                or thumbnails.get("standard")
+                or thumbnails.get("high")
+                or thumbnails.get("medium")
+                or thumbnails.get("default")
+                or {}
+            ).get("url")
+
             return {
-                "video_id": item["snippet"]["resourceId"]["videoId"],
-                "title": item["snippet"]["title"],
-                "channel_title": item["snippet"]["channelTitle"],
-                "thumbnail": item["snippet"]["thumbnails"]["high"]["url"]
+                "video_id": video_id,
+                "title": snippet.get("title", "New YouTube upload"),
+                "channel_title": snippet.get("channelTitle", "YouTube"),
+                "thumbnail": thumbnail,
             }
+
         return None
 
     # ------------------------------------------------------------------ #
@@ -151,26 +192,33 @@ class YouTubeAlerts(commands.Cog):
 
         live = await self._get_live_streams(channel_ids)
 
-        if not self._seeded:
-            for cid, info in live.items():
-                self._seen_live[cid] = info["video_id"]
-            self._seeded = True
-            return
+        # Persist seen IDs in Red Config so bot/cog restarts do not re-announce
+        # old uploads or old/current livestreams as if they were new.
+        async with self.config.seen() as seen:
+            for cid in channel_ids:
+                upload = await self._get_latest_upload(cid)
+                live_info = live.get(cid)
+                state = seen.get(cid)
 
-        # Live announcements
-        for cid, info in live.items():
-            if self._seen_live.get(cid) == info["video_id"]:
-                continue
-            self._seen_live[cid] = info["video_id"]
-            await self._announce(cid, info, is_live=True)
+                # First time this channel is observed: seed silently.
+                # This prevents the latest existing video/current live from being
+                # announced immediately after install, reload, or adding a channel.
+                if not state:
+                    seen[cid] = {
+                        "last_upload": upload["video_id"] if upload else None,
+                        "last_live": live_info["video_id"] if live_info else None,
+                    }
+                    continue
 
-        # Upload announcements
-        for cid in channel_ids:
-            upload = await self._get_latest_upload(cid)
-            if not upload or self._seen_uploads.get(cid) == upload["video_id"]:
-                continue
-            self._seen_uploads[cid] = upload["video_id"]
-            await self._announce(cid, upload, is_live=False)
+                if live_info and state.get("last_live") != live_info["video_id"]:
+                    state["last_live"] = live_info["video_id"]
+                    await self._announce(cid, live_info, is_live=True)
+
+                if upload and state.get("last_upload") != upload["video_id"]:
+                    state["last_upload"] = upload["video_id"]
+                    await self._announce(cid, upload, is_live=False)
+
+                seen[cid] = state
 
     @check_youtube.before_loop
     async def _before_check(self):
@@ -300,7 +348,8 @@ class YouTubeAlerts(commands.Cog):
                 return await ctx.send("Already watching that channel.")
             chans.append(cid)
 
-        self._seeded = False
+        # No global reseed is needed. The next poll will initialize this
+        # channel silently so existing uploads/lives are not announced as new.
         await ctx.send(f"✅ Now watching **{cid}**.")
 
     @youtubset.command(name="remove", aliases=["del"])
