@@ -24,7 +24,7 @@ DEFAULT_GAME_SETTINGS = {
 }
 GAME_LABELS = {
     "blackjack": "🃏 Blackjack", "coinflip": "🪙 Coin Flip", "slots": "🎰 Slots",
-    "roulette": "🎡 Roulette", "highlow": "🂡 High/Low", "crash": "🚀 Crash", "mines": "💣 Mines",
+    "roulette": "🎡 Roulette", "highlow": "↕️ High/Low", "crash": "🚀 Crash", "mines": "💣 Mines",
     "dailyspin": "🎲 Daily Spin",
 }
 
