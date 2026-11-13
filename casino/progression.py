@@ -25,7 +25,7 @@ ACHIEVEMENTS: Tuple[dict, ...] = (
     {"id":"lucky_devil","emoji":"🍀","name":"Lucky Devil","description":"Win 250 Ruthless Dealer casino games.","stat":"wins","goal":250,"reward":0},
     {"id":"wheel_regular","emoji":"🎡","name":"Wheel Regular","description":"Win 75 Roulette games.","stat":"games.roulette.wins","goal":75,"reward":0},
     {"id":"slot_regular","emoji":"💎","name":"Reel Regular","description":"Win 75 Slots games.","stat":"games.slots.wins","goal":75,"reward":0},
-    {"id":"highlow_regular","emoji":"🂡","name":"Higher or Lower","description":"Win 50 High/Low games.","stat":"games.highlow.wins","goal":50,"reward":0},
+    {"id":"highlow_regular","emoji":"↕️","name":"Higher or Lower","description":"Win 50 High/Low games.","stat":"games.highlow.wins","goal":50,"reward":0},
     {"id":"daily_regular","emoji":"☀️","name":"Daily Regular","description":"Complete Daily Spin 30 times.","stat":"games.dailyspin.games","goal":30,"reward":0},
     {"id":"daily_dedication","emoji":"📅","name":"Daily Dedication","description":"Complete 30 daily challenges.","stat":"daily_completed","goal":30,"reward":0},
     {"id":"weekly_warrior","emoji":"🗓️","name":"Weekly Warrior","description":"Complete 12 weekly challenges.","stat":"weekly_completed","goal":12,"reward":0},

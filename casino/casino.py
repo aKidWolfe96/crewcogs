@@ -17,7 +17,7 @@ LOBBY_GAMES = (
     ("Coin Flip", "🪙", "CoinFlip", "coinflip"),
     ("Slots", "🎰", "Slots", "slots"),
     ("Roulette", "🎡", "Roulette", "roulette"),
-    ("High/Low", "🂡", "HighLow", "highlow"),
+    ("High/Low", "↕️", "HighLow", "highlow"),
     ("Crash", "🚀", "Crash", "crash"),
     ("Mines", "💣", "Mines", "mines"),
 )
@@ -185,7 +185,7 @@ class Casino(commands.Cog):
         embed.add_field(name="🪙 Coin Flip", value=f"`{p}cf <bet> [heads|tails]` · win pays **2×**", inline=False)
         embed.add_field(name="🎰 Slots", value=f"`{p}slots <bet>` · three alike **5×–100×** (7️⃣ 100×, 💎 50×, ⭐ 25×) · any pair **1.5×**", inline=False)
         embed.add_field(name="🎡 Roulette", value=f"`{p}roulette <bet> [red|black|odd|even|low|high|1st12|col1|0-36]` · numbers **35:1** · dozens/columns **2:1** · the rest **1:1**\n`{p}rtable` — open a shared table everyone can bet on", inline=False)
-        embed.add_field(name="🂡 High/Low", value=f"`{p}hl <bet>` · up to 7 guesses, cash out any time · 1.2× → 4.75×", inline=False)
+        embed.add_field(name="↕️ High/Low", value=f"`{p}hl <bet>` · up to 7 guesses, cash out any time · 1.2× → 4.75×", inline=False)
         embed.add_field(name="🚀 Crash", value=f"`{p}crash <bet> [auto]` · cash out before the rocket crashes · e.g. `{p}crash 500 2` auto-cashes at 2×", inline=False)
         embed.add_field(name="💣 Mines", value=f"`{p}mines <bet> [1-10 mines]` · each gem raises the multiplier · hit a mine and lose", inline=False)
         embed.add_field(name="🎁 Free credits", value=f"`{p}daily` — stipend (streak bonus up to +70%), daily spin, scratch ticket and bailout", inline=False)
