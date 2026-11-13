@@ -1,26 +1,16 @@
 """
 PokéBot – Red-DiscordBot cog
-Converted from a discord.js standalone bot.
+Converted from a discord.js standalone bot, then reworked around buttons.
 
-Commands (all prefixed, no slash commands):
-  [p]start        – Begin journey / pick starter
-  [p]profile      – View trainer profile
-  [p]pokemon      – Browse collection
-  [p]active       – Switch active Pokémon
-  [p]nickname     – Nickname a Pokémon
-  [p]dex          – Pokédex lookup
-  [p]pokedex      – Your Pokédex (caught species)
-  [p]dexpage      – Browse Pokédex by page
-  [p]catch        – Catch a wild Pokémon
-  [p]shop         – Browse PokéMart
-  [p]buy          – Buy items in bulk
-  [p]use          – Use a healing item
-  [p]inventory    – View your bag
-  [p]battle       – Challenge another trainer
-  [p]move         – Use a move in battle
-  [p]tms         – Browse TM shop
-  [p]buytm       – Buy a TM
-  [p]usetm       – Teach a TM move to a Pokémon
+Highlights
+  • Wild spawns come with buttons: throw any ball in one tap, or press
+    📖 "Do I have it?" to see privately whether the species is already in your
+    Pokédex (plus your odds, berries and ball counts).
+  • `heal` revives and restores your whole party (or `heal all` for the whole
+    collection) in one go — and offers a one-click purchase for anything missing.
+  • Battles, trades, releases, evolutions and starters use buttons / menus.
+  • Every change to a trainer's save goes through a per-trainer lock, so
+    simultaneous commands can no longer overwrite each other.
 """
 from __future__ import annotations
 
@@ -31,27 +21,34 @@ import math
 import random
 import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone, timedelta
 import zoneinfo
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import aiohttp
 import discord
 from redbot.core import Config, bank, commands, checks
 from redbot.core.bot import Red
+from redbot.core.data_manager import cog_data_path
 from redbot.core.errors import BalanceTooHigh
 
 from .embeds import (
-    COLORS, TYPE_EMOJIS, error_embed, hp_bar, pokemon_embed,
-    success_embed, type_tag,
+    COLORS, RARITY_BADGES, artwork_url, dex_no, error_embed, hp_bar, hp_line,
+    info_embed, mon_name, pokemon_embed, pretty_move, sprite_url,
+    success_embed, type_badges, type_color, type_tag, xp_bar,
 )
+from .healing import plan_heal
 from .pokeapi import (
     MAX_POKEMON, build_pokemon_instance, calculate_type_effectiveness,
-    catch_rate, effectiveness_label, fetch_move_data, fetch_pokemon,
-    get_random_pokemon_id, resolve_pokemon_id, set_cache_dir, pokemon_rarity,
+    catch_rate, clean_slug, effectiveness_label, fetch_move_data, fetch_pokemon,
+    get_random_pokemon_id, set_cache_dir,
     new_uid, ensure_uids, ensure_party, party_mons, uid_index,
     estimate_hit, boss_counter_damage,
+)
+from .ui import (
+    BattleView, ConfirmView, HealShortcutView, HealView, LinkButtonsView, MovePickerView,
+    RaidJoinView, RequestView, ShopView, SpawnView, StarterView, ThrowPanelView,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -220,11 +217,15 @@ async def _deposit(member: discord.Member, amount: int) -> None:
         await bank.set_balance(member, e.max_balance)
 
 async def _withdraw(member: discord.Member, amount: int) -> bool:
-    """Remove `amount` from the member's bank balance. Returns False if insufficient funds."""
-    balance = await bank.get_balance(member)
-    if balance < amount:
+    """Remove `amount` from the member's bank balance. Returns False if they can't afford it."""
+    if amount <= 0:
+        return True
+    try:
+        if not await bank.can_spend(member, amount):
+            return False
+        await bank.withdraw_credits(member, amount)
+    except ValueError:  # balance changed between the check and the withdrawal
         return False
-    await bank.withdraw_credits(member, amount)
     return True
 
 async def _currency_name(guild: discord.Guild) -> str:
@@ -265,6 +266,7 @@ class PaginatedView(discord.ui.View):
         self.total_pages = total_pages
         self.page        = initial_page
         self.author_id   = author_id
+        self.message: Optional[discord.Message] = None
         self._update_buttons()
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -300,23 +302,23 @@ class PaginatedView(discord.ui.View):
 
     # ── buttons ───────────────────────────────────────────────────────────────
 
-    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary, custom_id="pg_first")
+    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary)
     async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._go(interaction, 1)
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="pg_prev")
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary)
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._go(interaction, self.page - 1)
 
-    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.secondary, custom_id="pg_counter", disabled=True)
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.secondary, disabled=True)
     async def btn_counter(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer()   # non-interactive; just a label
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="pg_next")
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary)
     async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._go(interaction, self.page + 1)
 
-    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary, custom_id="pg_last")
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary)
     async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._go(interaction, self.total_pages)
 
@@ -361,7 +363,7 @@ class DexShinyView(discord.ui.View):
         self.toggle.label = "Normal Form" if self.shiny else "Shiny Form"
         self.toggle.emoji = "🎨" if self.shiny else "✨"
 
-    @discord.ui.button(label="Shiny Form", emoji="✨", style=discord.ButtonStyle.primary, custom_id="dex_shiny")
+    @discord.ui.button(label="Shiny Form", emoji="✨", style=discord.ButtonStyle.primary)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
@@ -381,6 +383,57 @@ class DexShinyView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-trainer lock
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TrainerLock:
+    """An asyncio lock that the *same task* may re-enter.
+
+    A command takes its trainer's lock for its whole run; helpers it calls can
+    take the lock again without deadlocking, while other tasks (another command,
+    a button press, a background raid/battle payout) wait their turn.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional[asyncio.Task] = None
+        self._depth = 0
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def acquire(self, timeout: Optional[float] = None) -> bool:
+        task = asyncio.current_task()
+        if self._owner is task and task is not None:
+            self._depth += 1
+            return True
+        if timeout is None:
+            await self._lock.acquire()
+        else:
+            # Poll rather than wait_for(): cancelling a wait_for'd acquire can leak the lock.
+            deadline = time.monotonic() + timeout
+            while self._lock.locked():
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(0.2)
+            await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return True
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth <= 0:
+            self._depth = 0
+            self._owner = None
+            self._lock.release()
+
+
+class TrainerBusy(Exception):
+    """Raised when a trainer's save is held by another action for too long."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -404,6 +457,9 @@ class PokéBot(commands.Cog):
         self._trades:       Dict[int, dict]           = {}  # target_user_id -> pending trade offer
         self._raids:        Dict[int, dict]           = {}  # guild_id   -> active raid
         self._raid_tasks:   Dict[int, asyncio.Task]   = {}  # guild_id   -> raid loop task
+        self._locks:        Dict[Tuple[int, int], TrainerLock] = {}  # (guild, user) -> save lock
+        self._spawning:     set                       = set()  # channel ids with a spawn being built
+        self._evo_cache:    Dict[str, dict]           = {}  # evolution-chain url -> chain json
 
         self.config = Config.get_conf(self, identifier=0x504F4B45424F54, force_registration=True)
 
@@ -450,8 +506,8 @@ class PokéBot(commands.Cog):
         self.config.register_guild(**default_guild)
         self.config.register_member(**default_member)
 
-        cache_path = Path(__file__).parent / "data" / "pokemon_cache"
-        set_cache_dir(cache_path)
+        # Cache PokéAPI data in Red's data folder (survives `[p]cog update`, never read-only).
+        set_cache_dir(cog_data_path(self) / "pokemon_cache")
 
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -459,16 +515,86 @@ class PokéBot(commands.Cog):
 
     async def cog_load(self) -> None:
         self._session = aiohttp.ClientSession()
+        # When the cog is (re)loaded on a running bot, on_ready never fires again —
+        # start the spawn loops right away instead of waiting for a chat message.
+        if self.bot.is_ready():
+            for guild in self.bot.guilds:
+                self._ensure_spawn_task(guild)
 
     async def cog_unload(self) -> None:
-        for task in self._spawn_tasks.values():
+        for task in (*self._spawn_tasks.values(), *self._flee_tasks.values(), *self._raid_tasks.values()):
             task.cancel()
-        for task in self._flee_tasks.values():
-            task.cancel()
-        for task in self._raid_tasks.values():
-            task.cancel()
+        for spawn in self._spawn_cache.values():
+            view = spawn.get("view")
+            if view is not None:
+                view.stop()
         if self._session:
             await self._session.close()
+
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        """Delete a trainer's save in every server."""
+        all_members = await self.config.all_members()
+        for guild_id, members in all_members.items():
+            if user_id in members:
+                await self.config.member_from_ids(guild_id, user_id).clear()
+
+    # ── Checks & locking ──────────────────────────────────────────────────────
+
+    # Commands that never change a save (or manage their own locking) run unlocked.
+    _UNLOCKED_COMMANDS = {
+        "pokeset", "pokespawn", "pokedexsync", "raidstart", "raidcancel", "raidstatus",
+        "raidswap", "raidjoin", "profile", "pokemon", "party", "dex", "pokedex", "pokeboard",
+        "pokestats", "pokehelp", "tms", "berries", "inventory", "shop", "battle", "move",
+        "forfeit", "trade",
+    }
+
+    async def cog_check(self, ctx: commands.Context) -> bool:
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage("PokéBot commands only work inside a server.")
+        return True
+
+    def _lock_for(self, guild_id: int, user_id: int) -> TrainerLock:
+        key = (guild_id, user_id)
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = self._locks[key] = TrainerLock()
+        return lock
+
+    async def cog_before_invoke(self, ctx: commands.Context) -> None:
+        if ctx.guild is None or ctx.command is None:
+            return
+        root = ctx.command.qualified_name.split(" ")[0]
+        if ctx.command.qualified_name in self._UNLOCKED_COMMANDS or root == "pokeset":
+            return
+        lock = self._lock_for(ctx.guild.id, ctx.author.id)
+        if not await lock.acquire(timeout=8):
+            raise commands.UserFeedbackCheckFailure(
+                "⏳ You're still in the middle of another PokéBot action — finish it first!"
+            )
+        ctx.__dict__["_pokebot_lock"] = lock
+
+    async def cog_after_invoke(self, ctx: commands.Context) -> None:
+        lock = ctx.__dict__.pop("_pokebot_lock", None)
+        if lock is not None:
+            lock.release()
+
+    @asynccontextmanager
+    async def _trainer(self, member: discord.Member, *, timeout: Optional[float] = None) -> AsyncIterator[Optional[dict]]:
+        """Lock a trainer, load a fresh copy of their save, and write it back on success.
+
+        Yields None (and saves nothing) if the member hasn't started yet.
+        Raises TrainerBusy if `timeout` elapses before the lock is free.
+        """
+        lock = self._lock_for(member.guild.id, member.id)
+        if not await lock.acquire(timeout=timeout):
+            raise TrainerBusy()
+        try:
+            player = await self._get_player(member)
+            yield player
+            if player is not None:
+                await self._save_player(member, player)
+        finally:
+            lock.release()
 
     # ── Player helpers ────────────────────────────────────────────────────────
 
@@ -597,19 +723,8 @@ class PokéBot(commands.Cog):
                 species = await r.json()
 
             chain_url = species["evolution_chain"]["url"]
-            # Check file cache first
-            cache_key = None
-            if hasattr(self, '_evo_cache'):
-                cache_key = chain_url
-                if chain_url in self._evo_cache:
-                    chain_data = self._evo_cache[chain_url]
-                else:
-                    async with self._session.get(chain_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                        r.raise_for_status()
-                        chain_data = await r.json()
-                    self._evo_cache[chain_url] = chain_data
-            else:
-                self._evo_cache: Dict[str, dict] = {}
+            chain_data = self._evo_cache.get(chain_url)
+            if chain_data is None:
                 async with self._session.get(chain_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                     r.raise_for_status()
                     chain_data = await r.json()
@@ -649,26 +764,58 @@ class PokéBot(commands.Cog):
     async def _notify_evo_if_ready(
         self, ctx: commands.Context, player: dict, poke_idx: int
     ) -> None:
-        """Send a one-time evolution-available notice if the Pokémon just became eligible."""
+        """Command-path wrapper: caller already holds the trainer lock and owns `player`."""
+        await self._notify_evo(ctx.channel, ctx.author, player, poke_idx, mention=False)
+
+    async def _notify_evo(
+        self,
+        channel: discord.abc.Messageable,
+        member: discord.Member,
+        player: dict,
+        poke_idx: int,
+        *,
+        mention: bool,
+    ) -> None:
+        """Send a one-time 'evolution available' notice. Caller must hold the trainer lock."""
+        if not (0 <= poke_idx < len(player["pokemon"])):
+            return
         poke = player["pokemon"][poke_idx]
-        # Only check if not already flagged
         if poke.get("evoNotified"):
             return
         evo = await self._fetch_evolution_target(poke)
-        if evo and self._evolution_eligible(poke, evo):
-            poke["evoNotified"] = True
-            await self._save_player(ctx.author, player)
-            min_lvl = evo["min_level"] or 20
-            await ctx.send(embed=discord.Embed(
-                title="✨ Evolution Available!",
-                description=(
-                    f"**{poke['displayName']}** can evolve into "
-                    f"**{evo['name'].capitalize()}** (reached Lv.{min_lvl})!\n\n"
-                    f"Use `evolve {poke_idx + 1}` to evolve it, or keep it as-is — "
-                    f"the choice is yours!"
-                ),
-                color=COLORS["yellow"],
-            ))
+        if not (evo and self._evolution_eligible(poke, evo)):
+            return
+        poke["evoNotified"] = True
+        await self._save_player(member, player)
+        min_lvl = evo["min_level"] or 20
+        embed = discord.Embed(
+            title="✨ Evolution available!",
+            description=(
+                f"{member.mention + ' — ' if mention else ''}**{mon_name(poke)}** can evolve into "
+                f"**{evo['name'].replace('-', ' ').title()}** (reached Lv.{min_lvl})!\n\n"
+                f"Use `evolve {poke_idx + 1}` whenever you're ready — or keep it as it is."
+            ),
+            color=COLORS["yellow"],
+        )
+        art = artwork_url(poke)
+        if art:
+            embed.set_thumbnail(url=art)
+        with suppress(discord.HTTPException):
+            await channel.send(embed=embed)
+
+    async def _notify_evo_background(self, channel: discord.abc.Messageable, member: discord.Member, uid: str) -> None:
+        """Background-task version: takes the lock and reloads the save first."""
+        try:
+            async with self._trainer(member, timeout=60) as player:
+                if player is None:
+                    return
+                idx = uid_index(player, uid)
+                if idx >= 0:
+                    await self._notify_evo(channel, member, player, idx, mention=True)
+        except TrainerBusy:
+            pass
+        except Exception:
+            log.exception("[PokéBot] background evolution check failed")
 
     def _update_dex(self, player: dict, pokemon: dict) -> bool:
         """Record a newly caught species in the player's Pokédex. Returns True if it's a new entry."""
@@ -680,26 +827,25 @@ class PokéBot(commands.Cog):
         return False
 
     def _build_battle_embed(self, battle: dict, log_lines: Optional[List[str]] = None) -> discord.Embed:
-        if log_lines is None:
-            log_lines = []
         p1, p2 = battle["player1"], battle["player2"]
         embed = discord.Embed(
-            title=f"⚔️ Pokémon Battle — Turn {battle['turn']}",
+            title=f"⚔️ Battle — Turn {battle['turn']}",
             color=COLORS["purple"],
         )
-        embed.add_field(
-            name=f"{p1['username']}'s {p1['pokemon']['displayName']}{'  ✨' if p1['pokemon'].get('shiny') else ''}",
-            value=f"Lv.{p1['pokemon']['level']} | HP: {hp_bar(p1['pokemon']['stats']['hp'], p1['pokemon']['stats']['maxHp'])} ({p1['pokemon']['stats']['hp']}/{p1['pokemon']['stats']['maxHp']})",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{p2['username']}'s {p2['pokemon']['displayName']}{'  ✨' if p2['pokemon'].get('shiny') else ''}",
-            value=f"Lv.{p2['pokemon']['level']} | HP: {hp_bar(p2['pokemon']['stats']['hp'], p2['pokemon']['stats']['maxHp'])} ({p2['pokemon']['stats']['hp']}/{p2['pokemon']['stats']['maxHp']})",
-            inline=False,
-        )
+        for side, icon in ((p1, "🔴"), (p2, "🔵")):
+            mon = side["pokemon"]
+            ready = " ✅ *move locked in*" if side.get("moveUsed") else ""
+            embed.add_field(
+                name=f"{icon} {side['username']} — {mon_name(mon)}",
+                value=f"Lv.{mon['level']} · {type_badges(mon['types'])}\n{hp_line(mon)}{ready}",
+                inline=False,
+            )
+        art = artwork_url(p1["pokemon"])
+        if art:
+            embed.set_thumbnail(url=art)
         if log_lines:
-            embed.add_field(name="Battle Log", value="\n".join(log_lines), inline=False)
-        embed.set_footer(text="Use `move <move_name>` to attack!")
+            embed.add_field(name="📜 Battle Log", value="\n".join(log_lines)[-1024:], inline=False)
+        embed.set_footer(text="Tap ⚔️ Choose Move (or use `move <name>`) · 3 min to act each turn")
         return embed
 
     async def _resolve_move(
@@ -806,189 +952,499 @@ class PokéBot(commands.Cog):
         loser_id: int,
         channel: Optional[discord.TextChannel] = None,
     ) -> List[str]:
-        """Conclude a battle. Returns list of level-up announcement strings."""
+        """Conclude a battle and pay out. Returns level-up announcement strings.
+
+        Runs outside any command lock (battles involve two trainers), so each
+        trainer's save is updated in turn under their own lock — never both at
+        once, which rules out deadlocks between two simultaneous battles.
+        """
         battle   = self._battles.pop(battle_id, None)
         lvl_msgs: List[str] = []
+        if not battle:
+            return lvl_msgs
 
-        winner_member = guild.get_member(winner_id)
-        loser_member  = guild.get_member(loser_id)
+        p1_is_winner = battle["player1"]["id"] == winner_id
+        win_side  = battle["player1"] if p1_is_winner else battle["player2"]
+        lose_side = battle["player2"] if p1_is_winner else battle["player1"]
+        opp_level = lose_side["pokemon"].get("level", 1)
+        turns     = battle.get("turn", 1)
 
-        # Opponent level for XP scaling — use the loser's Pokémon level
-        opp_level = 1
-        if battle:
-            p1_is_winner = battle["player1"]["id"] == winner_id
-            loser_battle_poke = battle["player2"]["pokemon"] if p1_is_winner else battle["player1"]["pokemon"]
-            opp_level = loser_battle_poke.get("level", 1)
-
-        turns = battle["turn"] if battle else 1
-
-        if winner_member:
-            winner_data = await self._get_player(winner_member)
-            if winner_data:
-                winner_data["wins"] = winner_data.get("wins", 0) + 1
-                wp  = winner_data["pokemon"][winner_data["activePokemonIndex"]]
-                # XP = base 80 + (opponent level × 3) + small turn bonus, capped to avoid abuse
-                xp_gain = min(80 + opp_level * 3 + turns * 2, 400)
-                wp["xp"] = wp.get("xp", 0) + xp_gain
-                msgs     = self._check_level_up(wp)
-                lvl_msgs.extend(msgs)
-                if battle:
-                    p1_is_winner       = battle["player1"]["id"] == winner_id
-                    winner_battle_poke = battle["player1"]["pokemon"] if p1_is_winner else battle["player2"]["pokemon"]
-                    wp["stats"]["hp"]  = max(1, winner_battle_poke["stats"]["hp"])
-                await self._save_player(winner_member, winner_data)
-                await _deposit(winner_member, 100)
-
-                # Evo notification — fire in background so it doesn't block
-                if channel and msgs:  # only check on level-up
-                    async def _winner_evo_check():
-                        await self._notify_evo_if_ready_member(
-                            channel, winner_member, winner_data,
-                            winner_data["activePokemonIndex"]
-                        )
-                    self.bot.loop.create_task(_winner_evo_check())
-
-        if loser_member:
-            loser_data = await self._get_player(loser_member)
-            if loser_data:
-                loser_data["losses"] = loser_data.get("losses", 0) + 1
-                lp = loser_data["pokemon"][loser_data["activePokemonIndex"]]
-                # Loser gets consolation XP — 30% of winner's gain, minimum 15
-                xp_consolation = max(15, math.floor((80 + opp_level * 3) * 0.30))
-                lp["xp"] = lp.get("xp", 0) + xp_consolation
-                loser_msgs = self._check_level_up(lp)
-                lvl_msgs.extend(loser_msgs)
-                if battle:
-                    p1_is_loser       = battle["player1"]["id"] == loser_id
-                    loser_battle_poke = battle["player1"]["pokemon"] if p1_is_loser else battle["player2"]["pokemon"]
-                    lp["stats"]["hp"] = 0  # fainted
-                await self._save_player(loser_member, loser_data)
-
-                if channel and loser_msgs:
-                    async def _loser_evo_check():
-                        await self._notify_evo_if_ready_member(
-                            channel, loser_member, loser_data,
-                            loser_data["activePokemonIndex"]
-                        )
-                    self.bot.loop.create_task(_loser_evo_check())
-
-        return lvl_msgs
-
-    async def _notify_evo_if_ready_member(
-        self,
-        channel: discord.TextChannel,
-        member: discord.Member,
-        player: dict,
-        poke_idx: int,
-    ) -> None:
-        """Send an evolution-available notice to a channel on behalf of a member."""
-        poke = player["pokemon"][poke_idx]
-        if poke.get("evoNotified"):
-            return
-        evo = await self._fetch_evolution_target(poke)
-        if evo and self._evolution_eligible(poke, evo):
-            poke["evoNotified"] = True
-            await self._save_player(member, player)
-            min_lvl = evo["min_level"] or 20
+        async def _apply(member_id: int, side: dict, won: bool) -> None:
+            member = guild.get_member(member_id)
+            if member is None:
+                return
+            evolve_uid = None
             try:
-                await channel.send(embed=discord.Embed(
-                    title="✨ Evolution Available!",
-                    description=(
-                        f"{member.mention} — **{poke['displayName']}** can evolve into "
-                        f"**{evo['name'].capitalize()}** (reached Lv.{min_lvl})!\n\n"
-                        f"Use `evolve {poke_idx + 1}` to evolve it, or keep it as-is — "
-                        f"the choice is yours!"
-                    ),
-                    color=COLORS["yellow"],
-                ))
-            except discord.HTTPException:
-                pass
+                async with self._trainer(member, timeout=60) as data:
+                    if data is None:
+                        return
+                    idx = uid_index(data, side["pokemon"].get("uid", ""))
+                    if idx < 0:
+                        idx = data["activePokemonIndex"]
+                    mon = data["pokemon"][idx]
+                    if won:
+                        data["wins"] = data.get("wins", 0) + 1
+                        # XP = base 80 + (opponent level × 3) + small turn bonus, capped
+                        xp_gain = min(80 + opp_level * 3 + turns * 2, 400)
+                        mon["stats"]["hp"] = max(1, min(side["pokemon"]["stats"]["hp"], mon["stats"]["maxHp"]))
+                    else:
+                        data["losses"] = data.get("losses", 0) + 1
+                        xp_gain = max(15, math.floor((80 + opp_level * 3) * 0.30))
+                        mon["stats"]["hp"] = 0  # fainted
+                    mon["xp"] = mon.get("xp", 0) + xp_gain
+                    msgs = self._check_level_up(mon)
+                    lvl_msgs.extend(msgs)
+                    if msgs:
+                        evolve_uid = mon["uid"]
+                if won:
+                    await _deposit(member, 100)
+            except TrainerBusy:
+                log.warning("[PokéBot] could not record battle result for %s (save busy)", member_id)
+                return
+            if channel is not None and evolve_uid:
+                self.bot.loop.create_task(self._notify_evo_background(channel, member, evolve_uid))
+
+        await _apply(winner_id, win_side, True)
+        await _apply(loser_id, lose_side, False)
+        return lvl_msgs
 
     # ── Spawn & Flee System ───────────────────────────────────────────────────
 
+    def _spawn_embed(self, pokemon: dict, flee_at: float) -> discord.Embed:
+        rarity = RARITY_BADGES.get(pokemon.get("rarity", "common"), "")
+        lines = [f"{dex_no(pokemon['id'])} · Lv.**{pokemon['level']}** · {type_badges(pokemon['types'])}"]
+        if pokemon.get("shiny"):
+            lines.append("✨ **A SHINY Pokémon!** ✨")
+        if rarity:
+            lines.append(f"**{rarity} ENCOUNTER!**")
+        lines.append(f"\n⏳ Flees <t:{int(flee_at)}:R> if nobody catches it.")
+        embed = discord.Embed(
+            title=f"🌿 A wild {pokemon['displayName']}{' ✨' if pokemon.get('shiny') else ''} appeared!",
+            description="\n".join(lines),
+            color=type_color(pokemon),
+        )
+        art = artwork_url(pokemon)
+        if art:
+            embed.set_image(url=art)
+        embed.set_footer(text="Tap a ball to throw · 📖 Do I have it? privately checks your Pokédex, odds & berries")
+        return embed
+
     async def _spawn_wild(self, channel: discord.TextChannel) -> None:
         """Spawn a wild Pokémon in the channel and start a flee timer."""
-        if channel.id in self._spawn_cache:
+        if channel.id in self._spawn_cache or channel.id in self._spawning:
             return
-
-        pokemon_id = get_random_pokemon_id()
+        self._spawning.add(channel.id)
         try:
-            pokemon = await build_pokemon_instance(self._session, pokemon_id)
-        except Exception as exc:
-            log.warning(f"[PokéBot] Failed to fetch Pokémon ID {pokemon_id}: {exc}")
-            return
+            pokemon_id = get_random_pokemon_id()
+            try:
+                pokemon = await build_pokemon_instance(self._session, pokemon_id)
+            except Exception as exc:
+                log.warning("[PokéBot] Failed to fetch Pokémon ID %s: %s", pokemon_id, exc)
+                return
 
-        stats = await self.config.guild(channel.guild).encounter_stats()
-        stats["wild_spawns"] = stats.get("wild_spawns", 0) + 1
-        if pokemon.get("shiny"):
-            stats["shiny_spawns"] = stats.get("shiny_spawns", 0) + 1
-        if pokemon.get("rarity") == "legendary":
-            stats["legendary_spawns"] = stats.get("legendary_spawns", 0) + 1
-        elif pokemon.get("rarity") == "mythical":
-            stats["mythical_spawns"] = stats.get("mythical_spawns", 0) + 1
-        await self.config.guild(channel.guild).encounter_stats.set(stats)
+            async with self.config.guild(channel.guild).encounter_stats() as stats:
+                stats["wild_spawns"] = stats.get("wild_spawns", 0) + 1
+                if pokemon.get("shiny"):
+                    stats["shiny_spawns"] = stats.get("shiny_spawns", 0) + 1
+                if pokemon.get("rarity") == "legendary":
+                    stats["legendary_spawns"] = stats.get("legendary_spawns", 0) + 1
+                elif pokemon.get("rarity") == "mythical":
+                    stats["mythical_spawns"] = stats.get("mythical_spawns", 0) + 1
 
-        spawn_id = str(uuid.uuid4())
-        self._spawn_cache[channel.id] = {
-            "pokemon":   pokemon,
-            "channelId": channel.id,
-            "spawnedAt": time.time(),
-            "spawnId":   spawn_id,
-        }
+            flee_timeout = await self.config.guild(channel.guild).flee_timeout()
+            spawn_id = uuid.uuid4().hex
+            flee_at = time.time() + flee_timeout
+            view = SpawnView(self, spawn_id)
+            try:
+                message = await channel.send(embed=self._spawn_embed(pokemon, flee_at), view=view)
+            except discord.HTTPException as exc:
+                log.warning("[PokéBot] Could not post spawn in %s: %s", channel.id, exc)
+                view.stop()
+                return
+            view.message = message
+            self._spawn_cache[channel.id] = {
+                "pokemon":   pokemon,
+                "channelId": channel.id,
+                "spawnedAt": time.time(),
+                "fleeAt":    flee_at,
+                "spawnId":   spawn_id,
+                "message":   message,
+                "view":      view,
+            }
+        finally:
+            self._spawning.discard(channel.id)
 
-        shiny_text = "\n✨ **A SHINY Pokémon appeared!** ✨" if pokemon["shiny"] else ""
-        embed = discord.Embed(
-            title=f"A wild {pokemon['displayName']} appeared!{'  ✨' if pokemon['shiny'] else ''}",
-            description=(
-                f"**Level {pokemon['level']}** | "
-                f"Type: {' / '.join(t.capitalize() for t in pokemon['types'])}"
-                + shiny_text
-            ),
-            color=COLORS["shiny"] if pokemon["shiny"] else COLORS["green"],
-        )
-        if pokemon.get("spriteUrl"):
-            embed.set_image(url=pokemon["spriteUrl"])
-        flee_timeout = await self.config.guild(channel.guild).flee_timeout()
-        rarity = pokemon.get("rarity", "common")
-        if rarity in ("legendary", "mythical"):
-            embed.description += f"\n\n🌟 **{rarity.upper()} ENCOUNTER!**"
-        flee_minutes = max(1, round(flee_timeout / 60))
-        embed.set_footer(text=f"Use `catch <ball>` to catch it! It will flee in about {flee_minutes} minutes if ignored.")
-        await channel.send(embed=embed)
-
-        # Cancel any existing flee timer for this channel then start a fresh one
         self._cancel_flee_task(channel.id)
         self._flee_tasks[channel.id] = self.bot.loop.create_task(
             self._flee_timer(channel, pokemon, spawn_id, flee_timeout)
         )
 
+    async def _close_spawn_message(self, spawn: dict, note: str, color: Optional[int] = None) -> None:
+        """Grey out a finished spawn's buttons and stamp what happened on it."""
+        view = spawn.get("view")
+        message = spawn.get("message")
+        if view is not None:
+            view.disable_all()
+            view.stop()
+        if message is None:
+            return
+        embed = message.embeds[0].copy() if message.embeds else discord.Embed()
+        desc = (embed.description or "").split("⏳")[0].rstrip()
+        embed.description = f"{desc}\n\n{note}"
+        embed.set_footer(text="This encounter is over.")
+        if color is not None:
+            embed.color = color
+        with suppress(discord.HTTPException):
+            await message.edit(embed=embed, view=view)
+
     async def _flee_timer(self, channel: discord.TextChannel, pokemon: dict, spawn_id: str, flee_timeout: int = FLEE_TIMEOUT) -> None:
-        """Wait flee_timeout seconds; if the Pokémon is still uncaught, it flees and a new one spawns shortly after."""
+        """Wait flee_timeout seconds; if the Pokémon is still uncaught, it flees and a new one spawns after."""
         await asyncio.sleep(flee_timeout)
 
         # Only flee if this exact spawn (by unique ID) is still in the cache
         cached = self._spawn_cache.get(channel.id)
-        if cached and cached.get("spawnId") == spawn_id:
-            self._spawn_cache.pop(channel.id, None)
-            stats = await self.config.guild(channel.guild).encounter_stats()
+        if not (cached and cached.get("spawnId") == spawn_id):
+            return
+        self._spawn_cache.pop(channel.id, None)
+        async with self.config.guild(channel.guild).encounter_stats() as stats:
             stats["fled"] = stats.get("fled", 0) + 1
-            await self.config.guild(channel.guild).encounter_stats.set(stats)
-            try:
-                embed = discord.Embed(
-                    description=(
-                        f"🌿 The wild **{pokemon['displayName']}** got bored and fled into the tall grass!\n"
-                        f"_A new Pokémon will appear when someone next speaks..._"
-                    ),
-                    color=COLORS["gray"],
-                )
-                if pokemon.get("spriteUrl"):
-                    embed.set_thumbnail(url=pokemon["spriteUrl"])
-                await channel.send(embed=embed)
-            except discord.HTTPException:
-                pass
+        await self._close_spawn_message(cached, "🍃 **It fled into the tall grass!**", COLORS["gray"])
+        with suppress(discord.HTTPException):
+            embed = discord.Embed(
+                description=(
+                    f"🌿 The wild **{pokemon['displayName']}** got bored and fled!\n"
+                    f"_A new Pokémon will appear when someone next speaks..._"
+                ),
+                color=COLORS["gray"],
+            )
+            spr = sprite_url(pokemon)
+            if spr:
+                embed.set_thumbnail(url=spr)
+            await channel.send(embed=embed)
 
-            # Mark this guild as waiting for activity before respawning
-            self._pending_respawn[channel.guild.id] = channel
+        # Mark this guild as waiting for activity before respawning
+        self._pending_respawn[channel.guild.id] = channel
+
+    # ── Catching (shared by buttons and the `catch` command) ─────────────────
+
+    @staticmethod
+    def _catch_chance(lead: dict, wild: dict, ball: str, berry_mult: float = 1.0) -> float:
+        base_chance = catch_rate(wild, ball)
+        # Being 10+ levels above the wild Pokémon makes catching easier (up to +40%),
+        # 10+ below makes it harder (down to -40%).
+        lvl_diff = lead["level"] - wild["level"]
+        lvl_mult = 1.0 + max(-0.40, min(0.40, lvl_diff * 0.04))
+        rarity_mult = {"rare": 0.85, "legendary": 0.55, "mythical": 0.45}.get(wild.get("rarity", "common"), 1.0)
+        return min(base_chance * berry_mult * lvl_mult * rarity_mult, 0.95)
+
+    @staticmethod
+    def _pick_default_ball(items: dict) -> Optional[str]:
+        return next((b for b in BALL_NAMES if items.get(b, 0) > 0), None)
+
+    async def _do_catch(
+        self,
+        member: discord.Member,
+        channel: discord.TextChannel,
+        ball: Optional[str],
+        berry: Optional[str],
+        spawn_id: Optional[str] = None,
+    ) -> dict:
+        """Attempt a catch. Caller MUST hold the trainer's lock.
+
+        Returns {"error": embed|None, "embeds": [...], "view": View|None}.
+        """
+        out: dict = {"error": None, "embeds": [], "view": None}
+        player = await self._get_player(member)
+        if not player:
+            out["error"] = error_embed("Start your journey first with `start`!")
+            return out
+
+        spawn = self._spawn_cache.get(channel.id)
+        if not spawn or (spawn_id and spawn["spawnId"] != spawn_id):
+            out["error"] = error_embed("That Pokémon is gone — it was caught or it fled!" if spawn_id
+                                       else "There's no wild Pokémon here right now!")
+            return out
+
+        active_poke = player["pokemon"][player["activePokemonIndex"]]
+        if active_poke["stats"]["hp"] <= 0:
+            out["error"] = error_embed(
+                f"Your lead **{mon_name(active_poke)}** has fainted and can't help you catch!\n"
+                f"Tap **🩹 Heal party** below, use `heal`, or switch lead with `active <slot>`."
+            )
+            out["view"] = HealShortcutView(self, member.id)
+            return out
+
+        items = player["items"]
+        if ball is None:
+            ball = self._pick_default_ball(items)
+            if ball is None:
+                out["error"] = error_embed("You're out of Poké Balls! Grab some from the `shop` or spin a `pokestop`.")
+                return out
+        ball = ball.lower().replace(" ", "").replace("-", "").replace("é", "e")
+        if ball not in BALL_NAMES:
+            out["error"] = error_embed("Unknown ball type. Use: `pokeball`, `greatball`, or `ultraball`.")
+            return out
+        if items.get(ball, 0) <= 0:
+            out["error"] = error_embed(f"You don't have any {BALL_NAMES[ball]}s! Buy some with `shop`.")
+            return out
+
+        max_pokemon = await self.config.guild(channel.guild).max_pokemon()
+        if len(player["pokemon"]) >= max_pokemon:
+            out["error"] = error_embed(
+                f"Your collection is full! (**{len(player['pokemon'])}/{max_pokemon}** Pokémon)\n"
+                "Use `release <slot>` to make room before catching more."
+            )
+            return out
+
+        berry_slug = (berry or "").lower().replace(" ", "").replace("-", "")
+        berry_effect = {"catch_mult": 1.0, "no_damage": False, "credit_mult": 1}
+        if berry_slug:
+            if berry_slug not in BERRY_EFFECTS:
+                out["error"] = error_embed("Unknown berry. Available: `razzberry`, `nanabberry`, `pinapberry`.")
+                return out
+            if items.setdefault("berries", {}).get(berry_slug, 0) <= 0:
+                out["error"] = error_embed(
+                    f"You don't have any {BERRY_NAMES[berry_slug]}! Get them from `pokestop` or `buy {berry_slug}`."
+                )
+                return out
+            berry_effect = BERRY_EFFECTS[berry_slug]
+
+        # ── Claim & roll — no awaits from here until the spawn is popped, so two
+        #    trainers can never both catch the same Pokémon. ───────────────────
+        if self._spawn_cache.get(channel.id) is not spawn:
+            out["error"] = error_embed("Too slow — someone else just caught it!")
+            return out
+        pokemon = spawn["pokemon"]
+        chance  = self._catch_chance(active_poke, pokemon, ball, berry_effect["catch_mult"])
+        caught  = random.random() < chance
+        if caught:
+            self._spawn_cache.pop(channel.id, None)
+            self._cancel_flee_task(channel.id)
+
+        items[ball] -= 1
+        if berry_slug:
+            items["berries"][berry_slug] -= 1
+        berry_tag = f"{BERRY_NAMES[berry_slug]} fed! " if berry_slug else ""
+        shakes = 3 if caught else random.randint(0, 2)
+        shake_text = "🔴 " * shakes if shakes else "💥 "
+
+        # XP for the lead: full on success, 40% for the attempt.
+        catch_xp_full = max(10, math.floor(pokemon["level"] * 1.5 + 5))
+        catch_xp = catch_xp_full if caught else max(5, math.floor(catch_xp_full * 0.4))
+
+        hp_note = ""
+        if not caught and not berry_effect["no_damage"]:
+            scratch = max(1, random.randint(math.floor(pokemon["level"] * 0.5), math.floor(pokemon["level"] * 1.5)))
+            active_poke["stats"]["hp"] = max(0, active_poke["stats"]["hp"] - scratch)
+            if active_poke["stats"]["hp"] <= 0:
+                hp_note = f"💀 **{mon_name(active_poke)}** took {scratch} damage and fainted!"
+                out["view"] = HealShortcutView(self, member.id)
+            else:
+                hp_note = f"🩸 {mon_name(active_poke)} took **{scratch}** damage · {hp_line(active_poke, 8)}"
+        elif not caught:
+            hp_note = f"🍌 The Nanab Berry kept {mon_name(active_poke)} safe!"
+
+        active_poke["xp"] = active_poke.get("xp", 0) + catch_xp
+        lvl_msgs = self._check_level_up(active_poke)
+        currency = await _currency_name(channel.guild)
+
+        if caught:
+            spawn["view"].disable_all()  # visually lock the buttons right away
+            base_credits   = 500 if pokemon.get("shiny") else (100 if pokemon["level"] >= 30 else 50)
+            credits_earned = base_credits * berry_effect["credit_mult"]
+            is_new_dex     = self._update_dex(player, pokemon)
+            player["pokemon"].append({**pokemon, "caughtAt": time.time()})
+            owned_same     = sum(1 for p in player["pokemon"] if p["id"] == pokemon["id"])
+            await self._save_player(member, player)
+            await _deposit(member, credits_earned)
+            async with self.config.guild(channel.guild).encounter_stats() as stats:
+                stats["wild_catches"] = stats.get("wild_catches", 0) + 1
+                if pokemon.get("shiny"):
+                    stats["shiny_catches"] = stats.get("shiny_catches", 0) + 1
+            self.bot.loop.create_task(self._delayed_respawn(channel))
+            await self._close_spawn_message(
+                spawn, f"🎉 **Caught by {member.display_name}** with a {BALL_NAMES[ball]}!", COLORS["green"]
+            )
+
+            bonus = []
+            if pokemon.get("shiny"):
+                bonus.append("✨ shiny bonus")
+            elif pokemon["level"] >= 30:
+                bonus.append("💪 high-level bonus")
+            if berry_effect["credit_mult"] > 1:
+                bonus.append("🍍 Pinap ×2")
+            embed = discord.Embed(
+                title=f"🎉 Gotcha! {member.display_name} caught {pokemon['displayName']}{' ✨' if pokemon.get('shiny') else ''}!",
+                description=(
+                    f"{berry_tag}{shake_text}**Click!**\n"
+                    f"{dex_no(pokemon['id'])} · Lv.**{pokemon['level']}** · {type_badges(pokemon['types'])}"
+                ),
+                color=type_color(pokemon),
+            )
+            embed.add_field(
+                name="📖 Pokédex",
+                value=(f"🆕 **New entry!** ({len(player['caughtDex'])}/{MAX_POKEMON})" if is_new_dex
+                       else f"Already registered · you now own **{owned_same}**"),
+                inline=True,
+            )
+            embed.add_field(
+                name=f"💰 {currency}",
+                value=f"+**{credits_earned:,}**" + (f"\n_{' · '.join(bonus)}_" if bonus else ""),
+                inline=True,
+            )
+            need = active_poke.get("xpToNext") or 1
+            embed.add_field(
+                name="⭐ XP",
+                value=f"+{catch_xp} → {mon_name(active_poke, shiny_mark=False)}\n{xp_bar(active_poke['xp'], need, 8)}",
+                inline=True,
+            )
+            art = artwork_url(pokemon)
+            if art:
+                embed.set_thumbnail(url=art)
+            embed.set_footer(text=f"Odds were {chance:.0%} · {BALL_NAMES[ball]}s left: {items[ball]}")
+            out["embeds"].append(embed)
+        else:
+            await self._save_player(member, player)  # ball/berry spent, HP damage, XP
+            embed = discord.Embed(
+                title=f"💨 Oh no! {pokemon['displayName']} broke free!",
+                description=(
+                    f"{berry_tag}{shake_text}\n"
+                    f"**{member.display_name}** threw a {BALL_NAMES[ball]} — odds were **{chance:.0%}**.\n"
+                    + (f"{hp_note}\n" if hp_note else "")
+                    + f"_+{catch_xp} XP to {mon_name(active_poke, shiny_mark=False)} for trying · "
+                    f"{BALL_NAMES[ball]}s left: {items[ball]}_"
+                ),
+                color=COLORS["red"],
+            )
+            spr = sprite_url(pokemon)
+            if spr:
+                embed.set_thumbnail(url=spr)
+            out["embeds"].append(embed)
+
+        if lvl_msgs:
+            out["embeds"].append(discord.Embed(description="\n".join(lvl_msgs), color=COLORS["green"]))
+            await self._notify_evo(channel, member, player, player["activePokemonIndex"], mention=False)
+        return out
+
+    async def handle_throw(
+        self,
+        interaction: discord.Interaction,
+        spawn_id: str,
+        ball: Optional[str],
+        berry: Optional[str],
+        *,
+        panel: Optional[ThrowPanelView] = None,
+    ) -> None:
+        """Button entry point for throwing a ball at a spawn."""
+        member, channel = interaction.user, interaction.channel
+        if not isinstance(member, discord.Member) or channel is None:
+            return
+        # Acknowledge first: Discord drops interactions not answered within 3 seconds.
+        await interaction.response.defer()
+        lock = self._lock_for(member.guild.id, member.id)
+        if not await lock.acquire(timeout=5):
+            await interaction.followup.send(
+                "⏳ You're still busy with another PokéBot action — try again in a moment.", ephemeral=True
+            )
+            return
+        try:
+            out = await self._do_catch(member, channel, ball, berry, spawn_id=spawn_id)
+            if out["error"] is not None:
+                await interaction.followup.send(embed=out["error"], view=out["view"] or discord.utils.MISSING,
+                                                ephemeral=True)
+            else:
+                msg = await channel.send(embeds=out["embeds"], view=out["view"] or None)
+                if out["view"] is not None:
+                    out["view"].message = msg
+            if panel is not None:
+                if self._spawn_cache.get(channel.id, {}).get("spawnId") == spawn_id:
+                    new_panel = await self._build_throw_panel(member, spawn_id)
+                    if new_panel is not None:
+                        panel.stop()
+                        with suppress(discord.HTTPException):
+                            await interaction.edit_original_response(view=new_panel)
+                else:
+                    panel.disable_all()
+                    panel.stop()
+                    with suppress(discord.HTTPException):
+                        await interaction.edit_original_response(view=panel)
+        finally:
+            lock.release()
+
+    async def _build_throw_panel(self, member: discord.Member, spawn_id: str) -> Optional[ThrowPanelView]:
+        player = await self._get_player(member)
+        if not player:
+            return None
+        items = player.get("items", {})
+        return ThrowPanelView(
+            self, member.id, spawn_id,
+            balls={b: items.get(b, 0) for b in BALL_NAMES},
+            berries=items.get("berries", {}),
+            berry_names=BERRY_NAMES,
+        )
+
+    async def spawn_dex_check(self, interaction: discord.Interaction, spawn_id: str) -> None:
+        """'📖 Do I have it?' — private Pokédex status, odds and a personal throw panel."""
+        member, channel = interaction.user, interaction.channel
+        if not isinstance(member, discord.Member) or channel is None:
+            return
+        spawn = self._spawn_cache.get(channel.id)
+        if not spawn or spawn["spawnId"] != spawn_id:
+            await interaction.response.send_message("That Pokémon is gone — it was caught or it fled!", ephemeral=True)
+            return
+        player = await self._get_player(member)
+        if not player:
+            await interaction.response.send_message(
+                "You haven't started your journey yet! Use `start` to pick a starter, then come back.",
+                ephemeral=True,
+            )
+            return
+
+        wild = spawn["pokemon"]
+        owned = [p for p in player["pokemon"] if p["id"] == wild["id"]]
+        registered = wild["id"] in player.get("caughtDex", [])
+        if registered:
+            best = max(owned, key=lambda p: p["level"]) if owned else None
+            shinies = sum(1 for p in owned if p.get("shiny"))
+            status = f"✅ **Already in your Pokédex!**\nYou own **{len(owned)}**"
+            if best:
+                status += f" (best Lv.{best['level']})"
+            if shinies:
+                status += f" · ✨ {shinies} shiny"
+            if wild.get("shiny") and not shinies:
+                status += "\n✨ But you don't have a **shiny** one yet!"
+        else:
+            status = (f"🆕 **Not in your Pokédex yet!**\nCatch it to register {dex_no(wild['id'])} "
+                      f"({len(player.get('caughtDex', []))}/{MAX_POKEMON} so far).")
+
+        lead = player["pokemon"][player["activePokemonIndex"]]
+        items = player.get("items", {})
+        odds_lines = []
+        for b, label in BALL_NAMES.items():
+            base = self._catch_chance(lead, wild, b)
+            razz = self._catch_chance(lead, wild, b, BERRY_EFFECTS["razzberry"]["catch_mult"])
+            emoji = {"pokeball": "🔴", "greatball": "🔵", "ultraball": "⚫"}[b]
+            odds_lines.append(f"{emoji} {label} ×{items.get(b, 0)} — **{base:.0%}** _(🍓 {razz:.0%})_")
+        berries = items.get("berries", {})
+        berry_line = " · ".join(f"{BERRY_NAMES[k]} ×{berries.get(k, 0)}" for k in BERRY_NAMES)
+
+        embed = discord.Embed(
+            title=f"📖 {wild['displayName']}{' ✨' if wild.get('shiny') else ''} {dex_no(wild['id'])}",
+            description=status,
+            color=COLORS["green"] if not registered else type_color(wild),
+        )
+        lead_val = f"{mon_name(lead)} · Lv.{lead['level']}\n{hp_line(lead, 8)}"
+        if lead["stats"]["hp"] <= 0:
+            lead_val += "\n⚠️ Fainted — heal with `heal` before throwing!"
+        embed.add_field(name="🎯 Your lead", value=lead_val, inline=False)
+        embed.add_field(name="🎲 Your odds", value="\n".join(odds_lines), inline=False)
+        embed.add_field(name="🍓 Berries", value=berry_line, inline=False)
+        spr = sprite_url(wild)
+        if spr:
+            embed.set_thumbnail(url=spr)
+        embed.set_footer(text="Only you can see this · pick a berry, then throw from here")
+        panel = await self._build_throw_panel(member, spawn_id)
+        await interaction.response.send_message(embed=embed, view=panel, ephemeral=True)
 
     def _cancel_flee_task(self, channel_id: int) -> None:
         task = self._flee_tasks.pop(channel_id, None)
@@ -1231,7 +1687,9 @@ class PokéBot(commands.Cog):
             await ctx.send(embed=error_embed("Spawn channel not found — it may have been deleted. Use `pokeset spawnchannel` to set a new one."))
             return
         self._cancel_flee_task(channel.id)
-        self._spawn_cache.pop(channel.id, None)
+        old_spawn = self._spawn_cache.pop(channel.id, None)
+        if old_spawn:
+            await self._close_spawn_message(old_spawn, "🔄 Replaced by an admin spawn.", COLORS["gray"])
         await self._spawn_wild(channel)
         if channel != ctx.channel:
             await ctx.send(embed=success_embed(f"Spawned a wild Pokémon in {channel.mention}!"))
@@ -1248,31 +1706,24 @@ class PokéBot(commands.Cog):
 
         synced    = 0
         total_new = 0
-
-        # Collect all members and their data first, then batch-save concurrently
-        save_tasks = []
-        for member in ctx.guild.members:
-            if member.bot:
+        all_members = await self.config.all_members(ctx.guild)
+        for member_id, data in all_members.items():
+            member = ctx.guild.get_member(int(member_id))
+            if member is None or member.bot or data.get("registeredAt") is None:
                 continue
-            player = await self._get_player(member)
-            if not player or not player.get("pokemon"):
+            try:
+                async with self._trainer(member, timeout=15) as player:
+                    if not player or not player.get("pokemon"):
+                        continue
+                    dex = set(player.get("caughtDex", []))
+                    before = len(dex)
+                    dex.update(pk["id"] for pk in player["pokemon"])
+                    if len(dex) > before:
+                        player["caughtDex"] = sorted(dex)
+                        total_new += len(dex) - before
+                        synced += 1
+            except TrainerBusy:
                 continue
-
-            dex     = set(player.get("caughtDex", []))
-            before  = len(dex)
-
-            for pk in player["pokemon"]:
-                dex.add(pk["id"])
-
-            new_entries = len(dex) - before
-            if new_entries > 0:
-                player["caughtDex"] = sorted(dex)
-                save_tasks.append(self._save_player(member, player))
-                total_new += new_entries
-                synced    += 1
-
-        if save_tasks:
-            await asyncio.gather(*save_tasks)
 
         await ctx.send(embed=success_embed(
             f"Pokédex sync complete!\n"
@@ -1286,62 +1737,63 @@ class PokéBot(commands.Cog):
         """Begin your Pokémon journey and choose a starter!"""
         player = await self._get_player(ctx.author)
         if player:
-            await ctx.send(embed=error_embed("You already started your journey! Use `pokemon` to see your team."))
+            await ctx.send(embed=error_embed("You already started your journey! Use `profile` or `pokemon` to see your team."))
             return
-
-        lines = []
-        for gen in range(1, 10):
-            trio = STARTERS[(gen - 1) * 3: gen * 3]
-            lines.append(f"**Gen {gen}:** {', '.join(s['name'] for s in trio)}")
 
         embed = discord.Embed(
-            title="🌟 Welcome to your Pokémon journey!",
-            description="Choose your starter by typing its name below!\n\n" + "\n".join(lines),
+            title="🌟 Welcome to the world of Pokémon!",
+            description=(
+                f"Hi **{ctx.author.display_name}**! Every great trainer starts with one partner.\n\n"
+                "**Pick a region from the menu below**, then choose your starter.\n"
+                "_Grass, Fire or Water — there's no wrong answer!_"
+            ),
             color=COLORS["yellow"],
         )
-        await ctx.send(embed=embed)
-
-        def check(m: discord.Message) -> bool:
-            return (
-                m.author == ctx.author
-                and m.channel == ctx.channel
-                and any(m.content.strip().lower() == s["name"].lower() for s in STARTERS)
-            )
-
-        try:
-            msg = await self.bot.wait_for("message", check=check, timeout=60.0)
-        except asyncio.TimeoutError:
-            await ctx.send(embed=error_embed("Selection timed out. Use `start` again when ready!"))
+        embed.set_thumbnail(url="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/poke-ball.png")
+        view = StarterView(ctx.author.id, STARTERS)
+        view.message = await ctx.send(embed=embed, view=view)
+        await view.wait()
+        if view.choice is None:
+            await ctx.send(embed=error_embed("No starter chosen. Use `start` again when you're ready!"))
             return
 
-        chosen = next(s for s in STARTERS if s["name"].lower() == msg.content.strip().lower())
+        chosen = view.choice
         async with ctx.typing():
-            pokemon = await build_pokemon_instance(self._session, chosen["id"], level=5, allow_shiny=False)
+            try:
+                pokemon = await build_pokemon_instance(self._session, chosen["id"], level=5, allow_shiny=False)
+            except Exception:
+                await ctx.send(embed=error_embed("Couldn't reach the Pokédex service — try `start` again in a moment."))
+                return
         pokemon["stats"]["hp"] = pokemon["stats"]["maxHp"]
+        if await self._get_player(ctx.author):  # double-start guard
+            return
         await self._create_player(ctx.author, pokemon)
 
         currency = await _currency_name(ctx.guild)
         embed = discord.Embed(
-            title=f"🎉 You chose {pokemon['displayName']}!",
+            title=f"🎉 {ctx.author.display_name} chose {pokemon['displayName']}!",
             description=(
-                f"Welcome, **{ctx.author.display_name}**! Your journey begins!\n\n"
-                f"You received:\n"
-                f"• **{pokemon['displayName']}** (Lv.5)\n"
-                f"• **10 Poké Balls**, 3 Great Balls, 1 Ultra Ball\n"
-                f"• **500 {currency}** added to your bank\n\n"
-                f"Use `pokehelp` to see all commands. Good luck!"
+                f"Your journey begins! You received:\n"
+                f"• **{pokemon['displayName']}** (Lv.5) · {type_badges(pokemon['types'])}\n"
+                f"• 🔴 **10** Poké Balls · 🔵 **3** Great Balls · ⚫ **1** Ultra Ball\n"
+                f"• 💰 **500 {currency}**\n\n"
+                f"**Next steps**\n"
+                f"• Wild Pokémon appear in the spawn channel — tap a ball to throw!\n"
+                f"• `pokestop` once a day for free items · `heal` to patch up your team\n"
+                f"• `pokehelp` for everything else"
             ),
-            color=COLORS["green"],
+            color=type_color(pokemon),
         )
-        if pokemon.get("spriteUrl"):
-            embed.set_image(url=pokemon["spriteUrl"])
+        art = artwork_url(pokemon)
+        if art:
+            embed.set_image(url=art)
         await ctx.send(embed=embed)
 
     # ── Profile ───────────────────────────────────────────────────────────────
 
-    @commands.command(name="profile")
+    @commands.command(name="profile", aliases=["trainer"])
     async def profile(self, ctx: commands.Context, user: Optional[discord.Member] = None) -> None:
-        """View your (or another trainer's) profile."""
+        """View your (or another trainer's) Trainer Card."""
         target = user or ctx.author
         player = await self._get_player(target)
         if not player:
@@ -1353,43 +1805,57 @@ class PokéBot(commands.Cog):
             await ctx.send(embed=error_embed(msg))
             return
 
-        active   = player["pokemon"][player["activePokemonIndex"]] if player["pokemon"] else None
+        lead     = player["pokemon"][player["activePokemonIndex"]] if player["pokemon"] else None
         shinies  = sum(1 for p in player["pokemon"] if p.get("shiny"))
         total    = player["wins"] + player["losses"]
-        win_rate = f"{(player['wins'] / total * 100):.1f}" if total else "0.0"
+        win_rate = f"{(player['wins'] / total * 100):.0f}%" if total else "—"
         balance  = await _get_balance(target)
         currency = await _currency_name(ctx.guild)
+        dex_count = len(player.get("caughtDex", []))
+        rank_label, _ = _dex_rank(dex_count)
 
         embed = discord.Embed(
-            title=f"🎒 {target.display_name}'s Trainer Profile",
-            color=COLORS["purple"],
-        )
-        if active and active.get("spriteUrl"):
-            embed.set_thumbnail(url=active["spriteUrl"])
-
-        embed.add_field(name=f"💰 {currency}", value=str(balance), inline=True)
-        dex_count = len(player.get("caughtDex", []))
-        embed.add_field(name="📦 Pokémon",     value=str(len(player["pokemon"])), inline=True)
-        embed.add_field(name="📖 Pokédex",     value=f"{dex_count}/{MAX_POKEMON}", inline=True)
-        embed.add_field(name="✨ Shinies",      value=str(shinies), inline=True)
-        embed.add_field(name="⚔️ Battles",     value=f"{player['wins']}W / {player['losses']}L ({win_rate}%)", inline=True)
-        embed.add_field(
-            name="🎯 Active Pokémon",
-            value=(
-                f"{active['displayName']}{'  ✨' if active.get('shiny') else ''} (Lv.{active['level']})"
-                if active else "None"
+            title=f"🪪 {target.display_name}'s Trainer Card",
+            description=(
+                f"{rank_label}\n{_dex_progress_bar(dex_count, MAX_POKEMON, 12)} "
+                f"**{dex_count}/{MAX_POKEMON}** Pokédex ({dex_count / MAX_POKEMON:.1%})"
             ),
-            inline=True,
+            color=type_color(lead) if lead else COLORS["purple"],
         )
+        embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+        if lead:
+            art = artwork_url(lead)
+            if art:
+                embed.set_thumbnail(url=art)
+
+        embed.add_field(name=f"💰 {currency}", value=f"{balance:,}", inline=True)
+        embed.add_field(name="📦 Pokémon", value=f"{len(player['pokemon'])}", inline=True)
+        embed.add_field(name="✨ Shinies", value=str(shinies), inline=True)
+        embed.add_field(name="⚔️ Battles", value=f"{player['wins']}W / {player['losses']}L ({win_rate})", inline=True)
+        streak = player.get("pokestopStreak", 0)
+        embed.add_field(name="🔥 Pokéstop streak", value=f"{streak} day{'s' if streak != 1 else ''}", inline=True)
         balls = player["items"]
         embed.add_field(
-            name="🎒 Balls",
-            value=f"Poké: {balls.get('pokeball', 0)} · Great: {balls.get('greatball', 0)} · Ultra: {balls.get('ultraball', 0)}",
-            inline=False,
+            name="🎯 Balls",
+            value=f"🔴 {balls.get('pokeball', 0)} · 🔵 {balls.get('greatball', 0)} · ⚫ {balls.get('ultraball', 0)}",
+            inline=True,
         )
+        party_lines = []
+        for i, p in enumerate(party_mons(player)):
+            status = "💀" if p["stats"]["hp"] <= 0 else ("🟢" if p["stats"]["hp"] >= p["stats"]["maxHp"] else "🟡")
+            crown = "👑 " if i == 0 else ""
+            party_lines.append(f"{status} {crown}**{mon_name(p)}** · Lv.{p['level']}")
+        embed.add_field(name="🎒 Party", value="\n".join(party_lines) or "_Empty_", inline=False)
         reg = datetime.fromtimestamp(player["registeredAt"], tz=timezone.utc).strftime("%Y-%m-%d")
         embed.set_footer(text=f"Trainer since {reg}")
-        await ctx.send(embed=embed)
+
+        view = None
+        if target == ctx.author:
+            needs_heal = any(p["stats"]["hp"] < p["stats"]["maxHp"] for p in party_mons(player))
+            view = LinkButtonsView(self, ctx.author.id, show_heal=needs_heal)
+        msg = await ctx.send(embed=embed, view=view or None)
+        if view is not None:
+            view.message = msg
 
     # ── Pokemon list ──────────────────────────────────────────────────────────
 
@@ -1416,29 +1882,32 @@ class PokéBot(commands.Cog):
             offset = (pg - 1) * per_page
             chunk  = player["pokemon"][offset: offset + per_page]
             embed  = discord.Embed(
-                title=f"{target.display_name}'s Pokémon ({total} total)",
+                title=f"📦 {target.display_name}'s Pokémon ({total})",
                 color=COLORS["blue"],
             )
             embed.set_footer(
-                text=f"Page {pg}/{pages} · Active: #{player['activePokemonIndex'] + 1}"
+                text=f"Page {pg}/{pages} · 👑 lead · 🎒 in party · 🌟 can evolve · `pokemon <page>` to jump"
             )
+            party_uids = set(player.get("party", []))
             for i, p in enumerate(chunk):
                 idx     = offset + i + 1
-                active  = " ⬅ Active" if idx - 1 == player["activePokemonIndex"] else ""
-                shiny   = " ✨" if p.get("shiny") else ""
-                nick    = f' "{p["nickname"]}"' if p.get("nickname") else ""
+                tags    = []
+                if idx - 1 == player["activePokemonIndex"]:
+                    tags.append("👑")
+                elif p.get("uid") in party_uids:
+                    tags.append("🎒")
+                if p.get("evoNotified"):
+                    tags.append("🌟")
                 xp_cur  = p.get("xp", 0)
                 xp_nxt  = p.get("xpToNext") or self._xp_for_level(p["level"])
-                xp_bar  = self._xp_bar(xp_cur, xp_nxt, length=8)
-                evo_tag = " 🌟*evo ready*" if p.get("evoNotified") else ""
                 embed.add_field(
-                    name=f"#{idx} {p['displayName']}{shiny}{nick}{active}{evo_tag}",
+                    name=f"`{idx}` {mon_name(p)} · Lv.{p['level']} {' '.join(tags)}",
                     value=(
-                        f"Lv.{p['level']} | {' / '.join(type_tag(t) for t in p['types'])} | "
-                        f"HP: {p['stats']['hp']}/{p['stats']['maxHp']}\n"
-                        f"XP {xp_bar} {xp_cur}/{xp_nxt}"
+                        f"{type_badges(p['types'])}\n"
+                        f"{hp_line(p, 8)}\n"
+                        f"XP {xp_bar(xp_cur, xp_nxt, 8)} `{xp_cur}/{xp_nxt}`"
                     ),
-                    inline=False,
+                    inline=True,
                 )
             return embed
 
@@ -1509,29 +1978,52 @@ class PokéBot(commands.Cog):
             await ctx.send(embed=error_embed(msg))
             return
 
+        embed = self._party_embed(target, player, own=target == ctx.author)
+        view = None
+        if target == ctx.author and any(p["stats"]["hp"] < p["stats"]["maxHp"] for p in party_mons(player)):
+            view = HealShortcutView(self, ctx.author.id)
+        msg = await ctx.send(embed=embed, view=view or None)
+        if view is not None:
+            view.message = msg
+
+    def _party_embed(self, target: discord.abc.User, player: dict, *, own: bool = True) -> discord.Embed:
         mons = party_mons(player)
-        lines = []
-        for i, p in enumerate(mons):
-            lead   = " 👑 **Lead**" if i == 0 else ""
-            shiny  = " ✨" if p.get("shiny") else ""
-            nick   = f' "{p["nickname"]}"' if p.get("nickname") else ""
-            hp     = p["stats"]["hp"]
-            status = f"{hp}/{p['stats']['maxHp']} HP" if hp > 0 else "💀 Fainted"
-            lines.append(
-                f"**{i+1}.** {p['displayName']}{shiny}{nick} — Lv.{p['level']} | {status}{lead}"
-            )
         embed = discord.Embed(
             title=f"🎒 {target.display_name}'s Party ({len(mons)}/6)",
-            description="\n".join(lines) or "_Empty._",
-            color=COLORS["purple"],
+            color=type_color(mons[0]) if mons else COLORS["purple"],
         )
-        if mons and mons[0].get("spriteUrl"):
-            embed.set_thumbnail(url=mons[0]["spriteUrl"])
-        if target == ctx.author:
-            embed.set_footer(
-                text="party add <slot> · party remove <pos> · party move <pos> <new_pos> · party clear"
+        for i, p in enumerate(mons):
+            crown = "👑 " if i == 0 else ""
+            embed.add_field(
+                name=f"{i + 1}. {crown}{mon_name(p)} · Lv.{p['level']}",
+                value=f"{type_badges(p['types'])}\n{hp_line(p, 8)}",
+                inline=True,
             )
-        await ctx.send(embed=embed)
+        if not mons:
+            embed.description = "_Empty._"
+        if mons:
+            art = artwork_url(mons[0])
+            if art:
+                embed.set_thumbnail(url=art)
+        if own:
+            embed.set_footer(text="party add <slot> · party remove <pos> · party move <pos> <new_pos> · party clear · heal")
+        return embed
+
+    async def party_from_interaction(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        player = await self._get_player(member) if isinstance(member, discord.Member) else None
+        if not player:
+            await interaction.response.send_message("Start your journey first with `start`!", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=self._party_embed(member, player), ephemeral=True)
+
+    async def bag_from_interaction(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        player = await self._get_player(member) if isinstance(member, discord.Member) else None
+        if not player:
+            await interaction.response.send_message("Start your journey first with `start`!", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=await self._bag_embed(member, player), ephemeral=True)
 
     @party.command(name="add")
     async def party_add(self, ctx: commands.Context, slot: int) -> None:
@@ -1694,44 +2186,26 @@ class PokéBot(commands.Cog):
             return
 
         # Confirm — evolving is irreversible
-        evo_name = evo["name"].capitalize()
-        nick_line = (
-            f"• Nickname **{poke['nickname']}** will be kept\n"
-            if poke.get("nickname") else ""
-        )
+        evo_name = evo["name"].replace("-", " ").title()
+        nick_line = f"• Nickname **{poke['nickname']}** will be kept\n" if poke.get("nickname") else ""
         confirm_embed = discord.Embed(
-            title=f"✨ Evolve {poke['displayName']} → {evo_name}?",
+            title=f"✨ Evolve {mon_name(poke)} → {evo_name}?",
             description=(
-                f"**{poke['displayName']}** will evolve into **{evo_name}**!\n\n"
-                f"• Types, moves, sprite and stats will update to the evolved form\n"
+                f"• Types, sprite and stats update to the evolved form\n"
                 f"{nick_line}"
-                f"• This cannot be undone\n\n"
-                f"Type `yes` to evolve, or `no` to keep **{poke['displayName']}** as-is."
+                f"• This can't be undone"
             ),
             color=COLORS["yellow"],
         )
-        if poke.get("spriteUrl"):
-            confirm_embed.set_thumbnail(url=poke["spriteUrl"])
-        await ctx.send(embed=confirm_embed)
-
-        def check(m: discord.Message) -> bool:
-            return (
-                m.author == ctx.author
-                and m.channel == ctx.channel
-                and m.content.lower().strip() in ("yes", "no")
-            )
-
-        try:
-            msg = await self.bot.wait_for("message", check=check, timeout=30.0)
-        except asyncio.TimeoutError:
-            await ctx.send(embed=error_embed("Evolution cancelled — no response in 30 seconds."))
-            return
-
-        if msg.content.lower().strip() == "no":
-            await ctx.send(embed=discord.Embed(
-                color=COLORS["gray"],
-                description=f"Kept **{poke['displayName']}** — that's totally fine!",
-            ))
+        art = artwork_url(poke)
+        if art:
+            confirm_embed.set_thumbnail(url=art)
+        view = ConfirmView(ctx.author.id, confirm_label=f"Evolve into {evo_name}", confirm_emoji="✨",
+                           cancel_label="Not now", timeout=45)
+        view.message = await ctx.send(embed=confirm_embed, view=view)
+        await view.wait()
+        if not view.value:
+            await ctx.send(embed=info_embed(f"Kept **{mon_name(poke)}** as it is — that's totally fine!", COLORS["gray"]))
             return
 
         # ── Perform the evolution ─────────────────────────────────────────────
@@ -1783,18 +2257,18 @@ class PokéBot(commands.Cog):
         await self._save_player(ctx.author, player)
 
         embed = discord.Embed(
-            title=f"🎉 {old_name} evolved into {poke['displayName']}!",
+            title=f"🎉 What? {old_name} evolved into {poke['displayName']}!",
             description=(
                 f"{'✨ ' if poke.get('shiny') else ''}"
-                f"**{old_name}** → **{poke['displayName']}**\n\n"
-                f"Type: {' / '.join(type_tag(t) for t in new_types)}\n"
-                f"HP: {new_stats['hp']}/{new_stats['maxHp']} "
-                f"_(was {old_stats['hp']}/{old_stats['maxHp']})_"
+                f"**{old_name}** → **{poke['displayName']}** {dex_no(poke['id'])}\n\n"
+                f"{type_badges(new_types)}\n"
+                f"❤️ {hp_line(poke)} _(was {old_stats['hp']}/{old_stats['maxHp']})_"
             ),
-            color=COLORS["shiny"] if poke.get("shiny") else COLORS["yellow"],
+            color=type_color(poke),
         )
-        if new_sprite:
-            embed.set_image(url=new_sprite)
+        art = artwork_url(poke)
+        if art:
+            embed.set_image(url=art)
         embed.set_footer(text="Use 'pokemon' to see your updated collection!")
         await ctx.send(embed=embed)
 
@@ -1828,8 +2302,8 @@ class PokéBot(commands.Cog):
             big   = official.get("front_default") or thumb
 
         embed = discord.Embed(
-            title=f"#{raw['id']} — {raw['name'].capitalize()}{'  ✨ Shiny' if shiny else ''}",
-            color=COLORS["shiny"] if shiny else COLORS["blue"],
+            title=f"{dex_no(raw['id'])} — {raw['name'].replace('-', ' ').title()}{'  ✨ Shiny' if shiny else ''}",
+            color=type_color({"shiny": shiny, "types": [t["type"]["name"] for t in raw["types"]]}),
         )
         if thumb:
             embed.set_thumbnail(url=thumb)
@@ -1866,7 +2340,7 @@ class PokéBot(commands.Cog):
 
         async with ctx.typing():
             try:
-                raw = await fetch_pokemon(self._session, lookup.lower().strip())
+                raw = await fetch_pokemon(self._session, clean_slug(lookup))
             except Exception:
                 await ctx.send(embed=error_embed(
                     f"Couldn't find a Pokémon called **{lookup}**. Check the spelling!"
@@ -1879,9 +2353,24 @@ class PokéBot(commands.Cog):
         if start_shiny and not has_shiny:
             start_shiny = False  # nothing to show; open normal
 
-        embed = self._build_dex_embed(raw, start_shiny)
+        player = await self._get_player(ctx.author)
+        status = None
+        if player:
+            owned = sum(1 for p in player["pokemon"] if p["id"] == raw["id"])
+            if raw["id"] in player.get("caughtDex", []):
+                status = f"✅ **Registered in your Pokédex** · you own **{owned}**"
+            else:
+                status = "🆕 **Not in your Pokédex yet** — catch one to register it!"
+
+        def build(raw_: dict, shiny_: bool) -> discord.Embed:
+            e = self._build_dex_embed(raw_, shiny_)
+            if status:
+                e.description = status
+            return e
+
+        embed = build(raw, start_shiny)
         view  = DexShinyView(
-            self._build_dex_embed, raw,
+            build, raw,
             shiny=start_shiny, has_shiny=has_shiny, author_id=ctx.author.id,
         )
         view.message = await ctx.send(embed=embed, view=view)
@@ -1889,205 +2378,22 @@ class PokéBot(commands.Cog):
     # ── Catch ─────────────────────────────────────────────────────────────────
 
     @commands.command(name="catch")
-    async def catch(self, ctx: commands.Context, ball: str = "pokeball", berry: str = "") -> None:
-        """Catch a wild Pokémon! Usage: `catch [pokeball|greatball|ultraball] [berry]`
-        Berries: `razzberry` (better odds), `nanabberry` (no damage on fail), `pinapberry` (2× credits)."""
-        player = await self._get_player(ctx.author)
-        if not player:
-            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
-            return
+    async def catch(self, ctx: commands.Context, ball: Optional[str] = None, berry: str = "") -> None:
+        """Catch the wild Pokémon in this channel. Usage: `catch [ball] [berry]`
 
-        spawn = self._spawn_cache.get(ctx.channel.id)
-        if not spawn:
-            await ctx.send(embed=error_embed("There's no wild Pokémon here right now!"))
-            return
-
-        # Block catch if active Pokémon has fainted
-        active_poke = player["pokemon"][player["activePokemonIndex"]]
-        if active_poke["stats"]["hp"] <= 0:
-            # Find the first non-fainted Pokémon to suggest
-            healthy = next(
-                (i + 1 for i, p in enumerate(player["pokemon"]) if p["stats"]["hp"] > 0),
-                None,
-            )
-            hint = (
-                f"Try `active {healthy}` to switch, or `use revive` to revive **{active_poke['displayName']}**."
-                if healthy
-                else f"Use `use revive` to revive **{active_poke['displayName']}** before throwing!"
-            )
-            await ctx.send(embed=error_embed(
-                f"**{active_poke['displayName']}** has fainted and can't battle!\n{hint}"
-            ))
-            return
-
-        ball = ball.lower().replace(" ", "").replace("-", "")
-        if ball not in BALL_NAMES:
-            await ctx.send(embed=error_embed("Unknown ball type. Use: `pokeball`, `greatball`, or `ultraball`."))
-            return
-
-        ball_count = player["items"].get(ball, 0)
-        if ball_count <= 0:
-            await ctx.send(embed=error_embed(f"You don't have any {BALL_NAMES[ball]}s! Buy some with `shop`."))
-            return
-
-        # Check collection cap before consuming the ball
-        max_pokemon = await self.config.guild(ctx.guild).max_pokemon()
-        if len(player["pokemon"]) >= max_pokemon:
-            await ctx.send(embed=error_embed(
-                f"Your collection is full! (**{len(player['pokemon'])}/{max_pokemon}** Pokémon)\n"
-                "Use `release <slot>` to release one before catching more."
-            ))
-            return
-
-        # ── Berry handling ────────────────────────────────────────────────────
-        berry_slug = berry.lower().replace(" ", "").replace("-", "") if berry else ""
-        berry_effect = {"catch_mult": 1.0, "no_damage": False, "credit_mult": 1}
-        berry_used_name = ""
-        if berry_slug:
-            if berry_slug not in BERRY_EFFECTS:
-                await ctx.send(embed=error_embed(
-                    f"Unknown berry **{berry_slug}**. Available: `razzberry`, `nanabberry`, `pinapberry`."
-                ))
-                return
-            berries = player["items"].setdefault("berries", {})
-            if berries.get(berry_slug, 0) <= 0:
-                await ctx.send(embed=error_embed(
-                    f"You don't have any {BERRY_NAMES[berry_slug]}! "
-                    f"Get them from `pokestop` or buy with `buy {berry_slug}`."
-                ))
-                return
-            # Consume berry
-            berries[berry_slug] -= 1
-            berry_effect = BERRY_EFFECTS[berry_slug]
-            berry_used_name = BERRY_NAMES[berry_slug]
-
-        player["items"][ball] -= 1
-        pokemon = spawn["pokemon"]
-        base_chance = catch_rate(pokemon, ball)
-
-        # ── Level-difference modifier ─────────────────────────────────────────
-        # Compares active Pokémon level vs wild Pokémon level.
-        # Being 10+ levels above makes catching noticeably easier (~+40%).
-        # Being 10+ levels below makes it noticeably harder (~-35%).
-        # Clamped so it never flip-flops the core ball/HP math too wildly.
-        active_lvl = active_poke["level"]
-        wild_lvl   = pokemon["level"]
-        lvl_diff   = active_lvl - wild_lvl   # positive = trainer stronger
-        # Sigmoid-like linear clamp: ±0.04 per level difference, capped at ±0.40
-        lvl_mult   = 1.0 + max(-0.40, min(0.40, lvl_diff * 0.04))
-        rarity_mult = {"rare": 0.85, "legendary": 0.55, "mythical": 0.45}.get(
-            pokemon.get("rarity", "common"), 1.0
-        )
-        chance = min(base_chance * berry_effect["catch_mult"] * lvl_mult * rarity_mult, 0.95)
-        caught = random.random() < chance
-
-        shakes     = 3 if caught else random.randint(0, 2)
-        shake_text = "🔴 *shake*... " * shakes
-
-        # Wild Pokémon fights back — only deals damage on FAILED catches
-        fainted_from_catch = False
-        scratch_dmg     = 0
-        hp_note         = ""
-        if not caught and not berry_effect["no_damage"]:
-            wild_level  = pokemon["level"]
-            scratch_dmg = max(1, random.randint(
-                math.floor(wild_level * 0.5),
-                math.floor(wild_level * 1.5)
-            ))
-            active_poke["stats"]["hp"] = max(0, active_poke["stats"]["hp"] - scratch_dmg)
-            fainted_from_catch = active_poke["stats"]["hp"] <= 0
-            if fainted_from_catch:
-                hp_note = f" | ⚠️ {active_poke['displayName']} fainted! Use a Revive."
-            else:
-                hp_note = f" | {active_poke['displayName']} took {scratch_dmg} dmg ({active_poke['stats']['hp']}/{active_poke['stats']['maxHp']} HP)"
-
-        async with ctx.typing():
-            await asyncio.sleep(1.5)
-
-        currency = await _currency_name(ctx.guild)
-        berry_tag = f"\n{berry_used_name} used! " if berry_used_name else ""
-
-        # ── Award catch XP to active Pokémon (both outcomes) ─────────────────
-        # Successful catch: full XP. Failed: 40% XP for the attempt.
-        wild_level     = pokemon["level"]
-        catch_xp_full  = max(10, math.floor(wild_level * 1.5 + 5))
-        catch_xp       = catch_xp_full if caught else max(5, math.floor(catch_xp_full * 0.4))
-        active_poke["xp"] = active_poke.get("xp", 0) + catch_xp
-        lvl_msgs = self._check_level_up(active_poke)
-
-        if caught:
-            stats = await self.config.guild(ctx.guild).encounter_stats()
-            stats["wild_catches"] = stats.get("wild_catches", 0) + 1
-            if pokemon.get("shiny"):
-                stats["shiny_catches"] = stats.get("shiny_catches", 0) + 1
-            await self.config.guild(ctx.guild).encounter_stats.set(stats)
-            # Pokémon caught — cancel flee timer and remove from spawn cache
-            self._cancel_flee_task(ctx.channel.id)
-            self._spawn_cache.pop(ctx.channel.id, None)
-            # Schedule a fresh spawn after a short delay so the channel never goes dead
-            self.bot.loop.create_task(self._delayed_respawn(ctx.channel))
-
-            base_credits   = 500 if pokemon.get("shiny") else (100 if pokemon["level"] >= 30 else 50)
-            credits_earned = base_credits * berry_effect["credit_mult"]
-            is_new_dex     = self._update_dex(player, pokemon)
-            player["pokemon"].append({**pokemon, "caughtAt": time.time()})
-            await self._save_player(ctx.author, player)
-            await _deposit(ctx.author, credits_earned)
-
-            bonus_tag = (
-                " ✨ Shiny bonus!" if pokemon.get("shiny")
-                else (" 💪 High level bonus!" if pokemon["level"] >= 30 else "")
-            )
-            if berry_effect["credit_mult"] > 1:
-                bonus_tag += f" 🍍 Pinap bonus (2× credits)!"
-            xp_line = f"+{catch_xp} XP ({active_poke['displayName']})"
-            embed = pokemon_embed(
-                pokemon,
-                f"{ctx.author.display_name} caught {pokemon['displayName']}{'  ✨' if pokemon.get('shiny') else ''}!",
-                footer=f"{berry_tag}{shake_text}Gotcha! Added to your collection.",
-            )
-            embed.color = COLORS["shiny"] if pokemon.get("shiny") else COLORS["green"]
-            embed.add_field(
-                name=f"💰 {currency} Earned",
-                value=f"+{credits_earned}{bonus_tag}",
-                inline=True,
-            )
-            embed.add_field(name="⭐ XP Earned", value=xp_line, inline=True)
-            if is_new_dex:
-                dex_count = len(player.get("caughtDex", []))
-                embed.add_field(
-                    name="📖 Pokédex",
-                    value=f"New entry! ({dex_count}/{MAX_POKEMON} caught)",
-                    inline=True,
-                )
-            await ctx.send(embed=embed)
-            if lvl_msgs:
-                await ctx.send(embed=discord.Embed(description="\n".join(lvl_msgs), color=COLORS["green"]))
-            # Check evo eligibility after any level-up
-            if lvl_msgs:
-                await self._notify_evo_if_ready(ctx, player, player["activePokemonIndex"])
+        Leave out the ball to throw your cheapest one. Berries: `razzberry` (better odds),
+        `nanabberry` (no damage on a miss), `pinapberry` (2× credits).
+        Tip: the buttons under each spawn do the same thing in one tap.
+        """
+        if ball and ball.lower().replace(" ", "") in BERRY_EFFECTS and not berry:
+            ball, berry = None, ball  # `catch razzberry` — berry with the default ball
+        out = await self._do_catch(ctx.author, ctx.channel, ball, berry or None)
+        if out["error"] is not None:
+            msg = await ctx.send(embed=out["error"], view=out["view"] or None)
         else:
-            await self._save_player(ctx.author, player)  # saves HP damage, berry consumption, and XP
-            nanab_note = " 🍌 Nanab Berry absorbed the hit!" if berry_effect["no_damage"] and berry_slug == "nanabberry" else ""
-            hp_note    = hp_note + nanab_note if not berry_effect["no_damage"] else f"\n🍌 Nanab Berry protected {active_poke['displayName']} from damage!"
-            embed = discord.Embed(
-                title=f"Oh no! {pokemon['displayName']} broke free!",
-                description=(
-                    f"{berry_tag}{shake_text}💨 {pokemon['displayName']} escaped!\n"
-                    f"{hp_note}\n"
-                    f"_(+{catch_xp} XP to {active_poke['displayName']} for the attempt)_\n\n"
-                    f"_{BALL_NAMES[ball]}s remaining: {player['items'][ball]}_"
-                ),
-                color=COLORS["red"],
-            )
-            if pokemon.get("spriteUrl"):
-                embed.set_thumbnail(url=pokemon["spriteUrl"])
-            await ctx.send(embed=embed)
-            if lvl_msgs:
-                await ctx.send(embed=discord.Embed(description="\n".join(lvl_msgs), color=COLORS["green"]))
-            if lvl_msgs:
-                await self._notify_evo_if_ready(ctx, player, player["activePokemonIndex"])
-
+            msg = await ctx.send(embeds=out["embeds"], view=out["view"] or None)
+        if out["view"] is not None:
+            out["view"].message = msg
 
     # ── Release ───────────────────────────────────────────────────────────────
 
@@ -2133,51 +2439,33 @@ class PokéBot(commands.Cog):
 
         ball_emoji = {"pokeball": "🔴", "greatball": "🔵", "ultraball": "⚫"}[ball_reward]
         shiny_tag  = " ✨ SHINY" if poke.get("shiny") else ""
-        nick_tag   = f' "{poke["nickname"]}"' if poke.get("nickname") else ""
 
         confirm_embed = discord.Embed(
-            title=f"❓ Release {poke['displayName']}{shiny_tag}{nick_tag}?",
+            title=f"👋 Release {mon_name(poke)}?",
             description=(
-                f"Are you sure you want to release **{poke['displayName']}** "
-                f"(Lv.{poke['level']}){shiny_tag}?\n\n"
-                f"You will receive:\n"
+                f"Lv.{poke['level']} · {type_badges(poke['types'])}{shiny_tag}\n\n"
+                f"**You'll receive**\n"
                 f"💰 **{base_credits} {currency}**\n"
-                f"{ball_emoji} **{ball_qty}\u00d7 {BALL_NAMES[ball_reward]}**\n\n"
-                "Type `yes` to confirm or `no` to cancel."
+                f"{ball_emoji} **{ball_qty}\u00d7 {BALL_NAMES[ball_reward]}**"
             ),
             color=COLORS["orange"],
         )
-        if poke.get("spriteUrl"):
-            confirm_embed.set_thumbnail(url=poke["spriteUrl"])
-        await ctx.send(embed=confirm_embed)
-
-        def check(m: discord.Message) -> bool:
-            return (
-                m.author == ctx.author
-                and m.channel == ctx.channel
-                and m.content.lower().strip() in ("yes", "no")
-            )
-
-        try:
-            msg = await self.bot.wait_for("message", check=check, timeout=30.0)
-        except asyncio.TimeoutError:
-            await ctx.send(embed=error_embed("Release cancelled \u2014 no response in 30 seconds."))
+        spr = sprite_url(poke)
+        if spr:
+            confirm_embed.set_thumbnail(url=spr)
+        view = ConfirmView(ctx.author.id, confirm_label="Release", confirm_emoji="👋",
+                           cancel_label="Keep it", danger=True, timeout=30)
+        view.message = await ctx.send(embed=confirm_embed, view=view)
+        await view.wait()
+        if not view.value:
+            await ctx.send(embed=info_embed(f"Kept **{mon_name(poke)}** — good choice!", COLORS["gray"]))
             return
 
-        if msg.content.lower().strip() == "no":
-            await ctx.send(embed=discord.Embed(
-                color=COLORS["gray"],
-                description=f"Kept **{poke['displayName']}** \u2014 good choice!",
-            ))
-            return
-
-        # Apply rewards and remove the Pokémon
+        # Apply rewards and remove the Pokémon (keep the same lead, even if indexes shift)
+        lead_uid = player["pokemon"][player["activePokemonIndex"]]["uid"]
         player["pokemon"].pop(idx)
-
-        # Fix active index if it now points past the end or at the released slot
-        active = player["activePokemonIndex"]
-        if active >= len(player["pokemon"]) or active == idx:
-            player["activePokemonIndex"] = 0
+        lead_idx = uid_index(player, lead_uid)
+        player["activePokemonIndex"] = lead_idx if lead_idx >= 0 else 0
         ensure_party(player)  # drop the released Pokémon's uid from the party
 
         items = player.setdefault("items", {"pokeball": 0, "greatball": 0, "ultraball": 0, "healing": {}})
@@ -2211,161 +2499,165 @@ class PokéBot(commands.Cog):
             await ctx.send(embed=error_embed("Start your journey first with `start`!"))
             return
 
-        items   = player.get("items", {})
-        healing = items.get("healing", {})
-        tms     = items.get("tms", [])
-        berries = items.get("berries", {})
-        balance  = await _get_balance(ctx.author)
-        currency = await _currency_name(ctx.guild)
-        streak   = player.get("pokestopStreak", 0)
+        await ctx.send(embed=await self._bag_embed(ctx.author, player))
 
-        balls_lines = []
-        for ball_id, label in BALL_NAMES.items():
-            count = items.get(ball_id, 0)
-            emoji = next((i["emoji"] for i in SHOP_ITEMS if i["id"] == ball_id), "🔴")
-            balls_lines.append(f"{emoji} **{label}** — {count}")
+    async def _bag_embed(self, member: discord.Member, player: dict) -> discord.Embed:
+        items    = player.get("items", {})
+        healing  = items.get("healing", {})
+        tms      = items.get("tms", [])
+        berries  = items.get("berries", {})
+        balance  = await _get_balance(member)
+        currency = await _currency_name(member.guild)
+        emoji_of = {i["id"]: i["emoji"] for i in SHOP_ITEMS}
 
-        heal_lines = []
-        for item_id, label in ITEM_NAMES.items():
-            count = healing.get(item_id, 0)
-            heal_lines.append(f"{label} — {count}")
+        def lines(ids_labels, counts) -> str:
+            out = []
+            for item_id, label in ids_labels:
+                n = counts.get(item_id, 0)
+                out.append(f"{label} ×**{n}**" if n else f"{label} _×0_")
+            return "\n".join(out)
 
-        berry_lines = []
-        for berry_id, label in BERRY_NAMES.items():
-            count = berries.get(berry_id, 0)
-            berry_lines.append(f"{label} — {count}")
-
-        embed = discord.Embed(
-            title=f"🎒 {ctx.author.display_name}'s Bag",
-            color=COLORS["blue"],
-        )
-        embed.add_field(name=f"💰 {currency}", value=str(balance), inline=True)
-        if streak:
-            embed.add_field(name="🔥 Pokéstop Streak", value=f"{streak} day{'s' if streak != 1 else ''}", inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
-        embed.add_field(name="🎯 Poké Balls",    value="\n".join(balls_lines),  inline=True)
-        embed.add_field(name="💊 Healing Items",  value="\n".join(heal_lines),   inline=True)
-        embed.add_field(name="🍓 Berries",        value="\n".join(berry_lines),  inline=True)
-
+        embed = discord.Embed(title=f"👜 {member.display_name}'s Bag", color=COLORS["teal"])
+        embed.description = f"💰 **{balance:,} {currency}**"
+        embed.add_field(name="🎯 Balls",
+                        value=lines([(b, f"{emoji_of[b]} {n}") for b, n in BALL_NAMES.items()], items), inline=True)
+        embed.add_field(name="💊 Medicine", value=lines(list(ITEM_NAMES.items()), healing), inline=True)
+        embed.add_field(name="🍓 Berries", value=lines(list(BERRY_NAMES.items()), berries), inline=True)
         if tms:
-            tm_lines = []
+            counts: Dict[str, int] = {}
             for slug in tms:
-                tm_info = TM_LIST.get(slug)
-                if tm_info:
-                    emoji = TM_TYPE_EMOJI.get(tm_info["type"], "💿")
-                    tm_lines.append(f"{emoji} **{tm_info['name']}** `{slug}`")
-                else:
-                    tm_lines.append(f"💿 `{slug}`")
-            embed.add_field(name="💿 TMs", value="\n".join(tm_lines), inline=False)
-        else:
-            embed.add_field(name="💿 TMs", value="_None — buy TMs with `buytm <move>`_", inline=False)
-
-        embed.set_footer(text="Use `shop` to buy items • `tms` to browse TMs • `usetm` to teach moves")
-        await ctx.send(embed=embed)
+                counts[slug] = counts.get(slug, 0) + 1
+            tm_lines = []
+            for slug, n in counts.items():
+                info = TM_LIST.get(slug)
+                emoji = TM_TYPE_EMOJI.get(info["type"], "💿") if info else "💿"
+                tm_lines.append(f"{emoji} **{info['name'] if info else slug}**{f' ×{n}' if n > 1 else ''} `{slug}`")
+            embed.add_field(name="💿 TMs", value="\n".join(tm_lines)[:1024], inline=False)
+        embed.set_footer(text="shop to buy · heal to patch up your team · usetm to teach moves")
+        return embed
 
     # ── Shop ──────────────────────────────────────────────────────────────────
 
-    @commands.command(name="shop")
+    async def _shop_embed(self, member: discord.Member) -> discord.Embed:
+        balance  = await _get_balance(member)
+        currency = await _currency_name(member.guild)
+        prices   = await self._get_shop_prices(member.guild)
+        embed = discord.Embed(
+            title="🛒 PokéMart",
+            description=f"Your balance: **💰 {balance:,} {currency}**\nPick an item below, then tap a Buy button.",
+            color=COLORS["yellow"],
+        )
+        for title, category in (("🎯 Poké Balls", "balls"), ("💊 Medicine", "healing"), ("🍓 Berries", "berries")):
+            embed.add_field(
+                name=title,
+                value="\n".join(
+                    f"{i['emoji']} **{i['name']}** — {prices.get(i['id'], i['price']):,}\n_{i['desc']}_"
+                    for i in SHOP_ITEMS if i["category"] == category
+                ),
+                inline=True,
+            )
+        embed.set_footer(text="Or type: buy <item> [amount] · TMs live in `tms`")
+        return embed
+
+    async def _buy_items(self, member: discord.Member, item: str, amount: int) -> discord.Embed:
+        """Buy `amount` of a PokéMart item. Caller must hold the trainer lock."""
+        player = await self._get_player(member)
+        if not player:
+            return error_embed("Start your journey first with `start`!")
+        item = item.lower().replace(" ", "").replace("-", "").replace("é", "e")
+        shop_item = next((i for i in SHOP_ITEMS if i["id"] == item), None)
+        if not shop_item:
+            names = ", ".join(f"`{i['id']}`" for i in SHOP_ITEMS)
+            return error_embed(f"Unknown item. Available: {names}")
+
+        amount     = max(1, min(amount, 99))
+        prices     = await self._get_shop_prices(member.guild)
+        total_cost = prices.get(shop_item["id"], shop_item["price"]) * amount
+        currency   = await _currency_name(member.guild)
+        if not await _withdraw(member, total_cost):
+            balance = await _get_balance(member)
+            return error_embed(
+                f"You need **{total_cost:,} {currency}** for {amount}× {shop_item['name']} but only have **{balance:,}**."
+            )
+
+        if shop_item["category"] == "balls":
+            player["items"][item] = player["items"].get(item, 0) + amount
+            owned = player["items"][item]
+        elif shop_item["category"] == "berries":
+            berries = player["items"].setdefault("berries", {})
+            berries[item] = berries.get(item, 0) + amount
+            owned = berries[item]
+        else:
+            healing = player["items"].setdefault("healing", {})
+            healing[item] = healing.get(item, 0) + amount
+            owned = healing[item]
+        await self._save_player(member, player)
+        balance = await _get_balance(member)
+        return success_embed(
+            f"Bought **{amount}× {shop_item['emoji']} {shop_item['name']}** for **{total_cost:,} {currency}**!\n"
+            f"You now have **{owned}** · Balance: **{balance:,} {currency}**"
+        )
+
+    @commands.command(name="shop", aliases=["mart", "pokemart"])
     async def shop(self, ctx: commands.Context) -> None:
-        """Browse the PokéMart."""
+        """Browse the PokéMart and buy with a couple of clicks."""
         player = await self._get_player(ctx.author)
         if not player:
             await ctx.send(embed=error_embed("Start your journey first with `start`!"))
             return
+        prices = await self._get_shop_prices(ctx.guild)
+        view = ShopView(self, ctx.author.id, SHOP_ITEMS, prices)
+        view.message = await ctx.send(embed=await self._shop_embed(ctx.author), view=view)
 
-        balance  = await _get_balance(ctx.author)
-        currency = await _currency_name(ctx.guild)
-        prices   = await self._get_shop_prices(ctx.guild)
-
-        # Three pages: 1=Balls, 2=Healing, 3=Berries
-        SHOP_PAGES = [
-            ("🎯 Poké Balls",   "balls"),
-            ("💊 Healing Items", "healing"),
-            ("🍓 Berries",       "berries"),
-        ]
-        total_pages = len(SHOP_PAGES)
-
-        def build_shop_embed(pg: int) -> discord.Embed:
-            pg = max(1, min(pg, total_pages))
-            section_name, category = SHOP_PAGES[pg - 1]
-            items_str = "\n\n".join(
-                f"{i['emoji']} **{i['name']}** — {prices.get(i['id'], i['price'])} {currency}\n_{i['desc']}_"
-                for i in SHOP_ITEMS if i["category"] == category
-            )
-            embed = discord.Embed(
-                title=f"🛒 PokéMart — {section_name}",
-                description=(
-                    f"Your balance: **💰 {balance} {currency}**\n"
-                    f"Use `buy <item> [amount]` to purchase.\n\u200b"
-                ),
-                color=COLORS["yellow"],
-            )
-            embed.add_field(name=section_name, value=items_str, inline=False)
-            embed.set_footer(text=f"Page {pg}/{total_pages} · Win battles and catch Pokémon to earn more!")
-            return embed
-
-        async def async_shop_build(pg: int) -> discord.Embed:
-            return build_shop_embed(pg)
-
-        embed = build_shop_embed(1)
-        view  = PaginatedView(async_shop_build, total_pages, 1, ctx.author.id)
-        view.message = await ctx.send(embed=embed, view=view)
+    async def shop_purchase_interaction(self, interaction: discord.Interaction, view: ShopView, item: str, qty: int) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return
+        await interaction.response.defer()
+        lock = self._lock_for(member.guild.id, member.id)
+        if not await lock.acquire(timeout=5):
+            await interaction.followup.send("⏳ You're busy with another action — try again in a moment.", ephemeral=True)
+            return
+        try:
+            result = await self._buy_items(member, item, qty)
+        finally:
+            lock.release()
+        await interaction.edit_original_response(embed=await self._shop_embed(member), view=view)
+        await interaction.followup.send(embed=result, ephemeral=True)
 
     # ── Buy ───────────────────────────────────────────────────────────────────
 
     @commands.command(name="buy")
     async def buy(self, ctx: commands.Context, item: str, amount: int = 1) -> None:
         """Buy items from the PokéMart. Usage: `buy <item> [amount]`"""
-        player = await self._get_player(ctx.author)
-        if not player:
-            await ctx.send(embed=error_embed("Start your journey first with `start`!"))
-            return
-
-        item = item.lower().replace(" ", "").replace("-", "")
-        shop_item = next((i for i in SHOP_ITEMS if i["id"] == item), None)
-        if not shop_item:
-            names = ", ".join(f"`{i['id']}`" for i in SHOP_ITEMS)
-            await ctx.send(embed=error_embed(f"Unknown item. Available: {names}"))
-            return
-
-        amount     = max(1, min(amount, 99))
-        prices     = await self._get_shop_prices(ctx.guild)
-        item_price = prices.get(shop_item["id"], shop_item["price"])
-        total_cost = item_price * amount
-        currency   = await _currency_name(ctx.guild)
-
-        success = await _withdraw(ctx.author, total_cost)
-        if not success:
-            balance = await _get_balance(ctx.author)
-            await ctx.send(embed=error_embed(
-                f"You need **{total_cost} {currency}** for {amount}× {shop_item['name']} "
-                f"but only have **{balance}**."
-            ))
-            return
-
-        if shop_item["category"] == "balls":
-            player["items"][item] = player["items"].get(item, 0) + amount
-        elif shop_item["category"] == "berries":
-            berries = player["items"].setdefault("berries", {})
-            berries[item] = berries.get(item, 0) + amount
-        else:
-            if "healing" not in player["items"]:
-                player["items"]["healing"] = {}
-            player["items"]["healing"][item] = player["items"]["healing"].get(item, 0) + amount
-
-        await self._save_player(ctx.author, player)
-        balance = await _get_balance(ctx.author)
-        await ctx.send(embed=success_embed(
-            f"Bought **{amount}× {shop_item['emoji']} {shop_item['name']}** "
-            f"for **{total_cost} {currency}**!\n"
-            f"Remaining balance: **{balance} {currency}**"
-        ))
+        await ctx.send(embed=await self._buy_items(ctx.author, item, amount))
 
     # ── Use ───────────────────────────────────────────────────────────────────
 
     @commands.command(name="use")
-    async def use(self, ctx: commands.Context, item: str, slot: int = 0) -> None:
-        """Use a healing item. Usage: `use <item> [slot]`"""
+    async def use(self, ctx: commands.Context, item: str, slot: str = "") -> None:
+        """Use a healing item. Usage: `use <item> [slot | all]`
+
+        `use revive all` revives every fainted party Pokémon, `use potion all`
+        tops up every hurt one — and offers to buy anything you're short of.
+        For everything at once just use `heal`.
+        """
+        if slot.lower() in ("all", "party", "everyone", "team"):
+            item_slug = item.lower().replace(" ", "").replace("-", "")
+            if item_slug not in HEAL_AMOUNTS:
+                await ctx.send(embed=error_embed(f"Unknown item. Valid: {', '.join(HEAL_AMOUNTS.keys())}"))
+                return
+            mode = "revive" if item_slug == "revive" else "potion"
+            only = None if item_slug == "revive" else item_slug
+            embed, view = await self._start_heal(ctx.author, "party", mode, only_item=only)
+            msg = await ctx.send(embed=embed, view=view or None)
+            if view is not None:
+                view.message = msg
+            return
+        if slot and not slot.isdigit():
+            await ctx.send(embed=error_embed("Usage: `use <item> [slot]` or `use <item> all`."))
+            return
+        slot = int(slot) if slot else 0
         player = await self._get_player(ctx.author)
         if not player:
             await ctx.send(embed=error_embed("Start your journey first with `start`!"))
@@ -2415,17 +2707,209 @@ class PokéBot(commands.Cog):
         player["items"]["healing"][item] -= 1
         await self._save_player(ctx.author, player)
 
-        bar  = hp_bar(poke["stats"]["hp"], poke["stats"]["maxHp"])
         desc = (
-            f"⭐ **{poke['displayName']}** was revived!\nHP: {bar} {poke['stats']['hp']}/{poke['stats']['maxHp']}"
+            f"⭐ **{mon_name(poke)}** was revived!\n{hp_line(poke)}"
             if item == "revive"
-            else f"💊 **{poke['displayName']}** recovered HP!\nHP: {bar} {poke['stats']['hp']}/{poke['stats']['maxHp']}"
+            else f"💊 **{mon_name(poke)}** recovered HP!\n{hp_line(poke)}"
         )
         embed = discord.Embed(title=f"Used {ITEM_NAMES[item]}!", description=desc, color=COLORS["green"])
-        if poke.get("spriteUrl"):
-            embed.set_thumbnail(url=poke["spriteUrl"])
+        spr = sprite_url(poke)
+        if spr:
+            embed.set_thumbnail(url=spr)
         embed.set_footer(text=f"{ITEM_NAMES[item]}s remaining: {player['items']['healing'][item]}")
         await ctx.send(embed=embed)
+
+    # ── Healing (heal everything at once) ────────────────────────────────────
+
+    @staticmethod
+    def _heal_targets(player: dict, scope: str) -> List[dict]:
+        return player["pokemon"] if scope == "all" else party_mons(player)
+
+    @staticmethod
+    def _apply_heal_plan(player: dict, plan) -> None:
+        by_uid = {m.get("uid"): m for m in player["pokemon"]}
+        for mp in plan.mons:
+            mon = by_uid.get(mp.uid)
+            if mon is not None:
+                mon["stats"]["hp"] = mp.hp_after
+        healing = player["items"].setdefault("healing", {})
+        for item, qty in plan.use.items():
+            healing[item] = max(0, healing.get(item, 0) - qty)
+
+    @staticmethod
+    def _items_text(counts: Dict[str, int]) -> str:
+        return ", ".join(f"{qty}× {ITEM_NAMES[item]}" for item, qty in counts.items() if qty) or "—"
+
+    def _heal_result_embed(self, member: discord.Member, plan, *, spent: int = 0, currency: str = "") -> discord.Embed:
+        lines = []
+        for mp in plan.mons:
+            if not mp.changed:
+                lines.append(f"⚠️ **{mp.name}** — {mp.unresolved or 'unchanged'}")
+                continue
+            icon = "⭐" if mp.revived else "💊"
+            before = "💀" if mp.hp_before <= 0 else f"{mp.hp_before}"
+            after_note = f" _({mp.unresolved})_" if mp.unresolved else ""
+            lines.append(
+                f"{icon} **{mp.name}** {before} → {hp_bar(mp.hp_after, mp.max_hp, 8)} `{mp.hp_after}/{mp.max_hp}`{after_note}"
+            )
+        done = plan.complete
+        embed = discord.Embed(
+            title="🏥 Pokémon Center" + (" — all patched up!" if done else " — partly healed"),
+            description="\n".join(lines)[:3900] or "Nothing needed healing.",
+            color=COLORS["green"] if done else COLORS["orange"],
+        )
+        if plan.use:
+            embed.add_field(name="🎒 Used from your bag", value=self._items_text(plan.use), inline=False)
+        if plan.buy:
+            embed.add_field(
+                name="🛒 Bought & used",
+                value=f"{self._items_text(plan.buy)}\n**−{spent:,} {currency}**",
+                inline=False,
+            )
+        if not done:
+            embed.set_footer(text="Run `heal` again any time to buy what's still missing.")
+        return embed
+
+    @staticmethod
+    def _parse_heal_args(args: Tuple[str, ...]) -> Tuple[str, str]:
+        scope, mode = "party", "all"
+        for raw in args:
+            word = raw.lower().strip()
+            if word in ("all", "everything", "collection", "box"):
+                scope = "all"
+            elif word in ("party", "team"):
+                scope = "party"
+            elif word in ("revive", "revives", "fainted"):
+                mode = "revive"
+            elif word in ("potion", "potions", "hurt", "hp"):
+                mode = "potion"
+        return scope, mode
+
+    async def _start_heal(
+        self, member: discord.Member, scope: str, mode: str, *, only_item: Optional[str] = None
+    ) -> Tuple[discord.Embed, Optional[HealView]]:
+        """Heal straight away if the bag covers it; otherwise show a buy / use-what-I-have choice.
+
+        Caller must hold the trainer lock.
+        """
+        player = await self._get_player(member)
+        if not player:
+            return error_embed("Start your journey first with `start`!"), None
+        if self._get_battle_by_user(member.id):
+            return error_embed("You can't heal in the middle of a battle!"), None
+
+        targets = self._heal_targets(player, scope)
+        inventory = player["items"].get("healing", {})
+        prices = await self._get_shop_prices(member.guild)
+        owned = plan_heal(targets, inventory, prices, mode=mode, only_item=only_item)
+        where = "collection" if scope == "all" else "party"
+        if owned.targets == 0:
+            what = {"revive": "fainted", "potion": "hurt", "all": "fainted or hurt"}[mode]
+            return info_embed(f"💚 Nobody in your {where} is {what} — everyone's ready to go!", COLORS["green"]), None
+
+        if owned.complete:
+            self._apply_heal_plan(player, owned)
+            await self._save_player(member, player)
+            return self._heal_result_embed(member, owned), None
+
+        full = plan_heal(targets, inventory, prices, mode=mode, buy=True, only_item=only_item)
+        balance  = await _get_balance(member)
+        currency = await _currency_name(member.guild)
+        lines = []
+        for mp in owned.mons:
+            hp_txt = "💀 Fainted" if mp.hp_before <= 0 else f"`{mp.hp_before}/{mp.max_hp}` HP"
+            lines.append(f"• **{mp.name}** — {hp_txt}")
+        embed = discord.Embed(
+            title=f"🏥 Pokémon Center — {owned.targets} Pokémon need care",
+            description="\n".join(lines)[:3000],
+            color=COLORS["pink"],
+        )
+        embed.add_field(name="🎒 Your bag covers", value=self._items_text(owned.use) if owned.use else "Nothing yet", inline=False)
+        embed.add_field(
+            name="🛒 To heal everyone, buy",
+            value=f"{self._items_text(full.buy)}\nCost: **{full.cost:,} {currency}** · You have **{balance:,}**",
+            inline=False,
+        )
+        if balance < full.cost:
+            embed.set_footer(text=f"You're {full.cost - balance:,} {currency} short for the full heal.")
+        view = HealView(
+            self, member.id, scope=scope, mode=mode,
+            can_partial=owned.does_anything, cost=full.cost, currency=currency,
+            affordable=balance >= full.cost,
+        )
+        view.only_item = only_item  # type: ignore[attr-defined]
+        return embed, view
+
+    async def execute_heal(self, interaction: discord.Interaction, view: HealView, *, buy: bool) -> None:
+        """HealView button handler."""
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return
+        await interaction.response.defer()
+
+        async def tell(text: str) -> None:
+            await interaction.followup.send(text, ephemeral=True)
+
+        try:
+            async with self._trainer(member, timeout=5) as player:
+                if player is None:
+                    await tell("Start your journey first with `start`!")
+                    return
+                if self._get_battle_by_user(member.id):
+                    await tell("You can't heal in the middle of a battle!")
+                    return
+                targets = self._heal_targets(player, view.scope)
+                prices = await self._get_shop_prices(member.guild)
+                plan = plan_heal(targets, player["items"].get("healing", {}), prices, mode=view.mode,
+                                 buy=buy, only_item=getattr(view, "only_item", None))
+                currency = await _currency_name(member.guild)
+                if buy and plan.cost > 0 and not await _withdraw(member, plan.cost):
+                    balance = await _get_balance(member)
+                    await tell(
+                        f"💸 That costs **{plan.cost:,} {currency}** but you only have **{balance:,}**. "
+                        f"Try **Use only what I have**, or earn more by catching and battling!"
+                    )
+                    return
+                self._apply_heal_plan(player, plan)
+                embed = self._heal_result_embed(member, plan, spent=plan.cost if buy else 0, currency=currency)
+        except TrainerBusy:
+            await tell("⏳ You're busy with another action — try again in a moment.")
+            return
+        view.disable_all()
+        view.stop()
+        await interaction.edit_original_response(embed=embed, view=view)
+
+    async def heal_from_interaction(self, interaction: discord.Interaction, scope: str) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lock = self._lock_for(member.guild.id, member.id)
+        if not await lock.acquire(timeout=5):
+            await interaction.followup.send("⏳ You're busy with another action — try again in a moment.", ephemeral=True)
+            return
+        try:
+            embed, view = await self._start_heal(member, scope, "all")
+        finally:
+            lock.release()
+        await interaction.followup.send(embed=embed, view=view or discord.utils.MISSING, ephemeral=True)
+
+    @commands.command(name="heal", aliases=["healall", "pokecenter"])
+    async def heal(self, ctx: commands.Context, *options: str) -> None:
+        """Revive and heal your whole party in one go — the Pokémon Center.
+
+        `heal` — revive fainted party Pokémon and restore everyone to full HP
+        `heal all` — do the same for your entire collection
+        `heal revive` / `heal potion` — only revive, or only top up HP
+
+        Items in your bag are used first (smartly: no Max Potions on scratches).
+        If you're short, you'll get a button to buy exactly what's missing.
+        """
+        scope, mode = self._parse_heal_args(options)
+        embed, view = await self._start_heal(ctx.author, scope, mode)
+        msg = await ctx.send(embed=embed, view=view or None)
+        if view is not None:
+            view.message = msg
 
     # ── Battle ────────────────────────────────────────────────────────────────
 
@@ -2453,69 +2937,68 @@ class PokéBot(commands.Cog):
         if self._get_battle_by_user(opponent.id):
             await ctx.send(embed=error_embed(f"{opponent.display_name} is already in a battle!"))
             return
-
-        self._challenges[opponent.id] = {
-            "challengerId":   ctx.author.id,
-            "challengerName": ctx.author.display_name,
-            "channelId":      ctx.channel.id,
-            "expires":        time.time() + 60,
-        }
+        if opponent.id in self._challenges or ctx.author.id in self._challenges:
+            await ctx.send(embed=error_embed("One of you already has a battle challenge waiting for an answer."))
+            return
 
         challenger_poke = player["pokemon"][player["activePokemonIndex"]]
         opp_poke        = opp_data["pokemon"][opp_data["activePokemonIndex"]]
-
         if challenger_poke["stats"]["hp"] <= 0:
-            await ctx.send(embed=error_embed(
-                f"**{challenger_poke['displayName']}** has fainted! Heal it or switch active Pokémon before battling."
-            ))
+            await ctx.send(
+                embed=error_embed(f"Your lead **{mon_name(challenger_poke)}** has fainted! Heal up first."),
+                view=HealShortcutView(self, ctx.author.id),
+            )
             return
         if opp_poke["stats"]["hp"] <= 0:
             await ctx.send(embed=error_embed(
-                f"{opponent.display_name}'s **{opp_poke['displayName']}** has fainted — they need to heal up first!"
+                f"{opponent.display_name}'s **{mon_name(opp_poke)}** has fainted — they need to `heal` first!"
             ))
             return
 
         embed = discord.Embed(
             title="⚔️ Battle Challenge!",
             description=(
-                f"**{ctx.author.display_name}** challenges **{opponent.display_name}** to a battle!\n\n"
-                f"🔴 {ctx.author.display_name}'s **{challenger_poke['displayName']}** (Lv.{challenger_poke['level']})\n"
-                f"🔵 {opponent.display_name}'s **{opp_poke['displayName']}** (Lv.{opp_poke['level']})\n\n"
-                f"{opponent.mention}, type `accept` or `decline` to respond!"
+                f"**{ctx.author.display_name}** challenges **{opponent.display_name}**!\n\n"
+                f"🔴 **{mon_name(challenger_poke)}** · Lv.{challenger_poke['level']} · {type_badges(challenger_poke['types'])}\n"
+                f"🔵 **{mon_name(opp_poke)}** · Lv.{opp_poke['level']} · {type_badges(opp_poke['types'])}\n\n"
+                f"{opponent.mention}, do you accept? _(60 seconds)_"
             ),
             color=COLORS["orange"],
         )
-        await ctx.send(embed=embed)
-
-        def check(m: discord.Message) -> bool:
-            return (
-                m.author == opponent
-                and m.channel == ctx.channel
-                and m.content.lower().strip() in ("accept", "decline")
-            )
-
+        art = artwork_url(challenger_poke)
+        if art:
+            embed.set_thumbnail(url=art)
+        view = RequestView(ctx.author.id, opponent.id, accept_label="Fight!", timeout=60)
+        self._challenges[opponent.id] = {"challengerId": ctx.author.id, "expires": time.time() + 60}
         try:
-            msg = await self.bot.wait_for("message", check=check, timeout=60.0)
-        except asyncio.TimeoutError:
+            view.message = await ctx.send(content=opponent.mention, embed=embed, view=view,
+                                          allowed_mentions=discord.AllowedMentions(users=[opponent]))
+            await view.wait()
+        finally:
             self._challenges.pop(opponent.id, None)
-            await ctx.send(embed=error_embed(f"{opponent.display_name} didn't respond in time. Challenge expired."))
+
+        if view.value != "accept":
+            text = {
+                "decline": f"❌ {opponent.display_name} declined the challenge.",
+                "cancel":  f"↩️ {ctx.author.display_name} withdrew the challenge.",
+            }.get(view.value, f"⌛ {opponent.display_name} didn't respond in time.")
+            await ctx.send(embed=info_embed(text, COLORS["gray"]))
             return
 
-        challenge = self._challenges.pop(opponent.id, None)
-        if not challenge or time.time() > challenge["expires"]:
-            await ctx.send(embed=error_embed("Challenge expired."))
+        # Re-read both saves — things may have changed while we waited.
+        player   = await self._get_player(ctx.author)
+        opp_data = await self._get_player(opponent)
+        if not player or not opp_data:
+            await ctx.send(embed=error_embed("Battle cancelled — a trainer's save couldn't be loaded."))
             return
-
-        if msg.content.lower().strip() == "decline":
-            await ctx.send(embed=discord.Embed(
-                color=COLORS["gray"],
-                description=f"❌ {opponent.display_name} declined the battle challenge.",
-            ))
+        if self._get_battle_by_user(ctx.author.id) or self._get_battle_by_user(opponent.id):
+            await ctx.send(embed=error_embed("Battle cancelled — one of you joined another battle."))
             return
-
-        # Build the battle
         p1_pokemon = copy.deepcopy(player["pokemon"][player["activePokemonIndex"]])
         p2_pokemon = copy.deepcopy(opp_data["pokemon"][opp_data["activePokemonIndex"]])
+        if p1_pokemon["stats"]["hp"] <= 0 or p2_pokemon["stats"]["hp"] <= 0:
+            await ctx.send(embed=error_embed("Battle cancelled — a lead Pokémon has fainted."))
+            return
 
         battle_id = f"{ctx.author.id}_{opponent.id}_{int(time.time())}"
         battle = {
@@ -2524,147 +3007,199 @@ class PokéBot(commands.Cog):
             "turn":      1,
             "log":       [],
             "status":    "active",
+            "processing": False,
             "startedAt": time.time(),
             "guildId":   ctx.guild.id,
             "channelId": ctx.channel.id,
         }
         self._battles[battle_id] = battle
-
-        # Start the AFK timeout watcher
         self.bot.loop.create_task(self._battle_timeout_watcher(ctx.guild, battle_id, ctx.channel))
 
-        embed  = self._build_battle_embed(battle, ["The battle begins! Both trainers, use `move <move_name>` to fight!"])
-        moves1 = " · ".join(m.replace("-", " ").capitalize() for m in p1_pokemon["moves"])
-        moves2 = " · ".join(m.replace("-", " ").capitalize() for m in p2_pokemon["moves"])
-        await ctx.send(
-            content=(
-                f"{ctx.author.mention}'s moves: {moves1}\n"
-                f"{opponent.mention}'s moves: {moves2}"
-            ),
-            embed=embed,
-        )
+        embed = self._build_battle_embed(battle, ["The battle begins! Tap **⚔️ Choose Move** to pick your attack."])
+        bview = BattleView(self, battle_id, [ctx.author.id, opponent.id])
+        bview.message = await ctx.send(embed=embed, view=bview)
 
     async def _battle_timeout_watcher(
         self, guild: discord.Guild, battle_id: str, channel: discord.TextChannel
     ) -> None:
         """Periodically check if a battle has gone AFK and auto-forfeit if so."""
         while True:
-            await asyncio.sleep(60)  # Check every minute
+            await asyncio.sleep(30)
             battle = self._battles.get(battle_id)
             if not battle or battle["status"] != "active":
                 return
+            if battle.get("processing"):
+                continue
 
-            now  = time.time()
-            p1   = battle["player1"]
-            p2   = battle["player2"]
-            # Check whichever player has been idle longest
-            afk  = None
-            other = None
+            now = time.time()
+            p1, p2 = battle["player1"], battle["player2"]
+            afk = other = None
             if not p1["moveUsed"] and (now - p1["lastMoveAt"]) >= BATTLE_TIMEOUT:
                 afk, other = p1, p2
             elif not p2["moveUsed"] and (now - p2["lastMoveAt"]) >= BATTLE_TIMEOUT:
                 afk, other = p2, p1
-
             if afk:
                 battle["status"] = "finished"
                 await self._end_battle(guild, battle_id, other["id"], afk["id"], channel)
-                try:
-                    embed = discord.Embed(
-                        title="⏰ Battle Timeout!",
+                with suppress(discord.HTTPException):
+                    await channel.send(embed=discord.Embed(
+                        title="⏰ Battle timeout!",
                         description=(
-                            f"**{afk['username']}** took too long to respond and forfeited!\n"
-                            f"**{other['username']}** wins by default and receives 100 {await _currency_name(guild)}."
+                            f"**{afk['username']}** took too long and forfeited.\n"
+                            f"**{other['username']}** wins and receives 100 {await _currency_name(guild)}."
                         ),
                         color=COLORS["orange"],
-                    )
-                    await channel.send(embed=embed)
-                except discord.HTTPException:
-                    pass
+                    ))
                 return
 
-    # ── Move ──────────────────────────────────────────────────────────────────
+    async def _submit_move(
+        self, member: discord.Member, channel: discord.abc.Messageable, move_name: str
+    ) -> Optional[str]:
+        """Lock in a move. Returns an error message, or None on success.
+
+        When both moves are in, resolves the turn and posts the result.
+        """
+        result = self._get_battle_by_user(member.id)
+        if not result:
+            return "You're not in a battle! Use `battle @user` to start one."
+        battle_id, battle = result
+        if battle["status"] != "active":
+            return "That battle is already over."
+        move_name = move_name.lower().strip().replace(" ", "-")
+        my_side = battle["player1"] if battle["player1"]["id"] == member.id else battle["player2"]
+        if move_name not in my_side["pokemon"]["moves"]:
+            known = ", ".join(f"`{m}`" for m in my_side["pokemon"]["moves"] if m)
+            return f"{mon_name(my_side['pokemon'])} doesn't know **{move_name}**!\nKnown moves: {known}"
+        if my_side["moveUsed"] or battle.get("processing"):
+            return "You've already chosen a move this turn — waiting for your opponent…"
+
+        my_side["moveUsed"]   = move_name
+        my_side["lastMoveAt"] = time.time()
+        both_ready = battle["player1"]["moveUsed"] and battle["player2"]["moveUsed"]
+        if not both_ready:
+            with suppress(discord.HTTPException):
+                await channel.send(embed=info_embed(
+                    f"✅ **{my_side['username']}** has locked in a move. Waiting for the opponent…",
+                    COLORS["purple"],
+                ))
+            return None
+
+        # Claim the turn synchronously so two simultaneous submissions can't both resolve it.
+        battle["processing"] = True
+        try:
+            turn_result = await self._process_turn(battle_id)
+        finally:
+            battle["processing"] = False
+        if not turn_result:
+            self._battles.pop(battle_id, None)
+            return "Something went wrong processing this turn — the battle was cancelled."
+
+        updated_battle, turn_log, winner = turn_result
+        embed = self._build_battle_embed(updated_battle, turn_log)
+        guild = member.guild
+        if winner:
+            loser_id = battle["player2"]["id"] if winner["id"] == battle["player1"]["id"] else battle["player1"]["id"]
+            lvl_msgs = await self._end_battle(guild, battle_id, winner["id"], loser_id, channel)
+            currency = await _currency_name(guild)
+            embed.color = COLORS["yellow"]
+            embed.title = f"🏆 {winner['username']} wins the battle!"
+            embed.set_footer(text=f"{winner['username']} earned 100 {currency} and battle XP · loser's Pokémon fainted — `heal` to recover")
+            with suppress(discord.HTTPException):
+                await channel.send(embed=embed)
+                if lvl_msgs:
+                    await channel.send(embed=discord.Embed(description="\n".join(lvl_msgs), color=COLORS["green"]))
+        else:
+            bview = BattleView(self, battle_id, [battle["player1"]["id"], battle["player2"]["id"]])
+            with suppress(discord.HTTPException):
+                bview.message = await channel.send(embed=embed, view=bview)
+        return None
+
+    async def battle_open_picker(self, interaction: discord.Interaction, battle_id: str) -> None:
+        battle = self._battles.get(battle_id)
+        if not battle or battle["status"] != "active":
+            await interaction.response.send_message("This battle is over.", ephemeral=True)
+            return
+        side = battle["player1"] if battle["player1"]["id"] == interaction.user.id else battle["player2"]
+        if side["moveUsed"]:
+            await interaction.response.send_message(
+                f"You've locked in **{pretty_move(side['moveUsed'])}** — waiting for your opponent.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        moves = []
+        for slug in [m for m in side["pokemon"]["moves"] if m]:
+            info = {"slug": slug, "power": None, "type": None}
+            with suppress(Exception):
+                md = await fetch_move_data(self._session, slug)
+                info["power"] = md.get("power")
+                info["type"] = (md.get("type") or {}).get("name")
+            moves.append(info)
+        foe = battle["player2"] if side is battle["player1"] else battle["player1"]
+        embed = discord.Embed(
+            title=f"⚔️ {mon_name(side['pokemon'])} — choose a move",
+            description=(
+                f"{hp_line(side['pokemon'], 8)}\n\nVs **{mon_name(foe['pokemon'])}** · {type_badges(foe['pokemon']['types'])}"
+            ),
+            color=type_color(side["pokemon"]),
+        )
+        view = MovePickerView(self, interaction.user.id, battle_id, moves)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    async def battle_submit_interaction(
+        self, interaction: discord.Interaction, battle_id: str, slug: str, *, picker: MovePickerView
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or interaction.channel is None:
+            return
+        picker.disable_all()
+        picker.stop()
+        await interaction.response.edit_message(
+            content=f"✅ You chose **{pretty_move(slug)}**!", embed=None, view=picker
+        )
+        err = await self._submit_move(member, interaction.channel, slug)
+        if err:
+            await interaction.followup.send(embed=error_embed(err), ephemeral=True)
+
+    async def battle_forfeit(self, interaction: discord.Interaction, battle_id: str) -> None:
+        battle = self._battles.get(battle_id)
+        if not battle or battle["status"] != "active" or battle.get("processing"):
+            await interaction.response.send_message("This battle can't be forfeited right now.", ephemeral=True)
+            return
+        me = battle["player1"] if battle["player1"]["id"] == interaction.user.id else battle["player2"]
+        other = battle["player2"] if me is battle["player1"] else battle["player1"]
+        battle["status"] = "finished"
+        await interaction.response.send_message(
+            embed=info_embed(f"🏳️ **{me['username']}** forfeited — **{other['username']}** wins!", COLORS["orange"])
+        )
+        await self._end_battle(interaction.guild, battle_id, other["id"], me["id"], interaction.channel)
 
     @commands.command(name="move")
     async def move(self, ctx: commands.Context, *, move_name: str) -> None:
-        """Use a move in your current battle. Usage: `move <move_name>`"""
-        player = await self._get_player(ctx.author)
-        if not player:
-            await ctx.send(embed=error_embed("Start your journey with `start`!"))
-            return
+        """Use a move in your current battle. Usage: `move <move_name>` (or tap ⚔️ Choose Move)."""
+        err = await self._submit_move(ctx.author, ctx.channel, move_name)
+        if err:
+            await ctx.send(embed=error_embed(err))
 
+    @commands.command(name="forfeit", aliases=["surrender"])
+    async def forfeit(self, ctx: commands.Context) -> None:
+        """Give up your current battle."""
         result = self._get_battle_by_user(ctx.author.id)
         if not result:
-            await ctx.send(embed=error_embed("You're not in a battle! Use `battle @user` to start one."))
+            await ctx.send(embed=error_embed("You're not in a battle."))
             return
-
         battle_id, battle = result
-        move_name = move_name.lower().replace(" ", "-")
-        is_p1     = battle["player1"]["id"] == ctx.author.id
-        my_side   = battle["player1"] if is_p1 else battle["player2"]
-
-        if move_name not in my_side["pokemon"]["moves"]:
-            move_list = ", ".join(f"`{m}`" for m in my_side["pokemon"]["moves"])
-            await ctx.send(embed=error_embed(
-                f"{my_side['pokemon']['displayName']} doesn't know **{move_name}**!\nKnown moves: {move_list}"
-            ))
+        if battle.get("processing"):
+            await ctx.send(embed=error_embed("A turn is resolving — try again in a second."))
             return
-
-        if my_side["moveUsed"]:
-            await ctx.send(embed=error_embed("You already chose a move this turn! Waiting for your opponent..."))
-            return
-
-        my_side["moveUsed"]    = move_name
-        my_side["lastMoveAt"]  = time.time()   # Reset AFK timer on move submission
-        await ctx.send(embed=discord.Embed(
-            color=COLORS["purple"],
-            description=f"⚔️ **{my_side['pokemon']['displayName']}** is ready to use **{move_name.replace('-', ' ')}**! Waiting for opponent...",
-        ))
-
-        if battle["player1"]["moveUsed"] and battle["player2"]["moveUsed"]:
-            turn_result = await self._process_turn(battle_id)
-            if not turn_result:
-                log.error(
-                    "[PokéBot] _process_turn returned None for battle %s — "
-                    "p1.moveUsed=%s p2.moveUsed=%s",
-                    battle_id,
-                    battle["player1"].get("moveUsed"),
-                    battle["player2"].get("moveUsed"),
-                )
-                await ctx.send(embed=error_embed(
-                    "Something went wrong processing this turn. "
-                    "The battle has been cancelled — please start a new one."
-                ))
-                self._battles.pop(battle_id, None)
-                return
-
-            updated_battle, turn_log, winner = turn_result
-            embed = self._build_battle_embed(updated_battle, turn_log)
-
-            if winner:
-                loser_id = (
-                    battle["player2"]["id"]
-                    if winner["id"] == battle["player1"]["id"]
-                    else battle["player1"]["id"]
-                )
-                lvl_msgs = await self._end_battle(ctx.guild, battle_id, winner["id"], loser_id, ctx.channel)
-                currency       = await _currency_name(ctx.guild)
-                embed.color    = COLORS["yellow"]
-                embed.title    = f"🏆 {winner['username']} wins the battle!"
-                xp_note = f" · Level-up messages incoming!" if lvl_msgs else ""
-                embed.set_footer(text=f"{winner['username']} earned 100 {currency} and battle XP!{xp_note}")
-                await ctx.send(embed=embed)
-                # Surface level-up messages as a follow-up
-                if lvl_msgs:
-                    await ctx.send(embed=discord.Embed(
-                        description="\n".join(lvl_msgs),
-                        color=COLORS["green"],
-                    ))
-            else:
-                await ctx.send(embed=embed)
+        me = battle["player1"] if battle["player1"]["id"] == ctx.author.id else battle["player2"]
+        other = battle["player2"] if me is battle["player1"] else battle["player1"]
+        battle["status"] = "finished"
+        await self._end_battle(ctx.guild, battle_id, other["id"], me["id"], ctx.channel)
+        await ctx.send(embed=info_embed(f"🏳️ **{me['username']}** forfeited — **{other['username']}** wins!", COLORS["orange"]))
 
     # ── Pokédex ───────────────────────────────────────────────────────────────
 
-    @commands.command(name="pokedex", aliases=["pdex"])
+    @commands.command(name="pokedex", aliases=["pdex", "dexpage", "dp"])
     async def pokedex(self, ctx: commands.Context, page: int = 1, user: Optional[discord.Member] = None) -> None:
         """View your Pokédex — species you've caught. Usage: `pokedex [page] [@user]`"""
         target = user or ctx.author
@@ -2747,70 +3282,6 @@ class PokéBot(commands.Cog):
         view = PaginatedView(async_dex_build, total_pages, page, ctx.author.id)
         view.message = await ctx.send(embed=embed, view=view)
 
-    @commands.command(name="dexpage", aliases=["dp"])
-    async def dexpage(self, ctx: commands.Context, page: int = 1, user: Optional[discord.Member] = None) -> None:
-        """Browse your Pokédex by page. Usage: `dexpage [page] [@user]`"""
-        target = user or ctx.author
-        player = await self._get_player(target)
-        if not player:
-            await ctx.send(embed=error_embed("That trainer hasn't started yet!"))
-            return
-
-        caught_ids   = set(player.get("caughtDex", []))
-        total_caught = len(caught_ids)
-        if not caught_ids:
-            await ctx.send(embed=discord.Embed(
-                color=COLORS["orange"],
-                description="📭 No Pokémon in your Pokédex yet — go catch some!",
-            ))
-            return
-
-        seen: Dict[int, str] = {}
-        for pk in player["pokemon"]:
-            if pk["id"] in caught_ids:
-                seen[pk["id"]] = pk["displayName"]
-
-        all_entries = [(pid, seen.get(pid, f"#{pid}")) for pid in sorted(caught_ids)]
-        per_page    = 30
-        total_pages = max(1, math.ceil(total_caught / per_page))
-        remaining   = MAX_POKEMON - total_caught
-        completion  = (total_caught / MAX_POKEMON) * 100
-        rank_label, rank_color = _dex_rank(total_caught)
-        prog_bar = _dex_progress_bar(total_caught, MAX_POKEMON, length=20)
-
-        def build_dp_embed(pg: int) -> discord.Embed:
-            pg     = max(1, min(pg, total_pages))
-            offset = (pg - 1) * per_page
-            chunk  = all_entries[offset:offset + per_page]
-            embed  = discord.Embed(
-                title=f"📖 {target.display_name}'s Pokédex — Page {pg}/{total_pages}",
-                color=rank_color,
-            )
-            embed.description = (
-                f"{rank_label}\n{prog_bar}\n"
-                f"**{total_caught}** / **{MAX_POKEMON}** — {completion:.1f}%"
-            )
-            col_size = 10
-            cols = [chunk[i:i + col_size] for i in range(0, len(chunk), col_size)]
-            for col in cols:
-                val = "\n".join(f"🔵 `#{pid:04d}` {name}" for pid, name in col)
-                embed.add_field(name="\u200b", value=val, inline=True)
-            embed.set_footer(text=f"Page {pg}/{total_pages} · {remaining} species still to find!")
-            return embed
-
-        async def async_dp_build(pg: int) -> discord.Embed:
-            return build_dp_embed(pg)
-
-        page  = max(1, min(page, total_pages))
-        embed = build_dp_embed(page)
-
-        if total_pages == 1:
-            await ctx.send(embed=embed)
-            return
-
-        view = PaginatedView(async_dp_build, total_pages, page, ctx.author.id)
-        view.message = await ctx.send(embed=embed, view=view)
-
         # ── Leaderboard ───────────────────────────────────────────────────────────
 
     @commands.command(name="pokeboard", aliases=["pb"])
@@ -2826,12 +3297,12 @@ class PokéBot(commands.Cog):
             return
 
         entries = []
-        for member in ctx.guild.members:
-            if member.bot:
+        all_members = await self.config.all_members(ctx.guild)
+        for member_id, p in all_members.items():
+            member = ctx.guild.get_member(int(member_id))
+            if member is None or member.bot or p.get("registeredAt") is None:
                 continue
-            p = await self._get_player(member)
-            if p:
-                entries.append((member, p))
+            entries.append((member, p))
 
         currency = await _currency_name(ctx.guild)
 
@@ -2932,10 +3403,22 @@ class PokéBot(commands.Cog):
                 embed.add_field(
                     name="🎯 Catching",
                     value="\n".join([
-                        f"`{prefix}catch [ball] [berry]` — Catch a wild Pokémon",
-                        "• Higher-level active Pokémon improve catch rate",
+                        "• Tap **🔴 / 🔵 / ⚫** under a wild Pokémon to throw that ball",
+                        "• Tap **📖 Do I have it?** to privately see if it's in your Pokédex, your odds, and to feed a berry",
+                        f"`{prefix}catch [ball] [berry]` — same thing by command (ball optional)",
+                        "• Higher-level lead Pokémon improve catch rate",
                         "• Wild Pokémon only deal damage on **failed** throws",
-                        f"`{prefix}pokespawn` — *(Admin)* Force spawn a Pokémon",
+                    ]),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="🏥 Healing",
+                    value="\n".join([
+                        f"`{prefix}heal` — revive + fully heal your whole party in one go",
+                        f"`{prefix}heal all` — the same for your entire collection",
+                        f"`{prefix}heal revive` · `{prefix}heal potion` — only revives / only HP",
+                        f"`{prefix}use revive all` · `{prefix}use potion all` — use one item type on everyone",
+                        "• Short on items? You'll get a **🛒 Buy missing & heal all** button",
                     ]),
                     inline=False,
                 )
@@ -2964,6 +3447,7 @@ class PokéBot(commands.Cog):
                         f"`{prefix}release <slot>` — Release a Pokémon for rewards",
                         f"`{prefix}dex <name or #> [shiny]` — Look up any Pokémon (✨ toggle for shiny)",
                         f"`{prefix}pokedex [page] [@user]` — View your Pokédex",
+                        f"`{prefix}dex <name>` also tells you if it's already registered",
                     ]),
                     inline=False,
                 )
@@ -2992,8 +3476,9 @@ class PokéBot(commands.Cog):
                 embed.add_field(
                     name="⚔️ Battling",
                     value="\n".join([
-                        f"`{prefix}battle @user` — Challenge someone to a 1v1 battle",
-                        f"`{prefix}move <move_name>` — Use a move in your current battle",
+                        f"`{prefix}battle @user` — Challenge someone (they tap **Fight!**)",
+                        "• Tap **⚔️ Choose Move** for a private move menu (or `move <name>`)",
+                        f"`{prefix}forfeit` — give up the current battle",
                         f"• Winner earns 100 {currency} + full XP",
                         "• Loser earns 30% consolation XP · 3-min AFK timeout",
                     ]),
@@ -3002,7 +3487,7 @@ class PokéBot(commands.Cog):
                 embed.add_field(
                     name="🔴 Raids",
                     value="\n".join([
-                        f"`{prefix}raidjoin` — Join the active raid with your **whole party**",
+                        f"**⚔️ Join Raid** button / `{prefix}raidjoin` — Join with your **whole party**",
                         f"`{prefix}raidswap <pos>` — Bring a party member to the front",
                         f"`{prefix}raidheal <item>` — Heal your active Pokémon (every 2 turns)",
                         f"`{prefix}raidstatus` — Check boss HP, party, and turn count",
@@ -3021,7 +3506,7 @@ class PokéBot(commands.Cog):
                     name="🔄 Trading",
                     value="\n".join([
                         f"`{prefix}trade @user <your_slot> <their_slot>` — Offer a trade",
-                        "• Target types `accepttrade` or `declinetrade`",
+                        "• The other trainer taps **Accept trade** or **Decline**",
                         "• Both trainers' Pokédexes update after a successful trade",
                         "• Cannot trade during battles or your last Pokémon",
                     ]),
@@ -3037,10 +3522,10 @@ class PokéBot(commands.Cog):
                 embed.add_field(
                     name="🛒 Shop",
                     value="\n".join([
-                        f"`{prefix}shop` — Browse the PokéMart (3 pages: Balls / Healing / Berries)",
-                        f"`{prefix}buy <item> [amount]` — Buy items",
-                        f"`{prefix}use <item> [slot]` — Use a healing item",
-                        f"`{prefix}inventory` — View your bag & {currency} balance",
+                        f"`{prefix}shop` — PokéMart: pick an item, tap **Buy ×1 / ×5 / ×10**",
+                        f"`{prefix}buy <item> [amount]` — Buy by command",
+                        f"`{prefix}use <item> [slot|all]` — Use a healing item",
+                        f"`{prefix}bag` — View your bag & {currency} balance",
                     ]),
                     inline=False,
                 )
@@ -3085,7 +3570,7 @@ class PokéBot(commands.Cog):
                     value="\n".join([
                         "• Wild Pokémon spawn on a timer or every ~15 messages",
                         "• Uncaught Pokémon **flee** after a configurable timeout (default 4 h)",
-                        "• Shiny Pokémon are **1/512** — extremely rare!",
+                        "• Shiny Pokémon are **1/256** — extremely rare!",
                         "• Your active Pokémon's level affects catch rate vs the wild Pokémon",
                         "• Catch XP is awarded even on a failed throw",
                         "• Check your `pokedex` — 1,025 species to complete!",
@@ -3498,14 +3983,16 @@ class PokéBot(commands.Cog):
     @commands.command(name="trade")
     async def trade(self, ctx: commands.Context, target: discord.Member, your_slot: int, their_slot: int) -> None:
         """Offer a Pokémon trade. Usage: `trade @user <your_slot> <their_slot>`
-        Both trainers must confirm. The trade swaps the Pokémon in those slots."""
+
+        The other trainer gets Accept / Decline buttons. The exact Pokémon shown are
+        the ones that get swapped — even if either collection is reordered meanwhile.
+        """
         if target == ctx.author:
             await ctx.send(embed=error_embed("You can't trade with yourself!"))
             return
         if target.bot:
             await ctx.send(embed=error_embed("You can't trade with a bot!"))
             return
-
         player = await self._get_player(ctx.author)
         if not player:
             await ctx.send(embed=error_embed("Start your journey with `start`!"))
@@ -3514,144 +4001,116 @@ class PokéBot(commands.Cog):
         if not target_data:
             await ctx.send(embed=error_embed(f"{target.display_name} hasn't started their journey yet!"))
             return
-
         if self._get_battle_by_user(ctx.author.id) or self._get_battle_by_user(target.id):
             await ctx.send(embed=error_embed("Can't trade while either trainer is in a battle!"))
             return
+        if target.id in self._trades or ctx.author.id in self._trades:
+            await ctx.send(embed=error_embed("One of you already has a trade offer waiting — finish that first."))
+            return
 
-        # Validate slots
-        your_idx  = your_slot - 1
-        their_idx = their_slot - 1
-        if your_idx < 0 or your_idx >= len(player["pokemon"]):
+        your_idx, their_idx = your_slot - 1, their_slot - 1
+        if not (0 <= your_idx < len(player["pokemon"])):
             await ctx.send(embed=error_embed(f"You don't have a Pokémon in slot {your_slot}. You have {len(player['pokemon'])}."))
             return
-        if their_idx < 0 or their_idx >= len(target_data["pokemon"]):
-            await ctx.send(embed=error_embed(f"{target.display_name} doesn't have a Pokémon in slot {their_slot}. They have {len(target_data['pokemon'])}."))
-            return
-        if len(player["pokemon"]) <= 1:
-            await ctx.send(embed=error_embed("You can't trade your last Pokémon!"))
-            return
-        if len(target_data["pokemon"]) <= 1:
-            await ctx.send(embed=error_embed(f"{target.display_name} can't trade their last Pokémon!"))
-            return
-
-        your_poke  = player["pokemon"][your_idx]
-        their_poke = target_data["pokemon"][their_idx]
-
-        # Can't offer the active Pokémon if it would leave 0 usable ones (edge case handled below)
-        # Stash the offer
-        self._trades[target.id] = {
-            "offerer_id":   ctx.author.id,
-            "offerer_name": ctx.author.display_name,
-            "target_id":    target.id,
-            "channel_id":   ctx.channel.id,
-            "your_idx":     your_idx,
-            "their_idx":    their_idx,
-            "expires":      time.time() + 120,
-        }
-
-        shiny_y = " ✨" if your_poke.get("shiny") else ""
-        shiny_t = " ✨" if their_poke.get("shiny") else ""
-        nick_y  = f' "{your_poke["nickname"]}"' if your_poke.get("nickname") else ""
-        nick_t  = f' "{their_poke["nickname"]}"' if their_poke.get("nickname") else ""
-
-        embed = discord.Embed(
-            title="🔄 Trade Offer!",
-            description=(
-                f"**{ctx.author.display_name}** wants to trade with **{target.display_name}**!\n\n"
-                f"📤 **{ctx.author.display_name}** offers:\n"
-                f"→ **{your_poke['displayName']}{shiny_y}{nick_y}** Lv.{your_poke['level']} "
-                f"| {' / '.join(t.capitalize() for t in your_poke['types'])}\n\n"
-                f"📥 **{target.display_name}**'s Pokémon in slot {their_slot}:\n"
-                f"→ **{their_poke['displayName']}{shiny_t}{nick_t}** Lv.{their_poke['level']} "
-                f"| {' / '.join(t.capitalize() for t in their_poke['types'])}\n\n"
-                f"{target.mention} — type `accepttrade` to accept or `declinetrade` to decline!\n"
-                f"_(Expires in 2 minutes)_"
-            ),
-            color=COLORS["orange"],
-        )
-        if your_poke.get("spriteUrl"):
-            embed.set_thumbnail(url=your_poke["spriteUrl"])
-        if their_poke.get("spriteUrl"):
-            embed.set_image(url=their_poke["spriteUrl"])
-        await ctx.send(embed=embed)
-
-        def check(m: discord.Message) -> bool:
-            return (
-                m.author == target
-                and m.channel == ctx.channel
-                and m.content.lower().strip() in ("accepttrade", "declinetrade")
-            )
-
-        try:
-            msg = await self.bot.wait_for("message", check=check, timeout=120.0)
-        except asyncio.TimeoutError:
-            self._trades.pop(target.id, None)
-            await ctx.send(embed=error_embed(f"{target.display_name} didn't respond. Trade expired."))
-            return
-
-        trade = self._trades.pop(target.id, None)
-        if not trade or time.time() > trade["expires"]:
-            await ctx.send(embed=error_embed("Trade expired."))
-            return
-
-        if msg.content.lower().strip() == "declinetrade":
-            await ctx.send(embed=discord.Embed(
-                color=COLORS["gray"],
-                description=f"❌ {target.display_name} declined the trade.",
+        if not (0 <= their_idx < len(target_data["pokemon"])):
+            await ctx.send(embed=error_embed(
+                f"{target.display_name} doesn't have a Pokémon in slot {their_slot}. They have {len(target_data['pokemon'])}."
             ))
             return
-
-        # ── Execute the trade ─────────────────────────────────────────────────
-        # Re-fetch fresh data to avoid stale state
-        player      = await self._get_player(ctx.author)
-        target_data = await self._get_player(target)
-        if not player or not target_data:
-            await ctx.send(embed=error_embed("Trade failed — one trainer's data could not be loaded."))
+        if len(player["pokemon"]) <= 1 or len(target_data["pokemon"]) <= 1:
+            await ctx.send(embed=error_embed("Neither trainer can trade away their last Pokémon!"))
             return
 
-        yi, ti = trade["your_idx"], trade["their_idx"]
-        # Validate indices are still valid (collection may have changed)
-        if yi >= len(player["pokemon"]) or ti >= len(target_data["pokemon"]):
-            await ctx.send(embed=error_embed("Trade failed — a Pokémon slot is no longer valid (collection changed)."))
-            return
+        your_poke, their_poke = player["pokemon"][your_idx], target_data["pokemon"][their_idx]
+        your_uid, their_uid = your_poke["uid"], their_poke["uid"]
 
-        # Swap the Pokémon
-        poke_y = copy.deepcopy(player["pokemon"][yi])
-        poke_t = copy.deepcopy(target_data["pokemon"][ti])
-        player["pokemon"][yi]      = poke_t
-        target_data["pokemon"][ti] = poke_y
+        def side(p: dict) -> str:
+            return f"**{mon_name(p)}** · Lv.{p['level']}\n{dex_no(p['id'])} · {type_badges(p['types'])}"
 
-        # Fix active indices if they pointed at the traded slot
-        if player["activePokemonIndex"] == yi:
-            player["activePokemonIndex"] = yi  # same slot, new pokemon — fine
-        if target_data["activePokemonIndex"] == ti:
-            target_data["activePokemonIndex"] = ti
-
-        # Update Pokédex for both trainers
-        self._update_dex(player, poke_t)
-        self._update_dex(target_data, poke_y)
-
-        # Keep both parties valid (the traded-away uid leaves each party)
-        ensure_party(player)
-        ensure_party(target_data)
-
-        await self._save_player(ctx.author, player)
-        await self._save_player(target, target_data)
-
-        shiny_y = " ✨" if poke_y.get("shiny") else ""
-        shiny_t = " ✨" if poke_t.get("shiny") else ""
         embed = discord.Embed(
-            title="🔄 Trade Complete!",
+            title="🔄 Trade Offer",
+            description=f"{target.mention}, **{ctx.author.display_name}** wants to trade with you! _(2 minutes)_",
+            color=COLORS["orange"],
+        )
+        embed.add_field(name=f"📤 {ctx.author.display_name} gives", value=side(your_poke), inline=True)
+        embed.add_field(name=f"📥 {target.display_name} gives", value=side(their_poke), inline=True)
+        art = artwork_url(your_poke)
+        if art:
+            embed.set_thumbnail(url=art)
+        art2 = artwork_url(their_poke)
+        if art2:
+            embed.set_image(url=art2)
+
+        view = RequestView(ctx.author.id, target.id, accept_label="Accept trade", timeout=120)
+        self._trades[target.id] = {"offerer_id": ctx.author.id}
+        try:
+            view.message = await ctx.send(content=target.mention, embed=embed, view=view,
+                                          allowed_mentions=discord.AllowedMentions(users=[target]))
+            await view.wait()
+        finally:
+            self._trades.pop(target.id, None)
+
+        if view.value != "accept":
+            text = {
+                "decline": f"❌ {target.display_name} declined the trade.",
+                "cancel":  f"↩️ {ctx.author.display_name} withdrew the offer.",
+            }.get(view.value, f"⌛ {target.display_name} didn't respond — trade expired.")
+            await ctx.send(embed=info_embed(text, COLORS["gray"]))
+            return
+
+        # ── Execute: lock both trainers (in a fixed order to avoid deadlocks) ──
+        first, second = sorted((ctx.author, target), key=lambda m: m.id)
+        lock_a = self._lock_for(ctx.guild.id, first.id)
+        lock_b = self._lock_for(ctx.guild.id, second.id)
+        if not await lock_a.acquire(timeout=10):
+            await ctx.send(embed=error_embed("Trade failed — a trainer is busy. Try again."))
+            return
+        try:
+            if not await lock_b.acquire(timeout=10):
+                await ctx.send(embed=error_embed("Trade failed — a trainer is busy. Try again."))
+                return
+            try:
+                player      = await self._get_player(ctx.author)
+                target_data = await self._get_player(target)
+                if not player or not target_data:
+                    await ctx.send(embed=error_embed("Trade failed — a trainer's save couldn't be loaded."))
+                    return
+                if self._get_battle_by_user(ctx.author.id) or self._get_battle_by_user(target.id):
+                    await ctx.send(embed=error_embed("Trade failed — one of you entered a battle."))
+                    return
+                yi, ti = uid_index(player, your_uid), uid_index(target_data, their_uid)
+                if yi < 0 or ti < 0:
+                    await ctx.send(embed=error_embed("Trade failed — one of those Pokémon is no longer available."))
+                    return
+                poke_y = player["pokemon"][yi]
+                poke_t = target_data["pokemon"][ti]
+                player["pokemon"][yi]      = poke_t
+                target_data["pokemon"][ti] = poke_y
+                poke_t["evoNotified"] = False
+                poke_y["evoNotified"] = False
+                self._update_dex(player, poke_t)
+                self._update_dex(target_data, poke_y)
+                ensure_party(player)
+                ensure_party(target_data)
+                await self._save_player(ctx.author, player)
+                await self._save_player(target, target_data)
+            finally:
+                lock_b.release()
+        finally:
+            lock_a.release()
+
+        done = discord.Embed(
+            title="🔄 Trade complete!",
             description=(
-                f"✅ Trade successful!\n\n"
-                f"**{ctx.author.display_name}** received: **{poke_t['displayName']}{shiny_t}** Lv.{poke_t['level']}\n"
-                f"**{target.display_name}** received: **{poke_y['displayName']}{shiny_y}** Lv.{poke_y['level']}"
+                f"**{ctx.author.display_name}** received **{mon_name(poke_t)}** (Lv.{poke_t['level']})\n"
+                f"**{target.display_name}** received **{mon_name(poke_y)}** (Lv.{poke_y['level']})"
             ),
             color=COLORS["green"],
         )
-        await ctx.send(embed=embed)
-
+        art = artwork_url(poke_t)
+        if art:
+            done.set_thumbnail(url=art)
+        await ctx.send(embed=done)
 
     # ══════════════════════════════════════════════════════════════════════════
     # RAID SYSTEM  (party-based, rebalanced)
@@ -3813,8 +4272,9 @@ class PokéBot(commands.Cog):
             title=f"{'✨ ' if boss.get('shiny') else ''}🔴 RAID BOSS — {boss['displayName']} {star_label}",
             color=color_map.get(stars, COLORS["red"]),
         )
-        if boss.get("spriteUrl"):
-            embed.set_thumbnail(url=boss["spriteUrl"])
+        art = artwork_url(boss)
+        if art:
+            embed.set_thumbnail(url=art)
 
         embed.add_field(name="Boss HP", value=f"{bar}  **{hp_current:,} / {hp_max:,}**", inline=False)
         embed.add_field(
@@ -4059,13 +4519,15 @@ class PokéBot(commands.Cog):
             member = guild.get_member(participant["member_id"])
             if not member:
                 continue
-            p_data = await self._get_player(member)
-            if not p_data:
-                continue
-            poke = p_data["pokemon"][p_data["activePokemonIndex"]]
-            poke["xp"] = poke.get("xp", 0) + max(30, math.floor(participant.get("damage_dealt", 0) / 10))
-            self._check_level_up(poke)
-            await self._save_player(member, p_data)
+            try:
+                async with self._trainer(member, timeout=60) as p_data:
+                    if not p_data:
+                        continue
+                    poke = p_data["pokemon"][p_data["activePokemonIndex"]]
+                    poke["xp"] = poke.get("xp", 0) + max(30, math.floor(participant.get("damage_dealt", 0) / 10))
+                    self._check_level_up(poke)
+            except TrainerBusy:
+                log.warning("[PokéBot] skipped raid consolation XP for %s (save busy)", member.id)
 
     async def _resolve_raid_victory(
         self, guild: discord.Guild, channel: discord.TextChannel, raid: dict
@@ -4083,75 +4545,70 @@ class PokéBot(commands.Cog):
             boss["shiny"] = True
             boss["spriteUrl"] = boss.get("shinySpriteUrl") or boss.get("spriteUrl")
 
-        raid_stats = await self.config.guild(guild).encounter_stats()
-        raid_stats["raid_wins"] = raid_stats.get("raid_wins", 0) + 1
-        await self.config.guild(guild).encounter_stats.set(raid_stats)
+        async with self.config.guild(guild).encounter_stats() as raid_stats:
+            raid_stats["raid_wins"] = raid_stats.get("raid_wins", 0) + 1
 
         lines = []
+        max_pokemon = await self.config.guild(guild).max_pokemon()
         for participant in raid["participants"]:
             member = guild.get_member(participant["member_id"])
             if not member:
                 continue
-            p_data = await self._get_player(member)
-            if not p_data:
-                continue
-
-            poke    = p_data["pokemon"][p_data["activePokemonIndex"]]
             alive   = self._raid_party_alive(participant)
             contrib = participant.get("damage_dealt", 0) / total_dmg
+            xp_gain = math.floor(100 + boss["level"] * 2 + contrib * 300)
+            credits = stars * 200 + math.floor(contrib * stars * 400)
 
-            xp_gain    = math.floor(100 + boss["level"] * 2 + contrib * 300)
-            poke["xp"] = poke.get("xp", 0) + xp_gain
-            lvl_msgs   = self._check_level_up(poke)
-
-            base_credits = stars * 200
-            bonus        = math.floor(contrib * stars * 400)
-            credits      = base_credits + bonus
-            await self._save_player(member, p_data)
-            try:
-                await _deposit(member, credits)
-            except Exception:
-                pass
-
-            # ── Multiple Raid Ball throws ──────────────────────────────────────
+            # Multiple Raid Ball throws — rolled up front, applied under the lock below.
             n_balls     = self._raid_balls_awarded(stars, alive)
-            base_catch  = 0.55 + contrib * 0.20          # 55–75% base
-            shiny_bonus = 0.05 if boss_is_shiny else 0
-            per_ball    = min(base_catch + shiny_bonus, 0.85)
-
-            caught_count = 0
-            throw_lines  = []
+            per_ball    = min(0.55 + contrib * 0.20 + (0.05 if boss_is_shiny else 0), 0.85)
+            caught      = False
+            throw_lines = []
             for throw_num in range(1, n_balls + 1):
                 if random.random() < per_ball:
-                    caught_count = 1
+                    caught = True
                     throw_lines.append(f"  🔵 Ball {throw_num}: ✅ **Caught!**")
                     break
                 throw_lines.append(f"  🔵 Ball {throw_num}: 💨 Broke free...")
 
-            max_pokemon    = await self.config.guild(guild).max_pokemon()
             actually_added = 0
-            for _ in range(caught_count):
-                if len(p_data["pokemon"]) < max_pokemon:
-                    boss_copy                = copy.deepcopy(boss)
-                    boss_copy["uid"]         = new_uid()   # each caught copy is its own Pokémon
-                    boss_copy["shiny"]       = boss_is_shiny
-                    boss_copy["stats"]["hp"] = boss_copy["stats"]["maxHp"]
-                    boss_copy["caughtAt"]    = time.time()
-                    boss_copy["nickname"]    = None
-                    p_data["pokemon"].append(boss_copy)
-                    self._update_dex(p_data, boss_copy)
-                    actually_added += 1
+            full_box = False
+            lvl_msgs: List[str] = []
+            try:
+                async with self._trainer(member, timeout=60) as p_data:
+                    if not p_data:
+                        continue
+                    poke = p_data["pokemon"][p_data["activePokemonIndex"]]
+                    poke["xp"] = poke.get("xp", 0) + xp_gain
+                    lvl_msgs = self._check_level_up(poke)
+                    if caught:
+                        if len(p_data["pokemon"]) < max_pokemon:
+                            boss_copy                = copy.deepcopy(boss)
+                            boss_copy["uid"]         = new_uid()   # each caught copy is its own Pokémon
+                            boss_copy["shiny"]       = boss_is_shiny
+                            boss_copy["stats"]["hp"] = boss_copy["stats"]["maxHp"]
+                            boss_copy["caughtAt"]    = time.time()
+                            boss_copy["nickname"]    = None
+                            p_data["pokemon"].append(boss_copy)
+                            self._update_dex(p_data, boss_copy)
+                            actually_added = 1
+                        else:
+                            full_box = True
+            except TrainerBusy:
+                log.warning("[PokéBot] skipped raid rewards for %s (save busy)", member.id)
+                continue
+            with suppress(Exception):
+                await _deposit(member, credits)
             if actually_added:
-                await self._save_player(member, p_data)
-                raid_stats = await self.config.guild(guild).encounter_stats()
-                raid_stats["raid_catches"] = raid_stats.get("raid_catches", 0) + actually_added
-                await self.config.guild(guild).encounter_stats.set(raid_stats)
+                async with self.config.guild(guild).encounter_stats() as raid_stats:
+                    raid_stats["raid_catches"] = raid_stats.get("raid_catches", 0) + actually_added
 
-            caught_str = (
-                f"🎉 **Caught {actually_added}× {boss['displayName']}{'  ✨' if boss_is_shiny else ''}!**"
-                if actually_added
-                else f"😔 {boss['displayName']} wasn't caught this time."
-            )
+            if actually_added:
+                caught_str = f"🎉 **Caught {boss['displayName']}{'  ✨' if boss_is_shiny else ''}!**"
+            elif full_box:
+                caught_str = "📦 Caught it — but your collection is full, so it was released."
+            else:
+                caught_str = f"😔 {boss['displayName']} wasn't caught this time."
             lvl_str = f"\n  ⬆️ {lvl_msgs[0]}" if lvl_msgs else ""
             lines.append(
                 f"{'✅' if alive else '💀'} **{participant['username']}** — "
@@ -4159,27 +4616,21 @@ class PokéBot(commands.Cog):
                 + "\n".join(throw_lines)
                 + f"\n  {caught_str}{lvl_str}"
             )
-
             if len(lvl_msgs) > 1:
-                try:
-                    await channel.send(embed=discord.Embed(
-                        description="\n".join(lvl_msgs[1:]), color=COLORS["green"]
-                    ))
-                except discord.HTTPException:
-                    pass
+                with suppress(discord.HTTPException):
+                    await channel.send(embed=discord.Embed(description="\n".join(lvl_msgs[1:]), color=COLORS["green"]))
 
         shiny_announce = "\n\n✨ **The boss was SHINY — boosted catch chances for everyone!**" if boss_is_shiny else ""
         embed = discord.Embed(
             title="🏆 Raid Rewards",
-            description="\n\n".join(lines) + shiny_announce,
+            description=("\n\n".join(lines) + shiny_announce)[:4000],
             color=COLORS["yellow"],
         )
-        if boss.get("spriteUrl"):
-            embed.set_thumbnail(url=boss["spriteUrl"])
-        try:
+        art = artwork_url(boss)
+        if art:
+            embed.set_thumbnail(url=art)
+        with suppress(discord.HTTPException):
             await channel.send(embed=embed)
-        except discord.HTTPException:
-            pass
 
     # ── Raid commands ─────────────────────────────────────────────────────────
 
@@ -4251,17 +4702,19 @@ class PokéBot(commands.Cog):
             description=(
                 f"**{tier_label}** · Lv.{boss['level']}\n"
                 f"Type: {' / '.join(t.capitalize() for t in boss['types'])}\n\n"
-                f"⏳ **Join window: 2 minutes** — type `raidjoin` to enter with your party!\n\n"
+                f"⏳ **Join window: 2 minutes** — tap **⚔️ Join Raid** (or type `raidjoin`) to enter with your party!\n\n"
                 f"**On victory:** {balls_preview - 1}–{balls_preview} Raid Balls per trainer\n"
                 f"_Boss HP scales to your team — bring a full party (up to 6) for the tough ones!_"
             ),
             color={1: COLORS["green"], 2: COLORS["blue"], 3: COLORS["purple"],
                    4: COLORS["orange"], 5: COLORS["shiny"]}[stars],
         )
-        if boss.get("spriteUrl"):
-            embed.set_image(url=boss["spriteUrl"])
+        art = artwork_url(boss)
+        if art:
+            embed.set_image(url=art)
         embed.set_footer(text=f"{star_label} · Higher stars = tougher boss & better rewards!")
-        await channel.send(embed=embed)
+        join_view = RaidJoinView(self, ctx.guild.id, timeout=120)
+        join_view.message = await channel.send(embed=embed, view=join_view)
 
         if channel != ctx.channel:
             await ctx.send(embed=success_embed(f"Raid started in {channel.mention}!"))
@@ -4269,58 +4722,64 @@ class PokéBot(commands.Cog):
         task = self.bot.loop.create_task(self._run_raid(ctx.guild, channel))
         self._raid_tasks[ctx.guild.id] = task
 
-    @commands.command(name="raidjoin", aliases=["joinraid"])
-    async def raidjoin(self, ctx: commands.Context) -> None:
-        """Join the active raid with your whole party during the 2-minute window."""
-        raid = self._raids.get(ctx.guild.id)
+    async def _raid_join(self, member: discord.Member) -> Tuple[bool, discord.Embed]:
+        raid = self._raids.get(member.guild.id)
         if not raid:
-            await ctx.send(embed=error_embed("There's no active raid right now!"))
-            return
+            return False, error_embed("There's no active raid right now!")
         if raid["turn"] > 0:
-            await ctx.send(embed=error_embed("The raid has already started — you can only join during the 2-minute window!"))
-            return
-
-        player = await self._get_player(ctx.author)
+            return False, error_embed("The raid has already started — you can only join during the 2-minute window!")
+        player = await self._get_player(member)
         if not player:
-            await ctx.send(embed=error_embed("Start your journey with `start` before joining raids!"))
-            return
-        if any(p["member_id"] == ctx.author.id for p in raid["participants"]):
-            await ctx.send(embed=error_embed("You've already joined this raid!"))
-            return
+            return False, error_embed("Start your journey with `start` before joining raids!")
+        if any(p["member_id"] == member.id for p in raid["participants"]):
+            return False, error_embed("You've already joined this raid!")
 
         # Snapshot the party (deep copies so raid damage never touches stored HP)
         roster = party_mons(player)
         if not roster:
-            await ctx.send(embed=error_embed("Your party is empty! Add Pokémon with `party add <slot>`."))
-            return
+            return False, error_embed("Your party is empty! Add Pokémon with `party add <slot>`.")
         bench = [copy.deepcopy(m) for m in roster]
         if all(m["stats"]["hp"] <= 0 for m in bench):
-            await ctx.send(embed=error_embed(
-                "Every Pokémon in your party has fainted! Heal up with `use`/`shop` before joining."
-            ))
-            return
+            return False, error_embed("Every Pokémon in your party has fainted! Use `heal` before joining.")
 
-        # Start on the first healthy party member
         start_idx = next((i for i, m in enumerate(bench) if m["stats"]["hp"] > 0), 0)
         raid["participants"].append({
-            "member_id":     ctx.author.id,
-            "username":      ctx.author.display_name,
+            "member_id":     member.id,
+            "username":      member.display_name,
             "bench":         bench,
             "active_idx":    start_idx,
             "damage_dealt":  0,
             "heal_cooldown": 0,
         })
-
         alive_n, total_n = self._raid_party_status(raid["participants"][-1])
         lead = bench[start_idx]
-        await ctx.send(embed=discord.Embed(
+        hurt = sum(1 for m in bench if 0 < m["stats"]["hp"] < m["stats"]["maxHp"])
+        tip = f"\n_Tip: {hurt + total_n - alive_n} party member(s) aren't at full HP — `heal` before the fight starts!_" \
+            if (hurt or alive_n < total_n) else ""
+        return True, discord.Embed(
             color=COLORS["green"],
             description=(
-                f"✅ **{ctx.author.display_name}** joined with a party of **{total_n}** "
-                f"({alive_n} healthy)! Leading with **{lead['displayName']}** (Lv.{lead['level']}).\n"
-                f"_{len(raid['participants'])} trainer(s) ready._"
+                f"✅ **{member.display_name}** joined with a party of **{total_n}** "
+                f"({alive_n} healthy)! Leading with **{mon_name(lead)}** (Lv.{lead['level']}).\n"
+                f"_{len(raid['participants'])} trainer(s) ready._{tip}"
             ),
-        ))
+        )
+
+    async def raid_join_interaction(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return
+        ok, embed = await self._raid_join(member)
+        if ok:
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @commands.command(name="raidjoin", aliases=["joinraid"])
+    async def raidjoin(self, ctx: commands.Context) -> None:
+        """Join the active raid with your whole party during the 2-minute window."""
+        _, embed = await self._raid_join(ctx.author)
+        await ctx.send(embed=embed)
 
     @commands.command(name="raidswap")
     async def raidswap(self, ctx: commands.Context, position: int) -> None:
