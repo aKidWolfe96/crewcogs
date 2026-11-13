@@ -130,7 +130,7 @@ class Casino(commands.Cog):
         embed.add_field(name="Achievements", value=f"{len(data.get('achievements', []))}/{len(ACHIEVEMENTS)}", inline=True)
         embed.set_thumbnail(url=ctx.author.display_avatar.url)
         p = ctx.clean_prefix
-        embed.set_footer(text=f"Shortcuts: {p}bj · {p}flip · {p}slots · {p}roulette · {p}hl · {p}crash · {p}mines · {p}daily")
+        embed.set_footer(text=f"Shortcuts: {p}bj · {p}cf · {p}slots · {p}roulette · {p}hl · {p}crash · {p}mines · {p}daily")
         view = LobbyView(self, ctx)
         view.message = await ctx.send(embed=embed, view=view)
 
@@ -182,7 +182,7 @@ class Casino(commands.Cog):
                               description=f"Bets accept numbers like `500` or `2.5k`, or `half`, `all`, `max`.\n"
                                           f"Open everything from `{p}casino`.")
         embed.add_field(name="🃏 Blackjack", value=f"`{p}bj <bet>` · blackjack pays **3:2** · dealer stands on 17 · double or split your first two cards", inline=False)
-        embed.add_field(name="🪙 Coin Flip", value=f"`{p}flip <bet> [heads|tails]` · win pays **2×**", inline=False)
+        embed.add_field(name="🪙 Coin Flip", value=f"`{p}cf <bet> [heads|tails]` · win pays **2×**", inline=False)
         embed.add_field(name="🎰 Slots", value=f"`{p}slots <bet>` · three alike **5×–100×** (7️⃣ 100×, 💎 50×, ⭐ 25×) · any pair **1.5×**", inline=False)
         embed.add_field(name="🎡 Roulette", value=f"`{p}roulette <bet> [red|black|odd|even|low|high|1st12|col1|0-36]` · numbers **35:1** · dozens/columns **2:1** · the rest **1:1**\n`{p}rtable` — open a shared table everyone can bet on", inline=False)
         embed.add_field(name="🂡 High/Low", value=f"`{p}hl <bet>` · up to 7 guesses, cash out any time · 1.2× → 4.75×", inline=False)

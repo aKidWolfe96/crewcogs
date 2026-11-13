@@ -21,10 +21,10 @@ class CoinFlip(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="coinflip", aliases=["flip", "cf"])
+    @commands.command(name="coinflip", aliases=["cf"])
     @commands.guild_only()
     async def coinflip(self, ctx: commands.Context, bet: str, side: Optional[str] = None):
-        """Flip a coin for double your bet. Usage: `flip <bet> [heads|tails]`
+        """Flip a coin for double your bet. Usage: `cf <bet> [heads|tails]`
 
         Leave out the side to pick it with a button. Bets can be `500`, `2.5k`, `half`, `all`.
         """
