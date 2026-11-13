@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import discord
-from redbot.core import bank
 
 from .casino_core import CONFIG, safe_deposit
 

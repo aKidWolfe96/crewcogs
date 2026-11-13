@@ -1,250 +1,204 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import asyncio
 from io import BytesIO
-import random
-import time
 
 import discord
 from redbot.core import bank, checks, commands
 
-from .casino_core import ACTIVE_GAMES, CONFIG, DEFAULT_GAME_SETTINGS, safe_deposit
+from .casino_core import ACTIVE_GAMES, CONFIG, DEFAULT_GAME_SETTINGS, GAME_LABELS, currency, get_game_settings
 from .progression import ACHIEVEMENTS, ACHIEVEMENT_MAP, challenge_definitions, ensure_rotations
+from .rewards import FREEBIE_DEFAULTS, freebie_settings, open_panel, status as reward_status
+from .ui import BetPanelView, OwnedView
+
+# (lobby button label, emoji, cog name, game key)
+LOBBY_GAMES = (
+    ("Blackjack", "🃏", "Blackjack", "blackjack"),
+    ("Coin Flip", "🪙", "CoinFlip", "coinflip"),
+    ("Slots", "🎰", "Slots", "slots"),
+    ("Roulette", "🎡", "Roulette", "roulette"),
+    ("High/Low", "🂡", "HighLow", "highlow"),
+    ("Crash", "🚀", "Crash", "crash"),
+    ("Mines", "💣", "Mines", "mines"),
+)
+
+
+class LobbyView(OwnedView):
+    """The casino front door: every game, rewards and your stats one tap away."""
+
+    def __init__(self, cog: "Casino", ctx: commands.Context) -> None:
+        super().__init__(ctx.author.id, timeout=600)
+        self.cog, self.ctx = cog, ctx
+        for i, (label, emoji, cog_name, key) in enumerate(LOBBY_GAMES):
+            btn = discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.primary, row=i // 4)
+            btn.callback = self._game(label, emoji, cog_name, key)
+            self.add_item(btn)
+        for label, emoji, style, cb in (
+            ("Roulette Table", "👥", discord.ButtonStyle.secondary, self._table),
+            ("Daily Rewards", "🎁", discord.ButtonStyle.success, self._daily),
+            ("My Stats", "📊", discord.ButtonStyle.secondary, self._stats),
+            ("Challenges", "📋", discord.ButtonStyle.secondary, self._challenges),
+            ("Leaderboard", "🏆", discord.ButtonStyle.secondary, self._board),
+            ("How to play", "❓", discord.ButtonStyle.secondary, self._odds),
+        ):
+            btn = discord.ui.Button(label=label, emoji=emoji, style=style, row=2 if label in ("Roulette Table", "Daily Rewards", "My Stats") else 3)
+            btn.callback = cb
+            self.add_item(btn)
+
+    def _game(self, label: str, emoji: str, cog_name: str, key: str):
+        async def go(interaction: discord.Interaction) -> None:
+            game_cog = self.cog.bot.get_cog(cog_name)
+            if game_cog is None:
+                await interaction.response.send_message(f"{label} isn't loaded right now.", ephemeral=True)
+                return
+            settings = await get_game_settings(self.ctx.guild, key)
+            if not settings["enabled"]:
+                await interaction.response.send_message(f"{label} is currently disabled.", ephemeral=True)
+                return
+
+            async def on_bet(i: discord.Interaction, raw: str) -> None:
+                await game_cog.start(self.ctx, raw, interaction=i)
+
+            balance = await bank.get_balance(self.ctx.author)
+            limits = f"min {settings['min_bet']:,}" + (f" · max {settings['max_bet']:,}" if settings["max_bet"] else "")
+            await interaction.response.send_message(
+                f"{emoji} **{label}** — pick your bet (balance **{balance:,}**, {limits}). "
+                "This panel stays open so you can keep playing.",
+                view=BetPanelView(self.ctx.author.id, on_bet, max_bet=settings["max_bet"]),
+                ephemeral=True,
+            )
+        return go
+
+    async def _table(self, interaction: discord.Interaction) -> None:
+        roulette = self.cog.bot.get_cog("Roulette")
+        if roulette is None:
+            await interaction.response.send_message("Roulette isn't loaded right now.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await roulette.rtable.callback(roulette, self.ctx)
+
+    async def _daily(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        await open_panel(self.ctx)
+
+    async def _stats(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=await self.cog.stats_embed(self.ctx.author), ephemeral=True)
+
+    async def _challenges(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=await self.cog.challenges_embed(self.ctx.author), ephemeral=True)
+
+    async def _board(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=await self.cog.board_embed(self.ctx.guild, self.ctx.author), ephemeral=True)
+
+    async def _odds(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=await self.cog.odds_embed(self.ctx), ephemeral=True)
 
 
 class Casino(commands.Cog):
-    """Unified casino profiles, leaderboards, analytics, and settings."""
+    """Ruthless Dealer Casino — lobby, rewards, profiles, leaderboards and settings."""
 
     def __init__(self, bot):
         self.bot = bot
 
+    # ── Lobby ─────────────────────────────────────────────────────────────────
+
     @commands.group(name="casino", invoke_without_command=True)
     @commands.guild_only()
     async def casino(self, ctx: commands.Context, member: discord.Member = None):
-        """Show a unified casino profile or manage the casino."""
-        member = member or ctx.author
+        """Open the casino lobby (or `casino @member` to see someone's stats)."""
+        if member is not None and member != ctx.author:
+            await ctx.send(embed=await self.stats_embed(member))
+            return
+        balance = await bank.get_balance(ctx.author)
+        cur = await currency(ctx.guild)
+        data = await CONFIG.member(ctx.author).all()
+        ready = [k for k, v in (await reward_status(ctx.author)).items() if v["ready"]]
+        net = data["total_paid"] - data["total_wagered"]
+        title = data.get("equipped_title") or "Ruthless Player"
+        embed = discord.Embed(
+            title="🎰 Ruthless Dealer Casino",
+            description=(
+                f"Welcome back, **{ctx.author.display_name}** — *{title}*\n"
+                f"💰 **{balance:,} {cur}**"
+                + (f"\n🎁 **{len(ready)} reward{'s' if len(ready) != 1 else ''} ready** — tap Daily Rewards!" if ready else "")
+                + "\n\nPick a game below. Every result has **Again / 2× / ½** buttons so you can keep playing."
+            ),
+            color=discord.Color.gold(),
+        )
+        embed.add_field(name="Record", value=f"{data['wins']:,}W · {data['losses']:,}L · {data['pushes']:,}P", inline=True)
+        embed.add_field(name="Net", value=f"{net:+,}", inline=True)
+        embed.add_field(name="Achievements", value=f"{len(data.get('achievements', []))}/{len(ACHIEVEMENTS)}", inline=True)
+        embed.set_thumbnail(url=ctx.author.display_avatar.url)
+        p = ctx.clean_prefix
+        embed.set_footer(text=f"Shortcuts: {p}bj · {p}flip · {p}slots · {p}roulette · {p}hl · {p}crash · {p}mines · {p}daily")
+        view = LobbyView(self, ctx)
+        view.message = await ctx.send(embed=embed, view=view)
+
+    async def stats_embed(self, member: discord.Member) -> discord.Embed:
         data = await CONFIG.member(member).all()
         net = data["total_paid"] - data["total_wagered"]
         win_rate = data["wins"] / data["total_games"] * 100 if data["total_games"] else 0
-        favorite = max(data["games"].items(), key=lambda item: item[1].get("games", 0))[0].title() if data["games"] else "None"
+        favorite = max(data["games"].items(), key=lambda item: item[1].get("games", 0))[0] if data["games"] else None
         equipped = data.get("equipped_title") or "Ruthless Player"
-        embed = discord.Embed(title=f"🎰 Ruthless Dealer Casino • {member.display_name} — {equipped}", color=discord.Color.gold())
+        embed = discord.Embed(title=f"📊 {member.display_name} — {equipped}", color=discord.Color.gold())
         embed.add_field(name="Record", value=f"Games: **{data['total_games']:,}**\nWins: **{data['wins']:,}**\nLosses: **{data['losses']:,}**\nPushes: **{data['pushes']:,}**\nWin rate: **{win_rate:.1f}%**")
         embed.add_field(name="Economy", value=f"Wagered: **{data['total_wagered']:,}**\nReturned: **{data['total_paid']:,}**\nNet: **{net:+,}**\nBiggest payout: **{data['biggest_payout']:,}**")
-        embed.add_field(name="Favorite Game", value=f"**{favorite}**", inline=False)
-        embed.add_field(name="Progress", value=f"Achievements: **{len(data.get('achievements', []))}/20**\nBest High/Low streak: **{data.get('best_highlow_streak', 0)}**\nLongest win streak: **{data.get('longest_win_streak', 0)}**", inline=False)
-        if member == ctx.author:
-            free = await self._freebie_settings(ctx.guild)
-            now = time.time()
-            statuses = []
-            for label, key, cooldown in (
-                ("Daily Stipend", "daily_stipend_at", free["daily_cooldown"]),
-                ("Scratch Ticket", "scratch_claimed_at", free["scratch_cooldown"]),
-            ):
-                ready = now - float(data.get(key, 0)) >= int(cooldown)
-                statuses.append(f"{'✅' if ready else '⏳'} {label}")
-            balance = await bank.get_balance(member)
-            claim_ready = balance < int(free["claim_threshold"]) and now - float(data.get("bailout_claimed_at", 0)) >= int(free["claim_cooldown"])
-            statuses.append(f"{'✅' if claim_ready else '⏳'} Ruthless Dealer Bailout")
-            embed.add_field(name="Free Credits", value="\n".join(statuses), inline=False)
-        embed.set_footer(text="Unified tracking begins when this update is installed; legacy per-game stats remain available.")
-        await ctx.send(embed=embed)
+        embed.add_field(name="Favourite game", value=f"**{GAME_LABELS.get(favorite, favorite or 'None')}**", inline=False)
+        per_game = []
+        for game, g in sorted(data["games"].items(), key=lambda kv: kv[1].get("games", 0), reverse=True)[:7]:
+            gnet = g.get("paid", 0) - g.get("wagered", 0)
+            per_game.append(f"{GAME_LABELS.get(game, game)} — {g.get('games', 0):,} played · {g.get('wins', 0):,}W · {gnet:+,}")
+        if per_game:
+            embed.add_field(name="By game", value="\n".join(per_game), inline=False)
+        embed.add_field(name="Progress", value=f"Achievements: **{len(data.get('achievements', []))}/{len(ACHIEVEMENTS)}**\nBest High/Low streak: **{data.get('best_highlow_streak', 0)}**\nLongest win streak: **{data.get('longest_win_streak', 0)}**", inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        return embed
 
-
-
-    @staticmethod
-    def _cooldown_text(seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        hours, remainder = divmod(seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
-        if hours:
-            return f"{hours}h {minutes}m"
-        if minutes:
-            return f"{minutes}m {secs}s"
-        return f"{secs}s"
-
-    @staticmethod
-    async def _freebie_settings(guild: discord.Guild) -> dict:
-        defaults = {
-            "daily_enabled": True, "daily_min": 750, "daily_max": 1250,
-            "daily_cooldown": 86400, "claim_enabled": True,
-            "claim_threshold": 250, "claim_amount": 500,
-            "claim_cooldown": 43200, "scratch_enabled": True,
-            "scratch_cooldown": 86400,
-        }
-        stored = await CONFIG.guild(guild).freebies()
-        defaults.update(stored or {})
-        return defaults
-
-    @commands.command(name="cooldowns", aliases=["rewardcooldowns"])
+    @casino.command(name="stats")
     @commands.guild_only()
-    async def reward_timers(self, ctx: commands.Context):
-        """Show every persistent casino reward cooldown and challenge reset."""
-        settings = await self._freebie_settings(ctx.guild)
-        data = await CONFIG.member(ctx.author).all()
-        now = time.time()
-        balance = await bank.get_balance(ctx.author)
-        currency = await bank.get_currency_name(ctx.guild)
-        reward_ready_times = []
+    async def stats(self, ctx: commands.Context, member: discord.Member = None):
+        """Show detailed casino stats for you or another member."""
+        await ctx.send(embed=await self.stats_embed(member or ctx.author))
 
-        def timer_line(label: str, emoji: str, last_key: str, cooldown: int, enabled: bool = True) -> str:
-            if not enabled:
-                return f"⚫ **{label}** — Disabled"
-            remaining = int(cooldown - (now - float(data.get(last_key, 0.0))))
-            if remaining <= 0:
-                reward_ready_times.append((0, label))
-                return f"✅ **{label}** — Ready now"
-            ready_at = int(now + remaining)
-            reward_ready_times.append((remaining, label))
-            return f"{emoji} **{label}** — <t:{ready_at}:R> (`{self._cooldown_text(remaining)}`)"
+    # ── Daily rewards ─────────────────────────────────────────────────────────
 
-        reward_lines = [
-            timer_line(
-                "Daily Stipend", "🎁", "daily_stipend_at",
-                int(settings["daily_cooldown"]), bool(settings["daily_enabled"]),
-            ),
-            timer_line("Daily Spin", "🎲", "daily_spin_at", 86400),
-            timer_line(
-                "Scratch Ticket", "🎟️", "scratch_claimed_at",
-                int(settings["scratch_cooldown"]), bool(settings["scratch_enabled"]),
-            ),
-        ]
-
-        if not settings["claim_enabled"]:
-            reward_lines.append("⚫ **Ruthless Dealer Bailout** — Disabled")
-        else:
-            threshold = max(0, int(settings["claim_threshold"]))
-            remaining = int(
-                int(settings["claim_cooldown"])
-                - (now - float(data.get("bailout_claimed_at", 0.0)))
-            )
-            if balance >= threshold:
-                reward_lines.append(
-                    f"🔒 **Ruthless Dealer Bailout** — Balance must be below "
-                    f"**{threshold:,} {currency}** (yours: **{balance:,}**)"
-                )
-            elif remaining <= 0:
-                reward_ready_times.append((0, "Ruthless Dealer Bailout"))
-                reward_lines.append("✅ **Ruthless Dealer Bailout** — Ready now")
-            else:
-                ready_at = int(now + remaining)
-                reward_ready_times.append((remaining, "Ruthless Dealer Bailout"))
-                reward_lines.append(
-                    f"🎩 **Ruthless Dealer Bailout** — <t:{ready_at}:R> "
-                    f"(`{self._cooldown_text(remaining)}`)"
-                )
-
-        now_utc = datetime.now(timezone.utc)
-        next_daily = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        days_until_monday = 7 - now_utc.weekday()
-        next_weekly = (now_utc + timedelta(days=days_until_monday)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        daily_remaining = max(0, int((next_daily - now_utc).total_seconds()))
-        weekly_remaining = max(0, int((next_weekly - now_utc).total_seconds()))
-        reset_lines = [
-            f"☀️ **Daily Challenges** — <t:{int(next_daily.timestamp())}:R> "
-            f"(`{self._cooldown_text(daily_remaining)}`)",
-            f"🗓️ **Weekly Challenges** — <t:{int(next_weekly.timestamp())}:R> "
-            f"(`{self._cooldown_text(weekly_remaining)}`)",
-        ]
-
-        embed = discord.Embed(
-            title="⏱️ Ruthless Dealer Timers",
-            color=discord.Color.gold(),
-        )
-        embed.add_field(name="🎁 Reward Cooldowns", value="\n".join(reward_lines), inline=False)
-        embed.add_field(name="🎯 Challenge Resets", value="\n".join(reset_lines), inline=False)
-
-        if reward_ready_times:
-            ready_now = [label for remaining, label in reward_ready_times if remaining <= 0]
-            if ready_now:
-                next_text = "Ready now: " + ", ".join(ready_now)
-            else:
-                remaining, label = min(reward_ready_times)
-                next_text = f"Next reward: {label} in {self._cooldown_text(remaining)}"
-            embed.set_footer(text=f"{next_text} • Challenge resets use UTC.")
-        else:
-            embed.set_footer(text="Challenge resets use UTC.")
-        await ctx.send(embed=embed)
-
-    @commands.command(name="daily", aliases=["stipend"])
+    @commands.command(name="daily", aliases=["rewards", "stipend", "scratch", "scratchticket", "bailout", "cooldowns"])
     @commands.guild_only()
-    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
-    async def daily_stipend(self, ctx: commands.Context):
-        """Collect a modest daily casino stipend."""
-        settings = await self._freebie_settings(ctx.guild)
-        if not settings["daily_enabled"]:
-            return await ctx.send("Ruthless Dealer’s daily stipend is currently disabled.")
-        now = time.time()
-        last = float(await CONFIG.member(ctx.author).daily_stipend_at())
-        remaining = int(settings["daily_cooldown"] - (now - last))
-        if remaining > 0:
-            return await ctx.send(f"Ruthless Dealer already paid your stipend. Try again in **{self._cooldown_text(remaining)}**.")
-        low = max(0, int(settings["daily_min"]))
-        high = max(low, int(settings["daily_max"]))
-        requested = random.randint(low, high)
-        deposited = await safe_deposit(ctx.author, requested)
-        await CONFIG.member(ctx.author).daily_stipend_at.set(now)
-        currency = await bank.get_currency_name(ctx.guild)
-        if deposited < requested:
-            return await ctx.send(f"🎁 **Ruthless Dealer Daily Stipend**\nYou collected **{deposited:,} {currency}** before reaching the bank limit.")
-        await ctx.send(f"🎁 **Ruthless Dealer Daily Stipend**\nYou collected **{deposited:,} {currency}**. Come back tomorrow for another stipend!")
+    async def daily(self, ctx: commands.Context):
+        """Open your Daily Rewards: stipend (with streak bonus), daily spin, scratch ticket and bailout."""
+        await open_panel(ctx)
 
-    @casino.command(name="claim", aliases=["bailout", "pitboss"])
+    @casino.command(name="claim", aliases=["pitboss"], hidden=True)
     @commands.guild_only()
-    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
     async def emergency_claim(self, ctx: commands.Context):
-        """Claim a small emergency bailout when your balance is very low."""
-        settings = await self._freebie_settings(ctx.guild)
-        if not settings["claim_enabled"]:
-            return await ctx.send("Ruthless Dealer bailouts are currently disabled.")
-        balance = await bank.get_balance(ctx.author)
-        threshold = max(0, int(settings["claim_threshold"]))
-        if balance >= threshold:
-            currency = await bank.get_currency_name(ctx.guild)
-            return await ctx.send(f"Ruthless Dealer only helps players below **{threshold:,} {currency}**. Your balance is **{balance:,}**.")
-        now = time.time()
-        last = float(await CONFIG.member(ctx.author).bailout_claimed_at())
-        remaining = int(settings["claim_cooldown"] - (now - last))
-        if remaining > 0:
-            return await ctx.send(f"Ruthless Dealer already helped you recently. Try again in **{self._cooldown_text(remaining)}**.")
-        requested = max(0, int(settings["claim_amount"]))
-        deposited = await safe_deposit(ctx.author, requested)
-        await CONFIG.member(ctx.author).bailout_claimed_at.set(now)
-        currency = await bank.get_currency_name(ctx.guild)
-        await ctx.send(f"🎩 **Ruthless Dealer Favor**\nRuthless Dealer slides you **{deposited:,} {currency}** in chips.\n*“Good luck... you'll need it.”*")
+        """Open your Daily Rewards (the bailout lives there now)."""
+        await open_panel(ctx)
 
-    @commands.command(name="scratch", aliases=["scratchticket"])
+    # ── How to play ───────────────────────────────────────────────────────────
+
+    async def odds_embed(self, ctx: commands.Context) -> discord.Embed:
+        p = ctx.clean_prefix
+        embed = discord.Embed(title="❓ How to play", color=discord.Color.gold(),
+                              description=f"Bets accept numbers like `500` or `2.5k`, or `half`, `all`, `max`.\n"
+                                          f"Open everything from `{p}casino`.")
+        embed.add_field(name="🃏 Blackjack", value=f"`{p}bj <bet>` · blackjack pays **3:2** · dealer stands on 17 · double or split your first two cards", inline=False)
+        embed.add_field(name="🪙 Coin Flip", value=f"`{p}flip <bet> [heads|tails]` · win pays **2×**", inline=False)
+        embed.add_field(name="🎰 Slots", value=f"`{p}slots <bet>` · three alike **5×–100×** (7️⃣ 100×, 💎 50×, ⭐ 25×) · any pair **1.5×**", inline=False)
+        embed.add_field(name="🎡 Roulette", value=f"`{p}roulette <bet> [red|black|odd|even|low|high|1st12|col1|0-36]` · numbers **35:1** · dozens/columns **2:1** · the rest **1:1**\n`{p}rtable` — open a shared table everyone can bet on", inline=False)
+        embed.add_field(name="🂡 High/Low", value=f"`{p}hl <bet>` · up to 7 guesses, cash out any time · 1.2× → 4.75×", inline=False)
+        embed.add_field(name="🚀 Crash", value=f"`{p}crash <bet> [auto]` · cash out before the rocket crashes · e.g. `{p}crash 500 2` auto-cashes at 2×", inline=False)
+        embed.add_field(name="💣 Mines", value=f"`{p}mines <bet> [1-10 mines]` · each gem raises the multiplier · hit a mine and lose", inline=False)
+        embed.add_field(name="🎁 Free credits", value=f"`{p}daily` — stipend (streak bonus up to +70%), daily spin, scratch ticket and bailout", inline=False)
+        return embed
+
+    @casino.command(name="odds", aliases=["howto", "help", "payouts", "games"])
     @commands.guild_only()
-    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
-    async def scratch_ticket(self, ctx: commands.Context):
-        """Use one conservative free scratch ticket each day."""
-        settings = await self._freebie_settings(ctx.guild)
-        if not settings["scratch_enabled"]:
-            return await ctx.send("Ruthless Dealer’s daily scratch tickets are currently disabled.")
-        now = time.time()
-        last = float(await CONFIG.member(ctx.author).scratch_claimed_at())
-        remaining = int(settings["scratch_cooldown"] - (now - last))
-        if remaining > 0:
-            return await ctx.send(f"Ruthless Dealer already gave you today’s scratch ticket. Try again in **{self._cooldown_text(remaining)}**.")
-        prizes = [0, 250, 500, 1000, 2500, 5000, 10000]
-        weights = [3500, 3200, 2000, 900, 300, 90, 10]
-        requested = random.choices(prizes, weights=weights, k=1)[0]
-        deposited = await safe_deposit(ctx.author, requested) if requested else 0
-        await CONFIG.member(ctx.author).scratch_claimed_at.set(now)
-        currency = await bank.get_currency_name(ctx.guild)
-        if requested == 0:
-            return await ctx.send("🎟️ **Ruthless Dealer Daily Scratch Ticket**\nNo prize this time. Better luck tomorrow!")
-        if requested >= 5000:
-            await ctx.send(f"🎟️ **Ruthless Dealer Daily Scratch Ticket — Big Winner!**\nYou scratched off **{deposited:,} {currency}**!")
-        else:
-            await ctx.send(f"🎟️ **Ruthless Dealer Daily Scratch Ticket**\nYou won **{deposited:,} {currency}**!")
+    async def odds(self, ctx: commands.Context):
+        """How every game works and what it pays."""
+        await ctx.send(embed=await self.odds_embed(ctx))
 
-
-    async def _send_casinoboard(
-        self, ctx: commands.Context, metric: str = "wagered", game: str = None
-    ):
+    async def board_embed(self, guild: discord.Guild, viewer: discord.Member, metric: str = "wagered",
+                          game: str = None) -> discord.Embed:
         aliases = {
             "bet": "wagered",
             "bets": "wagered",
@@ -256,16 +210,14 @@ class Casino(commands.Cog):
         }
         metric = aliases.get(metric.lower(), metric.lower())
         if metric not in {"wagered", "profit", "games", "wins", "losses", "payout"}:
-            return await ctx.send(
-                "Category must be: `wagered`, `profit`, `wins`, `losses`, "
-                "`played`, or `biggestwin`."
-            )
+            return discord.Embed(description="Category must be: `wagered`, `profit`, `wins`, `losses`, `played`, or `biggestwin`.",
+                                 color=discord.Color.red())
 
         game = game.lower().strip() if game else None
-        all_members = await CONFIG.all_members(ctx.guild)
+        all_members = await CONFIG.all_members(guild)
         rows = []
         for user_id, data in all_members.items():
-            member = ctx.guild.get_member(int(user_id))
+            member = guild.get_member(int(user_id))
             if not member or member.bot:
                 continue
 
@@ -299,7 +251,7 @@ class Casino(commands.Cog):
                 }
             if not values["games"]:
                 continue
-            rows.append((member.display_name, values[metric], values))
+            rows.append((member.display_name, values[metric], values, member.id))
 
         rows.sort(key=lambda row: row[1], reverse=True)
         title_game = f" — {game.title()}" if game else ""
@@ -309,7 +261,7 @@ class Casino(commands.Cog):
             description=f"Top players by **{display_metric}**",
             color=discord.Color.gold(),
         )
-        for index, (name, value, values) in enumerate(rows[:10], 1):
+        for index, (name, value, values, _) in enumerate(rows[:10], 1):
             record = (
                 f"Wins: **{values['wins']:,}** | "
                 f"Losses: **{values['losses']:,}** | "
@@ -323,7 +275,10 @@ class Casino(commands.Cog):
             )
         if not rows:
             embed.description = "No matching casino games have been recorded yet."
-        await ctx.send(embed=embed)
+        rank = next((i for i, row in enumerate(rows, 1) if row[3] == viewer.id), None)
+        if rank and rank > 10:
+            embed.set_footer(text=f"Your rank: #{rank}")
+        return embed
 
 
     @casino.command(name="achievements", aliases=["ach", "badges"])
@@ -347,7 +302,7 @@ class Casino(commands.Cog):
                     f"{achievement['description']} `({min(value, achievement['goal']):,}/{achievement['goal']:,})`{reward}{title}"
                 )
             pages.append(discord.Embed(
-                title=f"🏆 Ruthless Dealer • {member.display_name}'s Achievements ({len(unlocked)}/20)",
+                title=f"🏆 Ruthless Dealer • {member.display_name}'s Achievements ({len(unlocked)}/{len(ACHIEVEMENTS)})",
                 description="\n\n".join(lines), color=discord.Color.gold()
             ))
         for embed in pages:
@@ -358,14 +313,10 @@ class Casino(commands.Cog):
         from .progression import stat_value
         return stat_value(data, stat)
 
-    @casino.command(name="challenges", aliases=["challenge"])
-    @commands.guild_only()
-    async def challenges(self, ctx: commands.Context, member: discord.Member = None):
-        """Show the current rotating daily and weekly challenges."""
-        member = member or ctx.author
-        daily_ids, weekly_ids = await ensure_rotations(ctx.guild)
+    async def challenges_embed(self, member: discord.Member) -> discord.Embed:
+        daily_ids, weekly_ids = await ensure_rotations(member.guild)
         data = await CONFIG.member(member).all()
-        embed = discord.Embed(title=f"📋 {member.display_name}'s Ruthless Dealer Challenges", color=discord.Color.blurple())
+        embed = discord.Embed(title=f"📋 {member.display_name}'s Challenges", color=discord.Color.blurple())
         for label, ids, weekly in (("☀️ Daily", daily_ids, False), ("🗓️ Weekly", weekly_ids, True)):
             state = data.get("weekly_state" if weekly else "daily_state", {})
             progress = state.get("progress", {})
@@ -374,10 +325,19 @@ class Casino(commands.Cog):
             for definition in challenge_definitions(ids, weekly=weekly):
                 current = min(int(progress.get(definition["id"], 0)), definition["goal"])
                 status = "✅" if definition["id"] in claimed else "⬜"
-                lines.append(f"{status} **{definition['name']}** — {definition['description']} `({current:,}/{definition['goal']:,})` • **{definition['reward']:,}**")
+                bar_len = 8
+                filled = round(current / definition["goal"] * bar_len) if definition["goal"] else bar_len
+                bar = "█" * filled + "░" * (bar_len - filled)
+                lines.append(f"{status} **{definition['name']}** — {definition['description']}\n`{bar}` {current:,}/{definition['goal']:,} · reward **{definition['reward']:,}**")
             embed.add_field(name=label, value="\n".join(lines) or "No challenges generated.", inline=False)
-        embed.set_footer(text="Daily and weekly rotations exclude the immediately previous rotation. Resets use UTC.")
-        await ctx.send(embed=embed)
+        embed.set_footer(text="Rewards pay out automatically when you finish. Resets at 00:00 UTC (weekly on Monday).")
+        return embed
+
+    @casino.command(name="challenges", aliases=["challenge"])
+    @commands.guild_only()
+    async def challenges(self, ctx: commands.Context, member: discord.Member = None):
+        """Show the current rotating daily and weekly challenges."""
+        await ctx.send(embed=await self.challenges_embed(member or ctx.author))
 
     @casino.group(name="title", aliases=["titles"], invoke_without_command=True)
     @commands.guild_only()
@@ -413,40 +373,12 @@ class Casino(commands.Cog):
         member = member or ctx.author
         data = await CONFIG.member(member).all()
         try:
-            from PIL import Image, ImageDraw, ImageFont, ImageOps
             avatar_bytes = await member.display_avatar.with_size(256).read()
-            avatar = Image.open(BytesIO(avatar_bytes)).convert("RGB").resize((180, 180))
-            avatar = ImageOps.fit(avatar, (180, 180))
-            card = Image.new("RGB", (1000, 420), (25, 27, 34))
-            draw = ImageDraw.Draw(card)
-            font_big = ImageFont.truetype("DejaVuSans.ttf", 34)
-            font = ImageFont.truetype("DejaVuSans.ttf", 22)
-            card.paste(avatar, (35, 45))
-            title = data.get("equipped_title") or "Ruthless Player"
-            draw.text((245, 45), member.display_name, fill="white", font=font_big)
-            draw.text((245, 92), title, fill=(255, 207, 64), font=font)
-            net = data.get("total_paid", 0) - data.get("total_wagered", 0)
-            stats = [
-                f"Games Played: {data.get('total_games', 0):,}",
-                f"Wins: {data.get('wins', 0):,}",
-                f"Total Wagered: {data.get('total_wagered', 0):,}",
-                f"Net: {net:+,}",
-                f"Achievements: {len(data.get('achievements', []))}/20",
-                f"Longest Win Streak: {data.get('longest_win_streak', 0):,}",
-                f"Best High/Low Streak: {data.get('best_highlow_streak', 0):,}",
-            ]
-            for i, line in enumerate(stats):
-                x = 245 if i < 4 else 600
-                y = 145 + (i if i < 4 else i - 4) * 44
-                draw.text((x, y), line, fill=(225, 225, 230), font=font)
-            badges = [ACHIEVEMENT_MAP[x]["emoji"] for x in data.get("achievements", []) if x in ACHIEVEMENT_MAP]
-            draw.text((35, 260), "Badges", fill=(255, 207, 64), font=font)
-            draw.text((35, 310), " ".join(badges[:12]) or "None yet", fill="white", font=font)
-            output = BytesIO(); card.save(output, format="PNG"); output.seek(0)
-            await ctx.send(file=discord.File(output, filename="casino-profile.png"))
+            png = await asyncio.to_thread(_draw_profile_card, avatar_bytes, member.display_name, data)
+            await ctx.send(file=discord.File(BytesIO(png), filename="casino-profile.png"))
         except Exception:
-            await ctx.send("Ruthless Dealer could not render the profile card, so here is the standard casino profile instead.")
-            await ctx.invoke(self.casino, member=member)
+            await ctx.send("Ruthless Dealer could not render the profile card, so here are your stats instead.",
+                           embed=await self.stats_embed(member))
 
     @commands.command(name="casinoboard", aliases=["casinoleaderboard"])
     @commands.guild_only()
@@ -473,7 +405,7 @@ class Casino(commands.Cog):
                     f"Game must be one of: {', '.join(sorted(known_games))}."
                 )
 
-        await self._send_casinoboard(ctx, metric=category, game=game)
+        await ctx.send(embed=await self.board_embed(ctx.guild, ctx.author, metric=category, game=game))
 
     @casino.command(name="analytics")
     @checks.admin_or_permissions(manage_guild=True)
@@ -567,13 +499,16 @@ class Casino(commands.Cog):
             payout_cap = setting.get("payout_cap", 0)
             cap_text = f" | Payout cap: {payout_cap:,}" if payout_cap else (" | Payout cap: Unlimited" if "payout_cap" in setting else "")
             lines.append(f"**{game.title()}** — {'Enabled' if setting['enabled'] else 'Disabled'} | Min: {setting['min_bet']:,} | Max: {maximum}{cap_text} | Cooldown: {setting['cooldown']}s")
-        free = await self._freebie_settings(ctx.guild)
+        free = await freebie_settings(ctx.guild)
         lines.extend([
             "",
             "**Free Credit Systems**",
             f"Daily stipend: {'Enabled' if free['daily_enabled'] else 'Disabled'} | {int(free['daily_min']):,}–{int(free['daily_max']):,} | {int(free['daily_cooldown']) // 3600}h",
             f"Ruthless Dealer: {'Enabled' if free['claim_enabled'] else 'Disabled'} | Below {int(free['claim_threshold']):,} grants {int(free['claim_amount']):,} | {int(free['claim_cooldown']) // 3600}h",
             f"Scratch ticket: {'Enabled' if free['scratch_enabled'] else 'Disabled'} | {int(free['scratch_cooldown']) // 3600}h",
+            f"Daily spin: {'Enabled' if free.get('spin_enabled', True) else 'Disabled'}",
+            "",
+            f"Change with `{ctx.clean_prefix}casino setreward <setting> <value>`",
         ])
         await ctx.send(embed=discord.Embed(title="⚙️ Ruthless Dealer Casino Settings", description="\n".join(lines), color=discord.Color.gold()))
 
@@ -584,6 +519,36 @@ class Casino(commands.Cog):
         async with CONFIG.guild(ctx.guild).games() as games:
             games.setdefault(game, dict(DEFAULT_GAME_SETTINGS[game]))[key] = value
         await ctx.send(f"Updated **{game}** `{key}` to **{value}**.")
+
+    @casino.command(name="setreward")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def setreward(self, ctx, setting: str = None, value: str = None):
+        """Change a free-credit setting. Run with no arguments to list them.
+
+        Times are in hours, toggles take on/off. Example: `casino setreward daily_max 2000`
+        """
+        if setting is None or setting not in FREEBIE_DEFAULTS:
+            names = ", ".join(f"`{k}`" for k in FREEBIE_DEFAULTS)
+            return await ctx.send(f"Settings: {names}\nCooldowns are set in hours; `*_enabled` take on/off.")
+        default = FREEBIE_DEFAULTS[setting]
+        if value is None:
+            return await ctx.send(f"Give a value for `{setting}`.")
+        if isinstance(default, bool):
+            parsed = value.lower() in ("on", "true", "yes", "enable", "enabled", "1")
+        else:
+            try:
+                number = float(value)
+            except ValueError:
+                return await ctx.send("That needs to be a number.")
+            if number < 0:
+                return await ctx.send("Values can't be negative.")
+            parsed = int(number * 3600) if setting.endswith("_cooldown") else int(number)
+        async with CONFIG.guild(ctx.guild).freebies() as free:
+            free[setting] = parsed
+            if setting in ("daily_min", "daily_max") and free.get("daily_min", 0) > free.get("daily_max", 0):
+                free["daily_max"] = free["daily_min"]
+        shown = f"{parsed // 3600}h" if setting.endswith("_cooldown") else parsed
+        await ctx.send(f"Updated `{setting}` to **{shown}**.")
 
     @casino.command(name="setmin")
     @checks.admin_or_permissions(manage_guild=True)
@@ -629,3 +594,38 @@ class Casino(commands.Cog):
     async def disable(self, ctx, game: str):
         await self._set_value(ctx, game, "enabled", False)
 
+
+
+def _draw_profile_card(avatar_bytes: bytes, display_name: str, data: dict) -> bytes:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+    avatar = ImageOps.fit(Image.open(BytesIO(avatar_bytes)).convert("RGB"), (180, 180))
+    card = Image.new("RGB", (1000, 420), (25, 27, 34))
+    draw = ImageDraw.Draw(card)
+    try:
+        font_big = ImageFont.truetype("DejaVuSans.ttf", 34)
+        font = ImageFont.truetype("DejaVuSans.ttf", 22)
+    except OSError:
+        font_big = font = ImageFont.load_default()
+    card.paste(avatar, (35, 45))
+    draw.text((245, 45), display_name, fill="white", font=font_big)
+    draw.text((245, 92), data.get("equipped_title") or "Ruthless Player", fill=(255, 207, 64), font=font)
+    net = data.get("total_paid", 0) - data.get("total_wagered", 0)
+    stats = [
+        f"Games Played: {data.get('total_games', 0):,}",
+        f"Wins: {data.get('wins', 0):,}",
+        f"Total Wagered: {data.get('total_wagered', 0):,}",
+        f"Net: {net:+,}",
+        f"Achievements: {len(data.get('achievements', []))}/{len(ACHIEVEMENTS)}",
+        f"Longest Win Streak: {data.get('longest_win_streak', 0):,}",
+        f"Best High/Low Streak: {data.get('best_highlow_streak', 0):,}",
+    ]
+    for i, line in enumerate(stats):
+        x = 245 if i < 4 else 600
+        y = 145 + (i if i < 4 else i - 4) * 44
+        draw.text((x, y), line, fill=(225, 225, 230), font=font)
+    unlocked = [ACHIEVEMENT_MAP[x]["name"] for x in data.get("achievements", []) if x in ACHIEVEMENT_MAP]
+    draw.text((35, 260), "Achievements", fill=(255, 207, 64), font=font)
+    draw.text((35, 310), ", ".join(unlocked[:5]) or "None yet", fill="white", font=font)
+    out = BytesIO()
+    card.save(out, format="PNG")
+    return out.getvalue()

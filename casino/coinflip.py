@@ -1,89 +1,107 @@
+import asyncio
 import logging
 import os
 import random
+from typing import Optional
 
-from discord import Embed, File
-from redbot.core import Config, bank, commands
+import discord
+from redbot.core import bank, commands
 
-from .casino_core import mark_played, refund_wager, settle_game, validate_bet
+from .casino_core import currency, mark_played, refund_wager, reply, resolve_bet, settle_game, validate_bet
+from .ui import ChoiceView, GameOverView
+
+GAME = "coinflip"
+LOG = logging.getLogger("red.crewcogs.casino.coinflip")
+SIDES = {"heads": "heads", "h": "heads", "head": "heads", "tails": "tails", "t": "tails", "tail": "tails"}
 
 
 class CoinFlip(commands.Cog):
-    """Coin Flip casino game using Red economy."""
+    """Coin Flip — call it in the air."""
 
     def __init__(self, bot):
         self.bot = bot
-        self.CONFIG = Config.get_conf(None, identifier=9876543210)
-        self.CONFIG.register_user(total_cf_wins=0, total_cf_losses=0, total_cf_bet=0)
 
-    @commands.command()
-    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
-    async def coinflip(self, ctx, side: str, bet: int):
-        """Bet on heads or tails."""
-        side = side.lower()
-        if side not in ("heads", "tails"):
-            return await ctx.send("Ruthless Dealer says to choose either `heads` or `tails`.")
+    @commands.command(name="coinflip", aliases=["flip", "cf"])
+    @commands.guild_only()
+    async def coinflip(self, ctx: commands.Context, bet: str, side: Optional[str] = None):
+        """Flip a coin for double your bet. Usage: `flip <bet> [heads|tails]`
 
-        error = await validate_bet(ctx, "coinflip", bet)
+        Leave out the side to pick it with a button. Bets can be `500`, `2.5k`, `half`, `all`.
+        """
+        if bet.lower() in SIDES:  # old order: coinflip heads 100
+            bet, side = side or "", bet
+        await self.start(ctx, bet, side)
+
+    async def start(self, ctx: commands.Context, raw_bet, side: Optional[str] = None,
+                    interaction: Optional[discord.Interaction] = None) -> None:
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.defer()
+        bet, err = await resolve_bet(ctx.author, GAME, raw_bet)
+        if err:
+            await reply(ctx, interaction, err)
+            return
+        if side is None:
+            view = ChoiceView(
+                ctx.author.id,
+                [("Heads", "🙂", discord.ButtonStyle.primary, "heads"), ("Tails", "🪙", discord.ButtonStyle.secondary, "tails")],
+                lambda i, value: self.start(ctx, bet, value, i),
+            )
+            embed = discord.Embed(title="🪙 Coin Flip", description=f"Betting **{bet:,}** — call it!", color=0xF1C40F)
+            view.message = await ctx.send(embed=embed, view=view)
+            return
+        side = SIDES.get(side.lower())
+        if side is None:
+            await reply(ctx, interaction, "Pick `heads` or `tails`.")
+            return
+        error = await validate_bet(ctx, GAME, bet)
         if error:
-            return await ctx.send(error)
-
+            await reply(ctx, interaction, error)
+            return
         try:
             await bank.withdraw_credits(ctx.author, bet)
-            mark_played(ctx.guild.id, ctx.author.id, "coinflip")
+            mark_played(ctx.guild.id, ctx.author.id, GAME)
         except ValueError:
-            return await ctx.send("Ruthless Dealer could not place the wager because your balance changed. Try again.")
+            await reply(ctx, interaction, "Your balance changed — try again.")
+            return
 
         settled = False
         try:
+            cur = await currency(ctx.guild)
+            msg = await ctx.send(embed=discord.Embed(
+                title="🪙 Coin Flip", color=0xF1C40F,
+                description=f"**{ctx.author.display_name}** bets **{bet:,}** on **{side.title()}**…\n\n🪙 *flipping…*",
+            ))
+            await asyncio.sleep(1.2)
             result = random.choice(("heads", "tails"))
             won = result == side
-            payout = bet * 2 if won else 0
-            settlement = await settle_game(
-                ctx.author, "coinflip", bet, payout, "win" if won else "loss"
-            )
+            settlement = await settle_game(ctx.author, GAME, bet, bet * 2 if won else 0,
+                                           "win" if won else "loss", channel=ctx.channel)
             settled = True
-
-            cfg = self.CONFIG.user(ctx.author)
-            await cfg.total_cf_bet.set(await cfg.total_cf_bet() + bet)
             if won:
-                await cfg.total_cf_wins.set(await cfg.total_cf_wins() + 1)
-            else:
-                await cfg.total_cf_losses.set(await cfg.total_cf_losses() + 1)
-
-            image_path = os.path.join(os.path.dirname(__file__), "cards", f"{result}.png")
-            file = File(image_path, filename="coin.png")
-            embed = Embed(title="🪙 Ruthless Dealer • Coin Flip", description=f"You bet **{bet:,}** on **{side.title()}**.")
-            embed.add_field(name="Result", value=f"**{result.title()}**", inline=False)
-            if won:
-                text = (
-                    f"🎉 Returned **{settlement.deposited:,}** CrewCoin "
-                    f"(net **{settlement.deposited - bet:+,}**)."
-                )
+                text = f"🎉 **{result.title()}!** You win **{settlement.deposited - bet:+,} {cur}**."
                 if settlement.capped:
-                    text += " Your payout was limited by the bank balance cap."
+                    text += "\n_Payout limited by the bank balance cap._"
             else:
-                text = f"💸 You lost **{bet:,}** CrewCoin."
-            embed.add_field(name="Outcome", value=text, inline=False)
-            embed.set_image(url="attachment://coin.png")
-            await ctx.send(embed=embed, file=file)
+                text = f"💸 **{result.title()}.** You lose **{bet:,} {cur}**."
+            balance = await bank.get_balance(ctx.author)
+            embed = discord.Embed(title="🪙 Coin Flip", description=text, color=0x2ECC71 if won else 0xE74C3C)
+            embed.set_footer(text=f"Balance: {balance:,} {cur}")
+            image_path = os.path.join(os.path.dirname(__file__), "cards", f"{result}.png")
+            file = discord.File(image_path, filename="coin.png")
+            embed.set_thumbnail(url="attachment://coin.png")
+            other = "tails" if side == "heads" else "heads"
+            view = GameOverView(
+                ctx.author.id, bet, lambda i, b: self.start(ctx, b, side, i),
+                extras=[(f"Switch to {other.title()}", "🔄", discord.ButtonStyle.secondary,
+                         lambda i: self.start(ctx, bet, other, i))],
+            )
+            await msg.edit(embed=embed, attachments=[file], view=view)
+            view.message = msg
         except Exception:
             if not settled:
-                await refund_wager(ctx.author, "coinflip", bet, reason="command failure before settlement")
-            logging.getLogger("red.crewcogs.casino.coinflip").exception(
-                "Coin Flip failed for user %s", ctx.author.id
-            )
-            await ctx.send(
-                "Ruthless Dealer’s Coin Flip settled, but the result message or legacy stats failed."
-                if settled
-                else "Ruthless Dealer’s Coin Flip hit an unexpected error. The unsettled wager was refunded."
-            )
-
-    @commands.command()
-    async def cfstats(self, ctx):
-        """Show your legacy coinflip stats."""
-        data = await self.CONFIG.user(ctx.author).all()
-        await ctx.send(f"Ruthless Dealer Coin Flip — Wins: {data['total_cf_wins']}, Losses: {data['total_cf_losses']}, Bet total: {data['total_cf_bet']:,}")
+                await refund_wager(ctx.author, GAME, bet, reason="command failure before settlement")
+            LOG.exception("Coin Flip failed for user %s", ctx.author.id)
+            await ctx.send("Coin Flip hit an error. " + ("Your result was recorded." if settled else "Your wager was refunded."))
 
 
 async def setup(bot):

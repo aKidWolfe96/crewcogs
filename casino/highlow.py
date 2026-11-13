@@ -4,7 +4,7 @@ import asyncio
 import logging
 import random
 from contextlib import suppress
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import discord
 from redbot.core import bank, commands
@@ -13,9 +13,12 @@ from .casino_core import (
     get_game_settings,
     mark_played,
     refund_wager,
+    reply,
+    resolve_bet,
     settle_game,
     validate_bet,
 )
+from .ui import GameOverView
 
 LOG = logging.getLogger("red.crewcogs.casino.highlow")
 GAME = "highlow"
@@ -84,7 +87,7 @@ class HighLowView(discord.ui.View):
             if self.message:
                 embed = self.cog.make_embed(self, description=text, color=discord.Color.orange())
                 with suppress(discord.HTTPException, discord.NotFound):
-                    await self.message.edit(embed=embed, view=self)
+                    await self.message.edit(embed=embed, view=self.cog.again_view(self))
             self.cog.active_players.discard(self.ctx.author.id)
             self.stop()
 
@@ -118,7 +121,8 @@ class HighLowView(discord.ui.View):
                     f"💸 **{next_card[:-1]} was not {guess}. You lost {self.bet:,}.**"
                 )
                 await interaction.message.edit(
-                    embed=self.cog.make_embed(self, description=description, color=discord.Color.red()), view=self
+                    embed=self.cog.make_embed(self, description=description, color=discord.Color.red()),
+                    view=self.cog.again_view(self, interaction.message),
                 )
                 self.cog.active_players.discard(self.ctx.author.id)
                 self.stop()
@@ -136,7 +140,8 @@ class HighLowView(discord.ui.View):
                     f"🏆 **Seven correct guesses! Auto-cashed out for {result.deposited:,}.**"
                 )
                 await interaction.message.edit(
-                    embed=self.cog.make_embed(self, description=description, color=discord.Color.green()), view=self
+                    embed=self.cog.make_embed(self, description=description, color=discord.Color.green()),
+                    view=self.cog.again_view(self, interaction.message),
                 )
                 self.cog.active_players.discard(self.ctx.author.id)
                 self.stop()
@@ -169,7 +174,8 @@ class HighLowView(discord.ui.View):
             result = await self.cog.finish(self, "win", self.current_payout)
             description = f"💰 **Cashed out after {self.streak} correct guess{'es' if self.streak != 1 else ''} for {result.deposited:,}.**"
             await interaction.message.edit(
-                embed=self.cog.make_embed(self, description=description, color=discord.Color.green()), view=self
+                embed=self.cog.make_embed(self, description=description, color=discord.Color.green()),
+                view=self.cog.again_view(self, interaction.message),
             )
             self.cog.active_players.discard(self.ctx.author.id)
             self.stop()
@@ -220,16 +226,31 @@ class HighLow(commands.Cog):
         embed.set_footer(text="Equal ranks are a push and do not advance the streak.")
         return embed
 
+    def again_view(self, view: "HighLowView", message: Optional[discord.Message] = None) -> GameOverView:
+        again = GameOverView(view.ctx.author.id, view.bet, lambda i, b: self.start(view.ctx, b, i))
+        again.message = message or view.message
+        return again
+
     @commands.command(name="highlow", aliases=["hl", "higherlower"])
     @commands.guild_only()
-    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
-    async def highlow(self, ctx: commands.Context, bet: int):
-        """Start a seven-step card High/Low game."""
+    async def highlow(self, ctx: commands.Context, bet: str):
+        """Guess higher or lower up to 7 times; cash out whenever you like. Usage: `hl <bet>`"""
+        await self.start(ctx, bet)
+
+    async def start(self, ctx: commands.Context, raw_bet, interaction: Optional[discord.Interaction] = None) -> None:
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.defer()
+        bet, err = await resolve_bet(ctx.author, GAME, raw_bet)
+        if err:
+            await reply(ctx, interaction, err)
+            return
         if ctx.author.id in self.active_players:
-            return await ctx.send("Ruthless Dealer says you already have a High/Low game in progress.")
+            await reply(ctx, interaction, "You already have a High/Low game in progress.")
+            return
         error = await validate_bet(ctx, GAME, bet)
         if error:
-            return await ctx.send(error)
+            await reply(ctx, interaction, error)
+            return
 
         self.active_players.add(ctx.author.id)
         withdrawn = False
@@ -249,9 +270,9 @@ class HighLow(commands.Cog):
             if withdrawn:
                 await refund_wager(ctx.author, GAME, bet, reason="High/Low failed before interaction began")
             self.active_players.discard(ctx.author.id)
-            await ctx.send("Ruthless Dealer could not start High/Low. Any withdrawn wager was refunded.")
+            await reply(ctx, interaction, "High/Low couldn't start. Any withdrawn wager was refunded.")
 
-    @commands.command(name="highlowpayouts", aliases=["hlpayouts"])
+    @commands.command(name="highlowpayouts", aliases=["hlpayouts"], hidden=True)
     async def highlowpayouts(self, ctx: commands.Context):
         lines = [f"**{index} correct:** {multiplier:.2f}× total return" for index, multiplier in enumerate(MULTIPLIERS, 1)]
         settings = await get_game_settings(ctx.guild, GAME) if ctx.guild else {"payout_cap": 0}

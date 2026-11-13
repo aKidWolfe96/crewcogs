@@ -1,43 +1,32 @@
+"""Blackjack — 3:2 naturals, dealer peek, double down and split."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
-import tempfile
 from contextlib import suppress
-from typing import Dict, List, Optional, TypedDict
+from io import BytesIO
+from typing import Dict, List, Optional
 
 import discord
 from PIL import Image
-from redbot.core import Config, bank, commands
-from .casino_core import mark_played, refund_wager, settle_game, validate_bet
+from redbot.core import bank, commands
 
+from .casino_core import (
+    currency, mark_played, refund_wager, render, reply, resolve_bet, settle_game, validate_bet,
+)
+from .ui import GameOverView
 
-CONFIG = Config.get_conf(None, identifier=1234567890)
-CONFIG.register_user(total_wins=0, total_losses=0, total_bet=0)
-
-SUIT_EMOJIS = {
-    "H": "♥",
-    "D": "♦",
-    "S": "♠",
-    "C": "♣",
-}
-
-
-class GameState(TypedDict, total=False):
-    deck: List[str]
-    player: List[str]
-    dealer: List[str]
-    bet: int
-    message: discord.Message
-    view: "BlackjackView"
-    settled: bool
+GAME = "blackjack"
+LOG = logging.getLogger("red.crewcogs.casino.blackjack")
+CARDS_DIR = os.path.join(os.path.dirname(__file__), "cards")
+SUIT_EMOJIS = {"H": "♥", "D": "♦", "S": "♠", "C": "♣"}
+TURN_TIMEOUT = 90
 
 
 def format_card(card: str) -> str:
-    rank = card[:-1]
-    suit = card[-1]
-    return f"{rank}{SUIT_EMOJIS[suit]}"
+    return f"{card[:-1]}{SUIT_EMOJIS[card[-1]]}"
 
 
 def card_value(card: str) -> int:
@@ -50,387 +39,363 @@ def card_value(card: str) -> int:
 
 
 def hand_value(cards: List[str]) -> int:
-    total = sum(card_value(card) for card in cards)
-    aces = sum(1 for card in cards if card[:-1] == "A")
+    total = sum(card_value(c) for c in cards)
+    aces = sum(1 for c in cards if c[:-1] == "A")
     while total > 21 and aces:
         total -= 10
         aces -= 1
     return total
 
 
+def is_soft(cards: List[str]) -> bool:
+    total = sum(card_value(c) for c in cards)
+    aces = sum(1 for c in cards if c[:-1] == "A")
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return aces > 0 and total <= 21
+
+
+def is_blackjack(cards: List[str]) -> bool:
+    return len(cards) == 2 and hand_value(cards) == 21
+
+
 def make_deck() -> List[str]:
     ranks = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-    return [f"{rank}{suit}" for rank in ranks for suit in "SHDC"]
+    deck = [f"{r}{s}" for r in ranks for s in "SHDC"] * 2  # two-deck shoe
+    random.shuffle(deck)
+    return deck
+
+
+def render_table(dealer: List[str], hands: List[List[str]], hide_hole: bool) -> bytes:
+    """Dealer row on top, one row per player hand underneath."""
+    card_w, card_h, gap = 100, 145, 18
+    rows = [dealer] + hands
+    width = max(len(r) for r in rows) * card_w
+    height = len(rows) * card_h + (len(rows) - 1) * gap
+    canvas = Image.new("RGBA", (max(width, card_w * 2), height), (0, 0, 0, 0))
+    for row_idx, row in enumerate(rows):
+        y = row_idx * (card_h + gap)
+        x = (canvas.width - len(row) * card_w) // 2
+        for i, card in enumerate(row):
+            name = "back.png" if (row_idx == 0 and i == 1 and hide_hole) else f"{card}.png"
+            with Image.open(os.path.join(CARDS_DIR, name)) as src:
+                img = src.convert("RGBA").resize((card_w, card_h))
+            canvas.paste(img, (x + i * card_w, y), img)
+            img.close()
+    out = BytesIO()
+    canvas.save(out, format="PNG")
+    canvas.close()
+    return out.getvalue()
 
 
 class BlackjackView(discord.ui.View):
-    def __init__(self, cog: "Blackjack", ctx: commands.Context):
-        super().__init__(timeout=60)
-        self.cog = cog
-        self.ctx = ctx
-        self.message: Optional[discord.Message] = None
-        self.finished = False
+    def __init__(self, cog: "Blackjack", game: dict) -> None:
+        super().__init__(timeout=TURN_TIMEOUT)
+        self.cog, self.game = cog, game
+        self.refresh()
 
-    def disable_controls(self) -> None:
-        for item in self.children:
-            item.disabled = True
+    def refresh(self) -> None:
+        hand = self.game["hands"][self.game["active"]]
+        two_cards = len(hand["cards"]) == 2 and not hand.get("split_aces")
+        self.double.disabled = not two_cards
+        can_split = (
+            len(self.game["hands"]) == 1 and len(hand["cards"]) == 2
+            and card_value(hand["cards"][0]) == card_value(hand["cards"][1])
+        )
+        self.split.disabled = not can_split
+        self.double.label = f"Double (+{hand['bet']:,})"
+        self.split.label = f"Split (+{hand['bet']:,})"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+        if interaction.user.id != self.game["ctx"].author.id:
+            await interaction.response.send_message("This isn't your hand — start your own with `bj <bet>`!", ephemeral=True)
             return False
         return True
 
     async def on_timeout(self) -> None:
-        if self.finished:
-            return
+        await self.cog.auto_stand(self.game, self)
 
-        self.finished = True
-        self.disable_controls()
-        await self.cog.expire_game(self.ctx, self)
-        self.stop()
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        LOG.exception("Blackjack interaction failed", exc_info=error)
+        with suppress(discord.HTTPException):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Something went wrong — your hand is safe, try again.", ephemeral=True)
 
-    async def on_error(
-        self,
-        interaction: discord.Interaction,
-        error: Exception,
-        item: discord.ui.Item,
-    ) -> None:
-        self.cog.log.exception("Blackjack interaction failed", exc_info=error)
-        if not interaction.response.is_done():
-            with suppress(discord.HTTPException):
-                await interaction.response.send_message(
-                    "Something went wrong while handling that action. Your hand is still protected.",
-                    ephemeral=True,
-                )
-
-    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="🃏")
+    @discord.ui.button(label="Hit", emoji="🃏", style=discord.ButtonStyle.primary)
     async def hit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
+        await self.cog.act(interaction, self.game, self, "hit")
 
-        game = self.cog.games.get(self.ctx.author.id)
-        if not game or game.get("settled") or game.get("view") is not self:
-            self.finished = True
-            self.disable_controls()
-            with suppress(discord.HTTPException):
-                await interaction.message.edit(view=self)
-            self.stop()
-            return
-
-        game["player"].append(game["deck"].pop())
-
-        player_total = hand_value(game["player"])
-        if player_total >= 21:
-            await self.cog.resolve(self.ctx, busted=player_total > 21, view=self)
-        else:
-            await self.cog.show_game(self.ctx, start=True, message=interaction.message, view=self)
-
-    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="🛑")
+    @discord.ui.button(label="Stand", emoji="✋", style=discord.ButtonStyle.secondary)
     async def stand(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        await self.cog.resolve(self.ctx, view=self)
+        await self.cog.act(interaction, self.game, self, "stand")
+
+    @discord.ui.button(label="Double", emoji="💰", style=discord.ButtonStyle.success)
+    async def double(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.act(interaction, self.game, self, "double")
+
+    @discord.ui.button(label="Split", emoji="✂️", style=discord.ButtonStyle.danger)
+    async def split(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.act(interaction, self.game, self, "split")
 
 
 class Blackjack(commands.Cog):
-    """Blackjack casino using Red's economy."""
+    """Blackjack with real casino rules."""
 
-    def __init__(self):
-        self.games: Dict[int, GameState] = {}
+    def __init__(self) -> None:
+        self.games: Dict[int, dict] = {}
         self._locks: Dict[int, asyncio.Lock] = {}
 
-    @property
-    def log(self):
-        import logging
-
-        return logging.getLogger("red.crewcogs.casino.blackjack")
-
-    def _lock_for(self, user_id: int) -> asyncio.Lock:
+    def _lock(self, user_id: int) -> asyncio.Lock:
         return self._locks.setdefault(user_id, asyncio.Lock())
 
-    async def _edit_expired_message(self, game: GameState, view: BlackjackView) -> None:
-        message = game.get("message") or view.message
-        if message is None:
+    @commands.command(name="blackjack", aliases=["bj", "21"])
+    @commands.guild_only()
+    async def blackjack(self, ctx: commands.Context, bet: str) -> None:
+        """Play a hand of blackjack. Usage: `bj <bet>`
+
+        Blackjack pays 3:2 · dealer stands on 17 · double down on any two cards ·
+        split pairs once (split aces get one card each).
+        """
+        await self.start(ctx, bet)
+
+    # ── Game flow ─────────────────────────────────────────────────────────────
+
+    async def start(self, ctx: commands.Context, raw_bet, interaction: Optional[discord.Interaction] = None) -> None:
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.defer()
+        bet, err = await resolve_bet(ctx.author, GAME, raw_bet)
+        if err:
+            await reply(ctx, interaction, err)
             return
-
-        embed = message.embeds[0].copy() if message.embeds else discord.Embed(title="🃏 Ruthless Dealer • Blackjack")
-        embed.description = "⏱️ This hand expired. The wager was refunded."
-        with suppress(discord.HTTPException, discord.NotFound):
-            await message.edit(embed=embed, view=view)
-
-    @commands.command()
-    async def blackjack(self, ctx: commands.Context, bet: int) -> None:
-        """Start a blackjack hand for CrewCoin."""
-        user_id = ctx.author.id
-
-        async with self._lock_for(user_id):
-            existing = self.games.get(user_id)
-            if existing and not existing.get("settled", False):
-                await ctx.send("Ruthless Dealer says you already have an active blackjack hand. Finish it before starting another.")
+        async with self._lock(ctx.author.id):
+            existing = self.games.get(ctx.author.id)
+            if existing and not existing["settled"]:
+                await reply(ctx, interaction, "You already have a hand in play — finish it first!")
                 return
-
-            error = await validate_bet(ctx, "blackjack", bet)
+            error = await validate_bet(ctx, GAME, bet)
             if error:
-                await ctx.send(error)
+                await reply(ctx, interaction, error)
                 return
-
             try:
                 await bank.withdraw_credits(ctx.author, bet)
-                mark_played(ctx.guild.id, ctx.author.id, "blackjack")
+                mark_played(ctx.guild.id, ctx.author.id, GAME)
             except ValueError:
-                await ctx.send("Ruthless Dealer could not place the wager because your balance changed. Try again.")
+                await reply(ctx, interaction, "Your balance changed — try again.")
                 return
-
             deck = make_deck()
-            random.shuffle(deck)
-            view = BlackjackView(self, ctx)
-
-            game: GameState = {
-                "deck": deck,
-                "player": [deck.pop(), deck.pop()],
-                "dealer": [deck.pop(), deck.pop()],
-                "bet": bet,
-                "view": view,
-                "settled": False,
+            game = {
+                "ctx": ctx, "deck": deck, "base_bet": bet, "wagered": bet, "settled": False,
+                "dealer": [deck.pop(), deck.pop()], "hands": [{"cards": [deck.pop(), deck.pop()], "bet": bet, "done": False}],
+                "active": 0, "message": None,
             }
-            self.games[user_id] = game
-
+            self.games[ctx.author.id] = game
             try:
-                message = await self.show_game(ctx, start=True, view=view)
-                if message is None:
-                    raise RuntimeError("Blackjack message was not created")
-                game["message"] = message
-                view.message = message
+                player_bj = is_blackjack(game["hands"][0]["cards"])
+                dealer_bj = is_blackjack(game["dealer"])
+                # Dealer peeks for blackjack; a natural on either side ends the hand at once.
+                if player_bj or dealer_bj:
+                    game["hands"][0]["done"] = True
+                    game["message"] = await self._send_board(game, None, reveal=True)
+                    await self._settle(game)
+                    return
+                view = BlackjackView(self, game)
+                game["message"] = await self._send_board(game, view, reveal=False)
             except Exception:
-                self.games.pop(user_id, None)
-                refunded = await refund_wager(ctx.author, "blackjack", bet, reason="failed to create game message")
-                self.log.exception("Failed to start blackjack for user %s", user_id)
-                await ctx.send(
-                    "The hand could not be created. "
-                    + ("Your wager was refunded." if refunded == bet else "Your refund was limited by the bank balance cap.")
-                )
+                LOG.exception("Blackjack start failed for %s", ctx.author.id)
+                if not game["settled"]:
+                    game["settled"] = True
+                    await refund_wager(ctx.author, GAME, game["wagered"], reason="failed to start")
+                await ctx.send("The hand couldn't be dealt — your wager was refunded.")
 
-    def _load_card_images(self, hand: List[str], reveal_all: bool = True) -> List[Image.Image]:
-        images: List[Image.Image] = []
-        cards_dir = os.path.join(os.path.dirname(__file__), "cards")
-
-        try:
-            for index, card in enumerate(hand):
-                filename = "back.png" if index == 1 and not reveal_all else f"{card}.png"
-                path = os.path.join(cards_dir, filename)
-                with Image.open(path) as source:
-                    images.append(source.convert("RGBA").resize((100, 145)))
-            return images
-        except Exception:
-            for image in images:
-                image.close()
-            raise
-
-    async def show_game(
-        self,
-        ctx: commands.Context,
-        *,
-        start: bool = False,
-        message: Optional[discord.Message] = None,
-        view: Optional[BlackjackView] = None,
-        game_override: Optional[GameState] = None,
-    ) -> Optional[discord.Message]:
-        game = game_override or self.games.get(ctx.author.id)
-        if not game or (game.get("settled") and game_override is None):
-            return None
-
-        player_hand = game["player"]
-        dealer_hand = game["dealer"]
-        player_images: List[Image.Image] = []
-        dealer_images: List[Image.Image] = []
-        combo: Optional[Image.Image] = None
-        temp_path: Optional[str] = None
-        file: Optional[discord.File] = None
-
-        try:
-            player_images = self._load_card_images(player_hand)
-            dealer_images = self._load_card_images(dealer_hand, reveal_all=not start)
-
-            player_width = sum(image.width for image in player_images)
-            dealer_width = sum(image.width for image in dealer_images)
-            total_width = max(player_width, dealer_width)
-            total_height = 145 * 2 + 20
-            combo = Image.new("RGBA", (total_width, total_height), (0, 0, 0, 0))
-
-            x = (total_width - player_width) // 2
-            for image in player_images:
-                combo.paste(image, (x, 155), image)
-                x += image.width
-
-            x = (total_width - dealer_width) // 2
-            for image in dealer_images:
-                combo.paste(image, (x, 0), image)
-                x += image.width
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp:
-                temp_path = temp.name
-            combo.save(temp_path)
-
-            player_text = " ".join(format_card(card) for card in player_hand)
-            dealer_text = (
-                " ".join(format_card(card) for card in dealer_hand)
-                if not start
-                else f"{format_card(dealer_hand[0])} ??"
-            )
-
-            embed = discord.Embed(title="🃏 Ruthless Dealer • Blackjack")
-            embed.add_field(
-                name="Your Hand",
-                value=f"{player_text} ({hand_value(player_hand)})",
-                inline=False,
-            )
-            embed.add_field(
-                name="Ruthless Dealer Shows",
-                value=dealer_text if start else f"{dealer_text} ({hand_value(dealer_hand)})",
-                inline=False,
-            )
-            embed.set_image(url="attachment://hand.png")
-
-            file = discord.File(temp_path, filename="hand.png")
-            active_view = view or game.get("view")
-
-            if message is not None:
-                await message.edit(embed=embed, attachments=[file], view=active_view)
-                return message
-
-            sent_message = await ctx.send(embed=embed, file=file, view=active_view)
-            return sent_message
-        finally:
-            if file is not None:
-                file.close()
-            if temp_path:
-                with suppress(OSError):
-                    os.remove(temp_path)
-            if combo is not None:
-                combo.close()
-            for image in player_images + dealer_images:
-                image.close()
-
-    async def expire_game(self, ctx: commands.Context, view: BlackjackView) -> None:
-        user_id = ctx.author.id
-
-        async with self._lock_for(user_id):
-            game = self.games.get(user_id)
-            if not game or game.get("settled") or game.get("view") is not view:
+    async def act(self, interaction: discord.Interaction, game: dict, view: BlackjackView, action: str) -> None:
+        ctx = game["ctx"]
+        async with self._lock(ctx.author.id):
+            if game["settled"] or self.games.get(ctx.author.id) is not game:
+                await interaction.response.send_message("This hand is already over.", ephemeral=True)
                 return
-
-            game["settled"] = True
-            bet = game["bet"]
-            deposited = await refund_wager(ctx.author, "blackjack", bet, reason="hand timeout")
-            self.games.pop(user_id, None)
-
-        await self._edit_expired_message(game, view)
-        if deposited < bet:
-            with suppress(discord.HTTPException):
-                await ctx.send(
-                    f"{ctx.author.mention}, your blackjack hand expired, but only {deposited:,} of "
-                    f"the {bet:,} CrewCoin refund fit under the bank balance cap."
-                )
-
-    async def resolve(
-        self,
-        ctx: commands.Context,
-        *,
-        busted: bool = False,
-        view: Optional[BlackjackView] = None,
-    ) -> None:
-        user_id = ctx.author.id
-
-        async with self._lock_for(user_id):
-            game = self.games.get(user_id)
-            if not game or game.get("settled"):
-                return
-            if view is not None and game.get("view") is not view:
-                return
-
-            game["settled"] = True
-            active_view = game.get("view")
-            if active_view is not None:
-                active_view.finished = True
-                active_view.disable_controls()
-                active_view.stop()
-
-            player_hand = game["player"]
-            dealer_hand = game["dealer"]
+            hand = game["hands"][game["active"]]
             deck = game["deck"]
-            bet = game["bet"]
-            message = game.get("message")
+            if action in ("double", "split"):
+                extra = hand["bet"]
+                if action == "split" and view.split.disabled or action == "double" and view.double.disabled:
+                    await interaction.response.send_message("You can't do that right now.", ephemeral=True)
+                    return
+                try:
+                    await bank.withdraw_credits(ctx.author, extra)
+                except ValueError:
+                    bal = await bank.get_balance(ctx.author)
+                    await interaction.response.send_message(f"You need **{extra:,}** more to {action} (you have {bal:,}).", ephemeral=True)
+                    return
+                game["wagered"] += extra
+            await interaction.response.defer()
 
-            if not busted:
-                while hand_value(dealer_hand) < 17:
-                    dealer_hand.append(deck.pop())
+            if action == "hit":
+                hand["cards"].append(deck.pop())
+                if hand_value(hand["cards"]) >= 21:
+                    hand["done"] = True
+            elif action == "stand":
+                hand["done"] = True
+            elif action == "double":
+                hand["bet"] *= 2
+                hand["doubled"] = True
+                hand["cards"].append(deck.pop())
+                hand["done"] = True
+            elif action == "split":
+                first, second = hand["cards"]
+                aces = first[:-1] == "A"
+                game["hands"] = [
+                    {"cards": [first, deck.pop()], "bet": hand["bet"], "done": aces, "split_aces": aces},
+                    {"cards": [second, deck.pop()], "bet": hand["bet"], "done": aces, "split_aces": aces},
+                ]
+                game["active"] = 0
+                for h in game["hands"]:
+                    if hand_value(h["cards"]) == 21:
+                        h["done"] = True
 
-            player_value = hand_value(player_hand)
-            dealer_value = hand_value(dealer_hand)
-            user_config = CONFIG.user(ctx.author)
+            await self._advance(game, view)
 
-            payout = 0
-            outcome = "loss"
-            if busted or player_value < dealer_value <= 21:
-                result = f"You lose! Ruthless Dealer: {' '.join(format_card(card) for card in dealer_hand)} ({dealer_value})."
-            elif player_value > dealer_value or dealer_value > 21:
-                payout = bet * 2
-                outcome = "win"
-                result = (
-                    f"You win! Ruthless Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
-                    f"({dealer_value}). You earned {payout:,} CrewCoin."
-                )
-            else:
-                payout = bet
-                outcome = "push"
-                result = (
-                    f"Push! Ruthless Dealer: {' '.join(format_card(card) for card in dealer_hand)} "
-                    f"({dealer_value}). Your bet was returned."
-                )
+    async def auto_stand(self, game: dict, view: BlackjackView) -> None:
+        async with self._lock(game["ctx"].author.id):
+            if game["settled"]:
+                return
+            for h in game["hands"]:
+                h["done"] = True
+            game["timed_out"] = True
+            await self._advance(game, view)
 
-            settlement = await settle_game(ctx.author, "blackjack", bet, payout, outcome, channel=ctx.channel)
-            deposited = settlement.deposited
-            try:
-                await user_config.total_bet.set(await user_config.total_bet() + bet)
-                if outcome == "win":
-                    await user_config.total_wins.set(await user_config.total_wins() + 1)
-                elif outcome == "loss":
-                    await user_config.total_losses.set(await user_config.total_losses() + 1)
-            except Exception:
-                self.log.exception("Failed to update legacy blackjack stats for user %s", user_id)
-            self.games.pop(user_id, None)
+    async def _advance(self, game: dict, view: BlackjackView) -> None:
+        while game["active"] < len(game["hands"]) and game["hands"][game["active"]]["done"]:
+            game["active"] += 1
+        if game["active"] >= len(game["hands"]):
+            view.stop()
+            await self._edit_board(game, None, reveal=True)
+            await self._settle(game)
+            return
+        view.refresh()
+        await self._edit_board(game, view, reveal=False)
 
+    # ── Display ───────────────────────────────────────────────────────────────
+
+    def _embed(self, game: dict, reveal: bool, footer: Optional[str] = None) -> discord.Embed:
+        dealer = game["dealer"]
+        embed = discord.Embed(title="🃏 Blackjack", color=0x2C3E50)
+        dealer_text = (" ".join(format_card(c) for c in dealer) + f"  **({hand_value(dealer)})**") if reveal \
+            else f"{format_card(dealer[0])} 🂠  **({card_value(dealer[0])})**"
+        embed.add_field(name="Dealer", value=dealer_text, inline=False)
+        multi = len(game["hands"]) > 1
+        for i, h in enumerate(game["hands"]):
+            value = hand_value(h["cards"])
+            tags = []
+            if is_blackjack(h["cards"]) and not multi:
+                tags.append("**BLACKJACK!**")
+            elif value > 21:
+                tags.append("💥 bust")
+            elif is_soft(h["cards"]) and value < 21:
+                tags.append("soft")
+            if h.get("doubled"):
+                tags.append("doubled")
+            pointer = "▶ " if (not reveal and i == game["active"]) else ""
+            name = f"{pointer}Your hand{f' {i + 1}' if multi else ''} · bet {h['bet']:,}"
+            embed.add_field(name=name, value=" ".join(format_card(c) for c in h["cards"])
+                            + f"  **({value})** {' · '.join(tags)}", inline=True)
+        embed.set_image(url="attachment://table.png")
+        embed.set_footer(text=footer or "Blackjack pays 3:2 · dealer stands on 17 · double or split on your first two cards")
+        return embed
+
+    async def _file(self, game: dict, reveal: bool) -> discord.File:
+        png = await render(render_table, list(game["dealer"]), [list(h["cards"]) for h in game["hands"]], not reveal)
+        return discord.File(BytesIO(png), filename="table.png")
+
+    async def _send_board(self, game: dict, view: Optional[discord.ui.View], *, reveal: bool) -> discord.Message:
+        msg = await game["ctx"].send(embed=self._embed(game, reveal), file=await self._file(game, reveal),
+                                     view=view or discord.utils.MISSING)
+        if view is not None:
+            view.message = msg  # type: ignore[attr-defined]
+        return msg
+
+    async def _edit_board(self, game: dict, view: Optional[discord.ui.View], *, reveal: bool,
+                          footer: Optional[str] = None) -> None:
+        msg = game["message"]
+        if msg is None:
+            return
+        with suppress(discord.HTTPException):
+            await msg.edit(embed=self._embed(game, reveal, footer), attachments=[await self._file(game, reveal)],
+                           view=view)
+
+    # ── Settlement ────────────────────────────────────────────────────────────
+
+    async def _settle(self, game: dict) -> None:
+        ctx = game["ctx"]
+        if game["settled"]:
+            return
+        game["settled"] = True
+        paid = False
         try:
-            await self.show_final_board(ctx, game, message, active_view)
+            dealer, deck = game["dealer"], game["deck"]
+            hands = game["hands"]
+            single = len(hands) == 1
+            player_natural = single and is_blackjack(hands[0]["cards"])
+            dealer_natural = is_blackjack(dealer)
+            live = [h for h in hands if hand_value(h["cards"]) <= 21]
+            if live and not player_natural and not dealer_natural:
+                while hand_value(dealer) < 17:
+                    dealer.append(deck.pop())
+            dv = hand_value(dealer)
+            payout, lines = 0, []
+            for i, h in enumerate(hands):
+                pv = hand_value(h["cards"])
+                label = f"Hand {i + 1}: " if not single else ""
+                if player_natural and not dealer_natural:
+                    win = int(h["bet"] * 2.5)
+                    payout += win
+                    lines.append(f"🎉 {label}**Blackjack!** Paid 3:2 (+{win - h['bet']:,})")
+                elif dealer_natural and player_natural:
+                    payout += h["bet"]
+                    lines.append(f"🤝 {label}Both have blackjack — push.")
+                elif dealer_natural:
+                    lines.append(f"💸 {label}Dealer has blackjack.")
+                elif pv > 21:
+                    lines.append(f"💥 {label}Bust ({pv}).")
+                elif dv > 21 or pv > dv:
+                    payout += h["bet"] * 2
+                    lines.append(f"🎉 {label}You win {pv} vs {dv if dv <= 21 else 'bust'} (+{h['bet']:,})")
+                elif pv == dv:
+                    payout += h["bet"]
+                    lines.append(f"🤝 {label}Push at {pv}.")
+                else:
+                    lines.append(f"💸 {label}Dealer wins {dv} vs {pv}.")
+            wagered = game["wagered"]
+            outcome = "win" if payout > wagered else ("push" if payout == wagered else "loss")
+            settlement = await settle_game(ctx.author, GAME, wagered, payout, outcome, channel=ctx.channel)
+            paid = True
+            cur = await currency(ctx.guild)
+            net = settlement.deposited - wagered
+            balance = await bank.get_balance(ctx.author)
+            if game.get("timed_out"):
+                lines.insert(0, "⏱️ Time ran out — your hands were stood automatically.")
+            if settlement.capped:
+                lines.append("_Payout limited by the bank balance cap._")
+            summary = "\n".join(lines) + f"\n\n**Net: {net:+,} {cur}** · Balance {balance:,}"
+            embed = self._embed(game, True, footer="Tap a button to deal again")
+            embed.description = summary
+            embed.color = 0x2ECC71 if net > 0 else (0x95A5A6 if net == 0 else 0xE74C3C)
+            view = GameOverView(ctx.author.id, game["base_bet"], lambda i, b: self.start(ctx, b, i), again_label="Deal")
+            msg = game["message"]
+            if msg is not None:
+                await msg.edit(embed=embed, attachments=[await self._file(game, True)], view=view)
+                view.message = msg
+            else:
+                view.message = await ctx.send(embed=embed, view=view)
         except Exception:
-            self.log.exception("Failed to display final blackjack board for user %s", user_id)
-
-        if payout and deposited < payout:
-            result += f" Bank balance cap allowed only {deposited:,} CrewCoin to be deposited."
-        await ctx.send(result)
-
-    async def show_final_board(
-        self,
-        ctx: commands.Context,
-        game: GameState,
-        message: Optional[discord.Message],
-        view: Optional[BlackjackView],
-    ) -> None:
-        await self.show_game(
-            ctx,
-            start=False,
-            message=message,
-            view=view,
-            game_override=game,
-        )
-
-    @commands.command()
-    async def bjstats(self, ctx: commands.Context) -> None:
-        """Show your blackjack stats."""
-        data = await CONFIG.user(ctx.author).all()
-        await ctx.send(
-            f"Wins: {data['total_wins']}, Losses: {data['total_losses']}, "
-            f"Bet total: {data['total_bet']:,}"
-        )
+            LOG.exception("Blackjack settlement failed for %s", ctx.author.id)
+            if not paid:
+                await refund_wager(ctx.author, GAME, game["wagered"], reason="settlement failure")
+                with suppress(discord.HTTPException):
+                    await ctx.send("Blackjack hit an error settling your hand — your wager was refunded.")
+        finally:
+            if self.games.get(ctx.author.id) is game:
+                self.games.pop(ctx.author.id, None)
 
 
 async def setup(bot):

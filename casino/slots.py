@@ -1,115 +1,114 @@
 import asyncio
 import logging
 import random
+from typing import Optional
 
-from discord import Embed
-from redbot.core import Config, bank, commands
+import discord
+from redbot.core import bank, commands
 
-from .casino_core import mark_played, refund_wager, settle_game, validate_bet
+from .casino_core import currency, mark_played, refund_wager, reply, resolve_bet, settle_game, validate_bet
+from .ui import GameOverView
 
-SLOT_CONFIG_ID = 5557771234
+GAME = "slots"
+LOG = logging.getLogger("red.crewcogs.casino.slots")
 REEL = {"🍒": 25, "🍋": 20, "🍊": 18, "🍇": 14, "🔔": 10, "⭐": 7, "💎": 4, "7️⃣": 2}
 TRIPLE_PAYOUTS = {"🍒": 5, "🍋": 6, "🍊": 8, "🍇": 10, "🔔": 15, "⭐": 25, "💎": 50, "7️⃣": 100}
 PAIR_PAYOUT = 1.5
 SYMBOLS = list(REEL)
 WEIGHTS = list(REEL.values())
+BLUR = ("🍒", "🍋", "🔔", "⭐", "🍇", "💎")
+
+
+def spin_reels():
+    return random.choices(SYMBOLS, weights=WEIGHTS, k=3)
+
+
+def evaluate(reels, bet):
+    a, b, c = reels
+    if a == b == c:
+        return int(bet * TRIPLE_PAYOUTS[a]), "triple"
+    if a == b or b == c or a == c:
+        return int(bet * PAIR_PAYOUT), "pair"
+    return 0, "none"
+
+
+def machine(shown) -> str:
+    return f"╔════════════╗\n║  {' │ '.join(shown)}  ║\n╚════════════╝"
 
 
 class Slots(commands.Cog):
-    """Slot machine casino game using Red economy."""
+    """Slot machine."""
 
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(None, identifier=SLOT_CONFIG_ID, force_registration=True)
-        self.config.register_user(total_slot_wins=0, total_slot_losses=0, total_slot_bet=0, biggest_slot_win=0)
 
-    @staticmethod
-    def spin_reels():
-        return [random.choices(SYMBOLS, weights=WEIGHTS, k=1)[0] for _ in range(3)]
+    @commands.command(name="slots")
+    @commands.guild_only()
+    async def slots(self, ctx: commands.Context, bet: str):
+        """Spin the slot machine. Usage: `slots <bet>` — try `slots 500`, `slots half`, `slots all`."""
+        await self.start(ctx, bet)
 
-    @staticmethod
-    def evaluate(reels, bet):
-        a, b, c = reels
-        if a == b == c:
-            return int(bet * TRIPLE_PAYOUTS[a]), "triple"
-        if a == b or b == c or a == c:
-            return int(bet * PAIR_PAYOUT), "pair"
-        return 0, "none"
-
-    @commands.command()
-    @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
-    async def slots(self, ctx, bet: int):
-        """Spin the slot machine for CrewCoin."""
-        error = await validate_bet(ctx, "slots", bet)
+    async def start(self, ctx: commands.Context, raw_bet, interaction: Optional[discord.Interaction] = None) -> None:
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.defer()
+        bet, err = await resolve_bet(ctx.author, GAME, raw_bet)
+        if err:
+            await reply(ctx, interaction, err)
+            return
+        error = await validate_bet(ctx, GAME, bet)
         if error:
-            return await ctx.send(error)
+            await reply(ctx, interaction, error)
+            return
         try:
             await bank.withdraw_credits(ctx.author, bet)
-            mark_played(ctx.guild.id, ctx.author.id, "slots")
+            mark_played(ctx.guild.id, ctx.author.id, GAME)
         except ValueError:
-            return await ctx.send("Ruthless Dealer could not place the wager because your balance changed. Try again.")
+            await reply(ctx, interaction, "Your balance changed — try again.")
+            return
 
         settled = False
         try:
-            reels = self.spin_reels()
-            embed = Embed(title="🎰 Ruthless Dealer • Slots", description=f"Bet: **{bet:,}** CrewCoin")
-            embed.add_field(name="Reels", value="[ ❓ | ❓ | ❓ ]", inline=False)
+            cur = await currency(ctx.guild)
+            reels = spin_reels()
+            shown = [random.choice(BLUR) for _ in range(3)]
+            embed = discord.Embed(title="🎰 Slots", color=0x9B59B6,
+                                  description=f"**{ctx.author.display_name}** bets **{bet:,}**\n```\n{machine(shown)}\n```")
             message = await ctx.send(embed=embed)
-            shown = ["❓", "❓", "❓"]
             for index in range(3):
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.6)
                 shown[index] = reels[index]
-                embed.set_field_at(0, name="Reels", value=f"[ {' | '.join(shown)} ]", inline=False)
+                for j in range(index + 1, 3):
+                    shown[j] = random.choice(BLUR)
+                embed.description = f"**{ctx.author.display_name}** bets **{bet:,}**\n```\n{machine(shown)}\n```"
                 await message.edit(embed=embed)
 
-            payout, kind = self.evaluate(reels, bet)
-            result = "win" if payout else "loss"
-            settlement = await settle_game(ctx.author, "slots", bet, payout, result, channel=ctx.channel)
+            payout, kind = evaluate(reels, bet)
+            settlement = await settle_game(ctx.author, GAME, bet, payout, "win" if payout > bet else ("push" if payout == bet else "loss"),
+                                           channel=ctx.channel)
             settled = True
-
-            cfg = self.config.user(ctx.author)
-            await cfg.total_slot_bet.set(await cfg.total_slot_bet() + bet)
-            if payout:
-                if kind == "triple" and reels[0] == "7️⃣":
-                    outcome = f"🎰 **JACKPOT!** Returned **{settlement.deposited:,}** CrewCoin (net {settlement.deposited - bet:+,})."
-                elif kind == "triple":
-                    outcome = f"🎉 Three {reels[0]}! Returned **{settlement.deposited:,}** CrewCoin (net {settlement.deposited - bet:+,})."
-                else:
-                    outcome = f"✨ A pair! Returned **{settlement.deposited:,}** CrewCoin (net {settlement.deposited - bet:+,})."
-                if settlement.capped:
-                    outcome += " Payout limited by the bank balance cap."
-                await cfg.total_slot_wins.set(await cfg.total_slot_wins() + 1)
-                if settlement.deposited > await cfg.biggest_slot_win():
-                    await cfg.biggest_slot_win.set(settlement.deposited)
+            net = settlement.deposited - bet
+            if kind == "triple" and reels[0] == "7️⃣":
+                headline, color = f"🎰 **JACKPOT! 777!** {net:+,} {cur}", 0xFFD700
+            elif kind == "triple":
+                headline, color = f"🎉 **Three {reels[0]}!** {net:+,} {cur}", 0x2ECC71
+            elif kind == "pair":
+                headline, color = f"✨ **A pair!** {net:+,} {cur}", 0x2ECC71
             else:
-                outcome = f"💸 No match. You lost **{bet:,}** CrewCoin."
-                await cfg.total_slot_losses.set(await cfg.total_slot_losses() + 1)
-
-            embed.add_field(name="Outcome", value=outcome, inline=False)
-            await message.edit(embed=embed)
+                headline, color = f"💸 No match. {net:+,} {cur}", 0xE74C3C
+            if settlement.capped:
+                headline += "\n_Payout limited by the bank balance cap._"
+            balance = await bank.get_balance(ctx.author)
+            embed.description = f"```\n{machine(reels)}\n```\n{headline}"
+            embed.color = color
+            embed.set_footer(text=f"Bet {bet:,} · Balance {balance:,} {cur} · 3 alike up to 100× · any pair 1.5×")
+            view = GameOverView(ctx.author.id, bet, lambda i, b: self.start(ctx, b, i), again_label="Spin")
+            await message.edit(embed=embed, view=view)
+            view.message = message
         except Exception:
             if not settled:
-                await refund_wager(ctx.author, "slots", bet, reason="command failure before settlement")
-            logging.getLogger("red.crewcogs.casino.slots").exception(
-                "Slots failed for user %s", ctx.author.id
-            )
-            await ctx.send(
-                "Ruthless Dealer’s slots settled, but the result message or legacy stats failed."
-                if settled
-                else "Ruthless Dealer’s slots hit an unexpected error. The unsettled wager was refunded."
-            )
-
-    @commands.command()
-    async def slotstats(self, ctx):
-        data = await self.config.user(ctx.author).all()
-        await ctx.send(f"Ruthless Dealer Slots — Wins: {data['total_slot_wins']}, Losses: {data['total_slot_losses']}, Bet total: {data['total_slot_bet']:,}, Biggest win: {data['biggest_slot_win']:,}")
-
-    @commands.command()
-    async def slotpayouts(self, ctx):
-        lines = ["**Three of a kind** (total return):"]
-        lines.extend(f"{sym} {sym} {sym} → {mult}x" for sym, mult in TRIPLE_PAYOUTS.items())
-        lines.append(f"\n**Any two matching** → {PAIR_PAYOUT}x")
-        await ctx.send(embed=Embed(title="🎰 Ruthless Dealer • Slots Payouts", description="\n".join(lines), color=0xFFD700))
+                await refund_wager(ctx.author, GAME, bet, reason="command failure before settlement")
+            LOG.exception("Slots failed for user %s", ctx.author.id)
+            await ctx.send("Slots hit an error. " + ("Your result was recorded." if settled else "Your wager was refunded."))
 
 
 async def setup(bot):
