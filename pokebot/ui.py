@@ -268,6 +268,44 @@ class ThrowPanelView(OwnerView):
         return _throw
 
 
+class RetryThrowView(OwnerView):
+    """Under a failed catch: throw again right here instead of scrolling back to the spawn."""
+
+    def __init__(self, cog: "PokéBot", owner_id: int, spawn_id: str, balls: Dict[str, int], *,
+                 lead_fainted: bool = False) -> None:
+        super().__init__(owner_id, timeout=600.0)
+        self.cog = cog
+        self.spawn_id = spawn_id
+        for ball, label, emoji, style in BALL_BUTTONS:
+            count = balls.get(ball, 0)
+            btn = discord.ui.Button(label=f"{label} ×{count}", emoji=emoji, style=style,
+                                    disabled=count <= 0, row=0)
+            btn.callback = self._make_throw(ball)
+            self.add_item(btn)
+        odds = discord.ui.Button(label="Berries & odds", emoji="📖", style=discord.ButtonStyle.secondary, row=1)
+        odds.callback = self._odds
+        self.add_item(odds)
+        if lead_fainted:
+            heal = discord.ui.Button(label="Heal party", emoji="🩹", style=discord.ButtonStyle.success, row=1)
+            heal.callback = self._heal
+            self.add_item(heal)
+
+    def _make_throw(self, ball: str):
+        async def _throw(interaction: discord.Interaction) -> None:
+            # Retire these buttons so only the newest result stays clickable.
+            self.disable_all()
+            self.stop()
+            await interaction.response.edit_message(view=self)
+            await self.cog.handle_throw(interaction, self.spawn_id, ball, None)
+        return _throw
+
+    async def _odds(self, interaction: discord.Interaction) -> None:
+        await self.cog.spawn_dex_check(interaction, self.spawn_id)
+
+    async def _heal(self, interaction: discord.Interaction) -> None:
+        await self.cog.heal_from_interaction(interaction, "party")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Healing
 # ──────────────────────────────────────────────────────────────────────────────
@@ -454,6 +492,6 @@ class LinkButtonsView(OwnerView):
 
 __all__ = [
     "BaseView", "OwnerView", "ConfirmView", "RequestView", "StarterView", "starter_embeds",
-    "SpawnView", "ThrowPanelView", "HealView", "HealShortcutView", "BattleView",
+    "SpawnView", "ThrowPanelView", "RetryThrowView", "HealView", "HealShortcutView", "BattleView",
     "MovePickerView", "RaidJoinView", "ShopView", "LinkButtonsView", "COLORS",
 ]
