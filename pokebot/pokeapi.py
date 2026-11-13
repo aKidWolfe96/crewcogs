@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 import random
+import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -91,27 +92,55 @@ async def _get(session: aiohttp.ClientSession, url: str) -> Any:
         return await resp.json()
 
 
-async def fetch_pokemon(session: aiohttp.ClientSession, id_or_name) -> Dict:
-    slug = resolve_pokemon_id(id_or_name)
-    if CACHE_DIR:
-        cache_file = CACHE_DIR / f"{slug}.json"
-        if cache_file.exists():
-            return json.loads(cache_file.read_text())
-    data = await _get(session, f"https://pokeapi.co/api/v2/pokemon/{slug}")
-    if CACHE_DIR:
-        cache_file.write_text(json.dumps(data))
+_SLUG_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def clean_slug(value) -> str:
+    """Normalise user input to a safe PokéAPI slug ('Mr. Mime' -> 'mr-mime').
+
+    Also guarantees the slug is safe to use as a cache filename.
+    """
+    slug = str(value).strip().lower().replace(" ", "-").replace(".", "").replace("'", "")
+    slug = _SLUG_RE.sub("", slug).strip("-")
+    if not slug:
+        raise ValueError("empty Pokémon name")
+    return slug
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+async def _cached(session: aiohttp.ClientSession, name: str, url: str) -> Any:
+    cache_file = CACHE_DIR / f"{name}.json" if CACHE_DIR else None
+    if cache_file is not None and cache_file.exists():
+        try:
+            return await asyncio.to_thread(_read_json, cache_file)
+        except (OSError, ValueError):
+            pass  # corrupt cache entry — refetch below
+    data = await _get(session, url)
+    if cache_file is not None:
+        try:
+            await asyncio.to_thread(_write_json, cache_file, data)
+        except OSError:
+            pass
     return data
+
+
+async def fetch_pokemon(session: aiohttp.ClientSession, id_or_name) -> Dict:
+    slug = clean_slug(resolve_pokemon_id(id_or_name))
+    return await _cached(session, slug, f"https://pokeapi.co/api/v2/pokemon/{slug}")
 
 
 async def fetch_move_data(session: aiohttp.ClientSession, move_name: str) -> Dict:
-    if CACHE_DIR:
-        cache_file = CACHE_DIR / f"move_{move_name}.json"
-        if cache_file.exists():
-            return json.loads(cache_file.read_text())
-    data = await _get(session, f"https://pokeapi.co/api/v2/move/{move_name}")
-    if CACHE_DIR:
-        cache_file.write_text(json.dumps(data))
-    return data
+    slug = clean_slug(move_name)
+    return await _cached(session, f"move_{slug}", f"https://pokeapi.co/api/v2/move/{slug}")
 
 
 def get_random_pokemon_id() -> int:
@@ -200,7 +229,7 @@ async def build_pokemon_instance(
         "moves": selected_moves,
         "stats": stats,
         "spriteUrl": sprite_url,
-        "caughtAt": __import__("time").time(),
+        "caughtAt": time.time(),
         "nickname": None,
     }
 
