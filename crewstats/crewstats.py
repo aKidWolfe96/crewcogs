@@ -37,13 +37,10 @@ log = logging.getLogger("red.crewstats")
 # ---------------------------------------------------------------------------
 # External cog Config coordinates (must match the source cogs EXACTLY).
 # ---------------------------------------------------------------------------
-# Casino games were written with `Config.get_conf(None, identifier=...)`,
+# The casino's shared stats use `Config.get_conf(None, identifier=...)`,
 # which resolves the cog_name to "NoneType".  We re-open the same namespace.
 CASINO_COGNAME = None  # -> type(None).__name__ == "NoneType"
-CF_ID = 9876543210   # coinflip:  total_cf_wins / total_cf_losses / total_cf_bet
-BJ_ID = 1234567890   # blackjack: total_wins / total_losses / total_bet
-SL_ID = 5557771234   # slots:     total_slot_wins / total_slot_losses / total_slot_bet
-HR_ID = 7654321098   # horserace: hr_wins / hr_losses / hr_bet / hr_earned
+CASINO_ID = 2468135790  # casino_core.CONFIG: per-member total_wagered / wins across every game
 
 # PokeBot: get_conf(self, ...) with class name "PokéBot" (accented e).
 POKE_COGNAME = "PokéBot"
@@ -218,27 +215,20 @@ class CrewStats(commands.Cog):
     # ------------------------------------------------------------------ #
     # Reading external cog totals (bulk, defensive)
     # ------------------------------------------------------------------ #
-    async def _casino_totals(self) -> dict[int, dict]:
-        """{uid: {'bet': int, 'wins': int}} summed across all casino games."""
+    async def _casino_totals(self, guild: discord.Guild) -> dict[int, dict]:
+        """{uid: {'bet': int, 'wins': int}} from the casino's unified per-server stats (every game)."""
         out: dict[int, dict] = {}
-
-        async def add(conf_id, bet_key, win_key):
-            try:
-                data = await Config.get_conf(
-                    None, identifier=conf_id, cog_name=CASINO_COGNAME
-                ).all_users()
-            except Exception:
-                return
-            for uid, d in data.items():
-                uid = int(uid)
-                slot = out.setdefault(uid, {"bet": 0, "wins": 0})
-                slot["bet"] += int(d.get(bet_key, 0) or 0)
-                slot["wins"] += int(d.get(win_key, 0) or 0)
-
-        await add(CF_ID, "total_cf_bet", "total_cf_wins")
-        await add(BJ_ID, "total_bet", "total_wins")
-        await add(SL_ID, "total_slot_bet", "total_slot_wins")
-        await add(HR_ID, "hr_bet", "hr_wins")
+        try:
+            data = await Config.get_conf(
+                None, identifier=CASINO_ID, cog_name=CASINO_COGNAME
+            ).all_members(guild)
+        except Exception:
+            return out
+        for uid, d in data.items():
+            out[int(uid)] = {
+                "bet": int(d.get("total_wagered", 0) or 0),
+                "wins": int(d.get("wins", 0) or 0),
+            }
         return out
 
     async def _poke_totals(self, guild: discord.Guild) -> dict[int, dict]:
@@ -302,7 +292,7 @@ class CrewStats(commands.Cog):
 
     async def _current_externals(self, guild: discord.Guild) -> dict[int, dict]:
         """Merge all external lifetime totals into one {uid: metrics} map."""
-        casino = await self._casino_totals()
+        casino = await self._casino_totals(guild)
         poke = await self._poke_totals(guild)
         ow = await self._ow_totals(guild)
 

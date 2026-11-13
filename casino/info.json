@@ -3,8 +3,8 @@
     "aKidWolfe96"
   ],
   "name": "Ruthless Dealer Casino",
-  "description": "Ruthless Dealer unified casino games with profiles, achievements, titles, rotating challenges, and generated profile cards.",
-  "install_msg": "Good luck, don't lose it all.",
+  "description": "Ruthless Dealer casino: a button lobby, Blackjack (3:2, double, split), Coin Flip, Slots, Roulette with a multiplayer table, High/Low, Crash and Mines — every result has Play again / 2× / ½ buttons. One Daily Rewards panel with streak bonuses, plus profiles, achievements, titles, rotating challenges and leaderboards.",
+  "install_msg": "Good luck, don't lose it all. Open the lobby with `[p]casino` and grab free credits with `[p]daily`.",
   "requirements": [
     "Pillow"
   ],
@@ -14,5 +14,12 @@
     "fun"
   ],
   "hidden": false,
-  "type": "COG"
+  "type": "COG",
+  "end_user_data_statement": "The casino stores per-server game statistics, achievements, challenge progress and reward cooldowns keyed by Discord user ID. Credits live in Red's bank. No message content is stored.",
+  "min_bot_version": "3.5.0",
+  "min_python_version": [
+    3,
+    9,
+    0
+  ]
 }

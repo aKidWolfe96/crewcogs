@@ -48,7 +48,7 @@ from .pokeapi import (
 )
 from .ui import (
     BattleView, ConfirmView, HealShortcutView, HealView, LinkButtonsView, MovePickerView,
-    RaidJoinView, RequestView, ShopView, SpawnView, StarterView, ThrowPanelView,
+    RaidJoinView, RequestView, RetryThrowView, ShopView, SpawnView, StarterView, ThrowPanelView,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1305,6 +1305,10 @@ class PokéBot(commands.Cog):
             out["embeds"].append(embed)
         else:
             await self._save_player(member, player)  # ball/berry spent, HP damage, XP
+            out["view"] = RetryThrowView(
+                self, member.id, spawn["spawnId"], {b: items.get(b, 0) for b in BALL_NAMES},
+                lead_fainted=active_poke["stats"]["hp"] <= 0,
+            )
             embed = discord.Embed(
                 title=f"💨 Oh no! {pokemon['displayName']} broke free!",
                 description=(
@@ -1319,6 +1323,7 @@ class PokéBot(commands.Cog):
             spr = sprite_url(pokemon)
             if spr:
                 embed.set_thumbnail(url=spr)
+            embed.set_footer(text="Throw again with the buttons below — no need to scroll back up")
             out["embeds"].append(embed)
 
         if lvl_msgs:
@@ -1340,7 +1345,8 @@ class PokéBot(commands.Cog):
         if not isinstance(member, discord.Member) or channel is None:
             return
         # Acknowledge first: Discord drops interactions not answered within 3 seconds.
-        await interaction.response.defer()
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         lock = self._lock_for(member.guild.id, member.id)
         if not await lock.acquire(timeout=5):
             await interaction.followup.send(

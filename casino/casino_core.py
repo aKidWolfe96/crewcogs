@@ -1,22 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import discord
 from redbot.core import Config, bank
 from redbot.core.errors import BalanceTooHigh
 
 CASINO_CONFIG_ID = 2468135790
-ACTIVE_GAMES = ("blackjack", "coinflip", "slots", "roulette", "highlow")
+ACTIVE_GAMES = ("blackjack", "coinflip", "slots", "roulette", "highlow", "crash", "mines")
 DEFAULT_GAME_SETTINGS = {
     "blackjack": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 3},
     "coinflip": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 3},
     "slots": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 3},
     "roulette": {"enabled": True, "min_bet": 1, "max_bet": 0, "cooldown": 5},
     "highlow": {"enabled": True, "min_bet": 1, "max_bet": 0, "payout_cap": 0, "cooldown": 3},
+    "crash": {"enabled": True, "min_bet": 1, "max_bet": 0, "payout_cap": 0, "cooldown": 3},
+    "mines": {"enabled": True, "min_bet": 1, "max_bet": 0, "payout_cap": 0, "cooldown": 3},
+}
+GAME_LABELS = {
+    "blackjack": "🃏 Blackjack", "coinflip": "🪙 Coin Flip", "slots": "🎰 Slots",
+    "roulette": "🎡 Roulette", "highlow": "🂡 High/Low", "crash": "🚀 Crash", "mines": "💣 Mines",
+    "dailyspin": "🎲 Daily Spin",
 }
 
 CONFIG = Config.get_conf(None, identifier=CASINO_CONFIG_ID, force_registration=True)
@@ -65,6 +74,8 @@ CONFIG.register_member(
     daily_state={},
     weekly_state={},
     daily_stipend_at=0.0,
+    login_streak=0,
+    login_streak_day="",
     daily_spin_at=0.0,
     bailout_claimed_at=0.0,
     scratch_claimed_at=0.0,
@@ -297,3 +308,55 @@ async def settle_game(
         outcome,
     )
     return SettlementResult(payout, deposited, outcome, stats_recorded)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bets: "500", "1,000", "2.5k", "1m", "all", "half", "max"
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SUFFIX = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+
+
+async def resolve_bet(member: discord.Member, game: str, raw: Any) -> Tuple[Optional[int], Optional[str]]:
+    """Turn what the player typed into a whole-number bet. Returns (bet, error)."""
+    if isinstance(raw, int):
+        return (raw, None) if raw > 0 else (None, "Your wager must be greater than zero.")
+    text = str(raw).strip().lower().replace(",", "").replace("_", "")
+    balance = await bank.get_balance(member)
+    settings = await get_game_settings(member.guild, game)
+    cap = settings["max_bet"] if settings["max_bet"] > 0 else None
+    if text in ("all", "allin", "all-in", "everything"):
+        bet = balance if cap is None else min(balance, cap)
+    elif text == "max":
+        bet = cap if cap is not None else balance
+        bet = min(bet, balance)
+    elif text == "half":
+        bet = balance // 2
+    elif text in ("min", "minimum"):
+        bet = settings["min_bet"]
+    else:
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmb]?)", text)
+        if not m:
+            return None, f"`{raw}` isn't a bet. Use a number like `500`, `2.5k`, or `all` / `half` / `max`."
+        bet = int(float(m.group(1)) * _SUFFIX.get(m.group(2), 1))
+    if bet <= 0:
+        return None, "You don't have anything to bet — try `daily` for free credits!"
+    return bet, None
+
+
+async def currency(guild: discord.Guild) -> str:
+    return await bank.get_currency_name(guild)
+
+
+async def reply(ctx, interaction: Optional[discord.Interaction], content: Optional[str] = None, **kwargs):
+    """Send privately to the clicker if this came from a button, else to the channel."""
+    if interaction is not None:
+        if interaction.response.is_done():
+            return await interaction.followup.send(content, ephemeral=True, **kwargs)
+        return await interaction.response.send_message(content, ephemeral=True, **kwargs)
+    return await ctx.send(content, **kwargs)
+
+
+async def render(func: Callable[..., Any], *args: Any) -> Any:
+    """Run CPU-heavy image work off the event loop so the bot never freezes."""
+    return await asyncio.to_thread(func, *args)

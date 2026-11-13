@@ -25,6 +25,8 @@ class ChannelGuide(commands.Cog):
                 ("Slots", "🎰 Slots"),
                 ("Roulette", "🎡 Roulette"),
                 ("HighLow", "♥️ High / Low"),
+                ("Crash", "🚀 Crash"),
+                ("Mines", "💣 Mines"),
                 ("Economy", "💰 Balance / Economy"),
             ),
         ),
