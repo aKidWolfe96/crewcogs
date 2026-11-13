@@ -1,0 +1,15 @@
+{
+    "name": "RestockMonitor",
+    "short": "Free Pokémon card restock alerts for Target, Best Buy, Walmart, Shopify card shops and more.",
+    "description": "Watches product links at Target, Best Buy, Walmart, GameStop, Pokémon Center, Amazon, any Shopify card shop and most other stores — plus whole Shopify shops for new or restocked items matching keywords. Posts an alert with a Buy button and your chosen ping the moment something goes from sold out to available. Uses only free, public store data — no paid APIs.",
+    "end_user_data_statement": "This cog stores product links, store links and alert settings per server, plus the Discord user ID of whoever added each link. It does not store message content.",
+    "author": ["aKidWolfe96"],
+    "install_msg": "Restock Monitor installed!\n\nGet started:\n1. `[p]restock channel #restocks`\n2. `[p]restock ping @Collectors` (or everyone / here / none)\n3. `[p]restock add <product link>`\n4. `[p]restock store add <shopify shop link> pokemon` to watch a whole card shop\n\n`[p]restock retailers` lists supported stores. If you used BestBuyMonitor, its products are imported automatically.",
+    "requirements": [],
+    "tags": ["pokemon", "tcg", "restock", "monitor", "stock", "alert", "target", "bestbuy", "walmart", "shopify"],
+    "min_bot_version": "3.5.0",
+    "min_python_version": [3, 9, 0],
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
