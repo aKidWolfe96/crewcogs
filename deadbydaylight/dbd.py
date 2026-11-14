@@ -17,11 +17,14 @@ from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box, pagify
 
+from pathlib import Path
+
 from . import render
-from .data import DataError, GameData, Perk
+from .data import ITEM_TYPE_ALIASES, ITEM_TYPE_LABELS, DataError, GameData, Gear, Perk, norm
+from .icons import IconLibrary
 from .views import P100BoardView, RerollView, png_file
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 log = logging.getLogger("red.deadbydaylight")
 
 ROLE_ALIASES = {"killer": "killer", "k": "killer", "slasher": "killer",
@@ -31,8 +34,6 @@ WISHLIST_LIMIT = 20
 MEDALS = ("🥇", "🥈", "🥉")
 
 
-def perk_dict(p: Perk) -> dict:
-    return {"name": p.name, "role": p.role, "owner": p.character.name if p.character else None}
 
 
 class DeadByDaylight(commands.Cog):
@@ -45,6 +46,7 @@ class DeadByDaylight(commands.Cog):
         self.config.register_user(p100=[], wishlist=[])
         self.config.register_guild(shrine_channel=None, announce_channel=None, last_shrine=None, shoutouts=True)
         self.data = GameData(f"RedDiscordBot-DBD-Cog/{__version__}")
+        self.icons = IconLibrary(Path(__file__).parent)
         self._board_view: P100BoardView | None = None
 
     async def cog_load(self):
@@ -82,6 +84,18 @@ class DeadByDaylight(commands.Cog):
     # ------------------------------------------------------------------ #
     # Shrine of Secrets
     # ------------------------------------------------------------------ #
+    # ── dict builders for the renderer (icons ride along as bytes) ──────
+    def P(self, p: Perk) -> dict:
+        return {"name": p.name, "role": p.role, "owner": p.character.name if p.character else None,
+                "icon": self.icons.get(p.image)}
+
+    def C(self, c) -> dict:
+        return {"name": c.name, "role": c.role, "portrait": self.icons.get(c.image),
+                "difficulty": "" if c.difficulty in ("", "none") else c.difficulty}
+
+    def G(self, g: Gear, sub: str = None) -> dict:
+        return {"kind": g.kind, "name": g.name, "rarity": g.rarity, "icon": self.icons.get(g.image), "sub": sub}
+
     async def shrine_post(self) -> tuple[str, discord.File, dict]:
         await self.data.load()
         shrine = await self.data.shrine()
@@ -90,7 +104,8 @@ class DeadByDaylight(commands.Cog):
             p = self.data.perks.get(entry["id"])
             if p is None:
                 continue
-            perks.append({**perk_dict(p), "shards": entry.get("shards"), "bloodpoints": entry.get("bloodpoints"), "key": p.key})
+            perks.append({**self.P(p), "shards": entry.get("shards"), "bloodpoints": entry.get("bloodpoints"),
+                          "owner_portrait": self.icons.get(p.character.image) if p.character else None, "key": p.key})
         end = int(shrine.get("end") or 0) + 1
         label = dt.datetime.fromtimestamp(end, dt.timezone.utc).strftime("%a, %b %-d") if end > 1 else "soon"
         png = await self._png(render.render_shrine, perks, label)
@@ -182,11 +197,11 @@ class DeadByDaylight(commands.Cog):
                             value=f"{entry.get('shards', 0):,} Iridescent Shards", inline=False)
         if others:
             embed.set_footer(text="Did you mean: " + ", ".join(p.name for p in others))
-        png = await self._png(render.badge_png, perk.name, perk.role, 256)
+        png = await self._png(render.badge_png, perk.name, perk.role, self.icons.get(perk.image), 256)
         embed.set_thumbnail(url="attachment://perk.png")
         await ctx.send(embed=embed, file=png_file(png, "perk"))
 
-    @dbd.command(name="character", aliases=["char", "killer", "survivor"])
+    @dbd.command(name="character", aliases=["char"])
     @commands.cooldown(3, 10, commands.BucketType.user)
     async def dbd_character(self, ctx: commands.Context, *, name: str):
         """A killer or survivor with their three teachable perks. Nicknames work (`myers`, `chucky`)."""
@@ -195,48 +210,73 @@ class DeadByDaylight(commands.Cog):
         ch = self.data.find_character(name)
         if ch is None:
             return await ctx.send(f"No character found matching **{name}**.")
-        perks = self.data.character_perks(ch)
-        png = await self._png(
-            render.render_build, ch.name, ch.role, [perk_dict(p) for p in perks],
-            note="Teachable perks · unlocked at levels 30 / 35 / 40",
-            tag=("KILLER" if ch.role == "killer" else "SURVIVOR") + (f" · {ch.difficulty.upper()}" if ch.difficulty not in ("", "none") else ""),
-        )
+        perks = [self.P(p) for p in self.data.character_perks(ch)]
+        note = "Unlocked at levels 30 / 35 / 40"
+        power = self.data.power_of(ch)
+        if power:
+            note += f" · Power: {power.name}"
+        png = await self._png(render.render_character, self.C(ch), perks, note)
         bio = render_text(ch.bio)
-        await ctx.send(content=f"-# {bio[:300]}" if bio else None, file=png_file(png, ch.id.lower()))
+        await ctx.send(content=f"-# {bio[:300]}" if bio else None, file=png_file(png, norm(ch.id) or "character"))
 
     # ------------------------------------------------------------------ #
-    # Randomizers
+    # Loadouts (one command does the whole thing)
     # ------------------------------------------------------------------ #
-    def _random_build(self, role: str, character=None, exclude: set | None = None):
-        roster = [c for c in self.data.roster(role) if not exclude or c.id not in exclude]
-        ch = character or random.choice(roster)
-        perks = random.sample(self.data.perks_for_role(role), 4)
-        return ch, perks
+    def roll_loadout(self, role: str, character=None, item_type: str = None, exclude: set = None):
+        """Random full loadout: character, 4 perks, item/power + 2 matching add-ons, offering."""
+        d = self.data
+        if character is None:
+            roster = [c for c in d.roster(role) if not exclude or c.id not in exclude]
+            character = random.choice(roster or d.roster(role))
+        perks = random.sample(d.perks_for_role(role), 4)
+        gear = []
+        if role == "killer":
+            main = d.power_of(character)
+            sub = "Power"
+        else:
+            items = d.survivor_items(item_type) or d.survivor_items()
+            main = random.choice(items) if items else None
+            sub = None
+        if main is not None:
+            gear.append(self.G(main, sub))
+            pool = d.addons_for(main, randomizable_only=True)
+            for a in random.sample(pool, min(2, len(pool))):
+                gear.append(self.G(a))
+        offers = d.offerings_for(role, character)
+        if offers:
+            gear.append(self.G(random.choice(offers), "Offering"))
+        return character, perks, gear
 
-    @dbd.command(name="build", aliases=["random", "roll"])
+    @dbd.command(name="loadout", aliases=["build", "roll", "random"])
     @commands.cooldown(3, 10, commands.BucketType.user)
-    async def dbd_build(self, ctx: commands.Context, *, who: Optional[str] = None):
-        """A random character + 4 perks.
+    async def dbd_loadout(self, ctx: commands.Context, *, who: Optional[str] = None):
+        """A full random loadout: character, perks, item/power with add-ons, and an offering.
 
-        `[p]dbd build` · `[p]dbd build killer` · `[p]dbd build survivor` · `[p]dbd build nurse`
+        `[p]dbd loadout` · `[p]dbd loadout killer` · `[p]dbd loadout survivor`
+        `[p]dbd loadout nurse` · `[p]dbd loadout flashlight`
         """
         if not await self._ready(ctx):
             return
-        role, character = None, None
+        role, character, item_type = None, None, None
         if who:
-            role = ROLE_ALIASES.get(who.lower())
+            q = who.lower().strip()
+            role = ROLE_ALIASES.get(q)
+            if role is None and q in ITEM_TYPE_ALIASES:
+                role, item_type = "survivor", ITEM_TYPE_ALIASES[q]
             if role is None:
                 character = self.data.find_character(who)
                 if character is None:
-                    return await ctx.send(f"Say `killer`, `survivor`, or a character name. I don't know **{who}**.")
+                    return await ctx.send(
+                        f"Say `killer`, `survivor`, a character, or an item type (toolbox, medkit, flashlight, map, key). "
+                        f"I don't know **{who}**.")
                 role = character.role
 
         async def render_one():
             r = role or random.choice(("killer", "survivor"))
-            ch, perks = self._random_build(r, character)
-            png = await self._png(render.render_build, ch.name, r, [perk_dict(p) for p in perks],
-                                  who=ctx.author.display_name)
-            return None, png_file(png, "build")
+            ch, perks, gear = self.roll_loadout(r, character, item_type)
+            png = await self._png(render.render_loadout, self.C(ch), [self.P(p) for p in perks], gear,
+                                  ctx.author.display_name)
+            return None, png_file(png, "loadout")
 
         async with ctx.typing():
             _, file = await render_one()
@@ -247,10 +287,10 @@ class DeadByDaylight(commands.Cog):
     @commands.guild_only()
     @commands.cooldown(2, 15, commands.BucketType.user)
     async def dbd_squad(self, ctx: commands.Context, mode: Optional[str] = None):
-        """Random builds for everyone in your voice channel.
+        """Full loadouts for everyone in your voice channel.
 
-        `[p]dbd squad` gives everyone a survivor build (no duplicate survivors).
-        `[p]dbd squad killer` picks one random person to be the killer, great for customs.
+        `[p]dbd squad`: everyone gets a survivor loadout (no duplicate survivors).
+        `[p]dbd squad killer`: one random person is the killer, great for customs.
         """
         if not await self._ready(ctx):
             return
@@ -266,16 +306,15 @@ class DeadByDaylight(commands.Cog):
             killer = order.pop() if with_killer and len(order) > 1 else None
             rows, used = [], set()
             if killer:
-                ch, perks = self._random_build("killer")
-                rows.append({"player": killer.display_name, "role": "killer", "character": ch.name,
-                             "perks": [perk_dict(p) for p in perks]})
+                ch, perks, gear = self.roll_loadout("killer")
+                rows.append({"player": killer.display_name, "character": self.C(ch),
+                             "perks": [self.P(p) for p in perks], "gear": gear})
             for m in sorted(order, key=lambda m: m.display_name.lower()):
-                ch, perks = self._random_build("survivor", exclude=used)
+                ch, perks, gear = self.roll_loadout("survivor", exclude=used)
                 used.add(ch.id)
-                rows.append({"player": m.display_name, "role": "survivor", "character": ch.name,
-                             "perks": [perk_dict(p) for p in perks]})
-            title = "Custom game" if killer else "Survivor squad"
-            png = await self._png(render.render_squad, rows, title)
+                rows.append({"player": m.display_name, "character": self.C(ch),
+                             "perks": [self.P(p) for p in perks], "gear": gear})
+            png = await self._png(render.render_squad, rows, "Custom game" if killer else "Survivor squad")
             return None, png_file(png, "squad")
 
         async with ctx.typing():
@@ -284,12 +323,97 @@ class DeadByDaylight(commands.Cog):
         view.message = await ctx.send(file=file, view=view)
 
     # ------------------------------------------------------------------ #
+    # Item / add-on / offering lookups
+    # ------------------------------------------------------------------ #
+    async def _gear_embed(self, ctx, gear: Gear, others: list, owner: str = None):
+        color = render.RARITY_RGB.get(gear.rarity, (120, 120, 130))
+        embed = discord.Embed(title=gear.name, description=gear.description[:4000] or None,
+                              color=discord.Color.from_rgb(*color))
+        if gear.rarity_label:
+            embed.add_field(name="Rarity", value=gear.rarity_label, inline=True)
+        if owner:
+            embed.add_field(name="For", value=owner, inline=True)
+        if gear.role:
+            embed.add_field(name="Role", value=gear.role.title(), inline=True)
+        if not gear.randomizable:
+            embed.add_field(name="Note", value="Event or special item, so it's left out of random loadouts.", inline=False)
+        if others:
+            embed.set_footer(text="Did you mean: " + ", ".join(o.name for o in others))
+        png = await self._png(render.gear_png, self.G(gear), 256)
+        embed.set_thumbnail(url="attachment://gear.png")
+        await ctx.send(embed=embed, file=png_file(png, "gear"))
+
+    @dbd.command(name="item")
+    @commands.cooldown(3, 10, commands.BucketType.user)
+    async def dbd_item(self, ctx: commands.Context, *, name: str):
+        """Look up a survivor item."""
+        if not await self._ready(ctx):
+            return
+        item, others = self.data.find_item(name)
+        if item is None:
+            return await ctx.send(f"No item found matching **{name}**.")
+        await self._gear_embed(ctx, item, others, ITEM_TYPE_LABELS.get(item.item_type or "", None))
+
+    @dbd.command(name="addon", aliases=["add-on"])
+    @commands.cooldown(3, 10, commands.BucketType.user)
+    async def dbd_addon(self, ctx: commands.Context, *, name: str):
+        """Look up an add-on (survivor item or killer power)."""
+        if not await self._ready(ctx):
+            return
+        addon, others = self.data.find_addon(name)
+        if addon is None:
+            return await ctx.send(f"No add-on found matching **{name}**.")
+        await self._gear_embed(ctx, addon, others, self.data.addon_owner(addon))
+
+    @dbd.command(name="offering", aliases=["offer"])
+    @commands.cooldown(3, 10, commands.BucketType.user)
+    async def dbd_offering(self, ctx: commands.Context, *, name: str):
+        """Look up an offering."""
+        if not await self._ready(ctx):
+            return
+        offering, others = self.data.find_offering(name)
+        if offering is None:
+            return await ctx.send(f"No offering found matching **{name}**.")
+        await self._gear_embed(ctx, offering, others, (offering.role or "everyone").title())
+
+    @dbd.command(name="addons", aliases=["add-ons"])
+    @commands.cooldown(2, 15, commands.BucketType.user)
+    async def dbd_addons(self, ctx: commands.Context, *, killer_or_item: str):
+        """Every add-on for a killer's power or a survivor item type, by rarity.
+
+        `[p]dbd addons nurse` · `[p]dbd addons flashlight`
+        """
+        if not await self._ready(ctx):
+            return
+        q = killer_or_item.lower().strip()
+        if q in ITEM_TYPE_ALIASES:
+            item_type = ITEM_TYPE_ALIASES[q]
+            parent = next((i for i in self.data.survivor_items(item_type)), None)
+            if parent is None:
+                return await ctx.send("No items of that type right now.")
+            addons = self.data.addons_for(parent)
+            title = f"{ITEM_TYPE_LABELS.get(item_type, item_type)} add-ons"
+            sub = f"{len(addons)} add-ons"
+        else:
+            ch = self.data.find_character(killer_or_item, role="killer")
+            power = self.data.power_of(ch) if ch else None
+            if power is None:
+                return await ctx.send(f"Give me a killer or an item type. I don't know **{killer_or_item}**.")
+            parent, addons = power, self.data.addons_for(power)
+            title = f"{ch.short}'s add-ons"
+            sub = f"{power.name} · {len(addons)} add-ons"
+        async with ctx.typing():
+            png = await self._png(render.render_addons, title, sub, self.G(parent, "Power"),
+                                  [self.G(a) for a in addons if not a.name.startswith("@#")])
+        await ctx.send(file=png_file(png, "addons"))
+
+    # ------------------------------------------------------------------ #
     # Prestige 100 tracker
     # ------------------------------------------------------------------ #
     async def prestige_card(self, member) -> discord.File:
         done = set(await self.config.user(member).p100())
-        killers = [(c.id, c.short) for c in self.data.roster("killer")]
-        survivors = [(c.id, c.name) for c in self.data.roster("survivor")]
+        killers = [(c.id, c.short, self.icons.get(c.image)) for c in self.data.roster("killer")]
+        survivors = [(c.id, c.name, self.icons.get(c.image)) for c in self.data.roster("survivor")]
         try:
             avatar = await member.display_avatar.replace(size=128, format="png").read()
         except (discord.HTTPException, AttributeError):
@@ -440,6 +564,36 @@ class DeadByDaylight(commands.Cog):
         """Turn P100 shout-outs on or off."""
         await self.config.guild(ctx.guild).shoutouts.set(on)
         await ctx.send(f"P100 shout-outs {'on' if on else 'off'}.")
+
+    @dbdset.command(name="assets", aliases=["icons"])
+    async def dbdset_assets(self, ctx: commands.Context):
+        """Check the exported game icons: what matched and what's missing after a patch."""
+        if not await self._ready(ctx):
+            return
+        self.icons.scan()
+        d = self.data
+        groups = [
+            ("Perks", [(p.name, p.image) for p in d.perks.values()]),
+            ("Portraits", [(c.name, c.image) for c in d.characters.values()]),
+            ("Items & powers", [(i.name, i.image) for i in d.items.values() if not i.name.startswith("@#")]),
+            ("Add-ons", [(a.name, a.image) for a in d.addons.values() if not a.name.startswith("@#")]),
+            ("Offerings", [(o.name, o.image) for o in d.offerings.values()]),
+        ]
+        lines, missing_all = [], []
+        for label, entries in groups:
+            missing = [n for n, img in entries if not self.icons.locate(img)]
+            mark = "✅" if not missing else "⚠️"
+            lines.append(f"{mark} **{label}**: {len(entries) - len(missing)}/{len(entries)}")
+            missing_all += [f"{label[:-1] if label.endswith('s') else label}: {n}" for n in missing]
+        embed = discord.Embed(title="🖼️ Dead by Daylight icons", color=0xBE202C,
+                              description="\n".join(lines) + f"\n\n{self.icons.count} image files found in the cog folder.")
+        if missing_all:
+            embed.add_field(name=f"Missing ({len(missing_all)}): export these from FModel",
+                            value="\n".join(missing_all[:25]) + (f"\n…and {len(missing_all) - 25} more" if len(missing_all) > 25 else ""),
+                            inline=False)
+        else:
+            embed.set_footer(text="Everything matched. Missing icons fall back to drawn badges.")
+        await ctx.send(embed=embed)
 
     @dbdset.command(name="settings")
     async def dbdset_settings(self, ctx: commands.Context):
