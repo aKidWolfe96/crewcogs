@@ -4,6 +4,7 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 import discord
 import yaml
 from redbot.core import commands
+from redbot.core.utils.chat_formatting import box, pagify
 
 __red_end_user_data_statement__ = "This cog does not store any end user data."
 
@@ -175,3 +176,25 @@ class ChannelGuide(commands.Cog):
         await target.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         if channel is not None:
             await ctx.tick()
+
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    @commands.command(aliases=["channelid", "chids"])
+    async def channelids(self, ctx: commands.Context):
+        """List every channel in this server with its ID, grouped by category."""
+        icons = {
+            discord.ChannelType.text: "#",
+            discord.ChannelType.news: "📢",
+            discord.ChannelType.voice: "🔊",
+            discord.ChannelType.stage_voice: "🎙️",
+            discord.ChannelType.forum: "💬",
+        }
+        lines = []
+        for category, channels in ctx.guild.by_category():
+            lines.append(f"\n[{category.name}]  {category.id}" if category else "[No category]")
+            for ch in channels:
+                lines.append(f"  {icons.get(ch.type, '•')} {ch.name}  {ch.id}")
+
+        for page in pagify("\n".join(lines).strip(), page_length=1900):
+            await ctx.send(box(page, lang="ini"))
+
