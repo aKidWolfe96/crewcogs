@@ -10,7 +10,7 @@ __red_end_user_data_statement__ = "This cog does not store any end user data."
 
 CogKey = Union[str, Tuple[str, ...]]
 
-# Sentinel for the casino lobby: casino channels that no single game claims.
+# Sentinel for the casino lobby: the channels the Casino cog (`!casino`) is allowed in.
 LOBBY = "__lobby__"
 
 
@@ -19,19 +19,20 @@ class ChannelGuide(commands.Cog):
 
     CONFIG_FILE = Path(__file__).with_name("config.yaml")
 
+    # Each section: (title, optional tip, entries).
     # Each entry: (cog key(s) in config.yaml, label, commands to show, text when no channel is set).
-    # `{p}` is replaced with the server's prefix.
+    # `{p}` becomes the server's prefix and `{lobby}` the lobby channel(s).
     SECTIONS = (
         (
-            "🎰  Casino",
-            "Type `{p}casino` in any casino channel for a menu with every game, your stats and rewards.",
+            "🎰  Krusty Casino",
+            "New here? Type `{p}casino` in {lobby} for a menu with every game, your stats and rewards.",
             (
-                (LOBBY, "🏛️ **Casino Lobby**", "`{p}casino`", None),
+                (LOBBY, "🏛️ **Casino Lobby**", "`{p}casino` · `{p}casino achievements`", None),
                 ("Blackjack", "🃏 **Blackjack**", "`{p}bj`", None),
-                ("CoinFlip", "🪙 **Coin Flip**", "`{p}cf`", None),
-                ("Slots", "🎰 **Slots**", "`{p}slots`", None),
                 ("Roulette", "🎡 **Roulette**", "`{p}roulette` · `{p}rtable`", None),
+                ("CoinFlip", "🪙 **Coin Flip**", "`{p}cf`", None),
                 ("HighLow", "↕️ **High / Low**", "`{p}hl`", None),
+                ("Slots", "🎰 **Slots**", "`{p}slots`", "open it from the lobby"),
                 ("Crash", "🚀 **Crash**", "`{p}crash`", "open it from the lobby"),
                 ("Mines", "💣 **Mines**", "`{p}mines`", "open it from the lobby"),
                 ("DailySpin", "🎁 **Daily Rewards**", "`{p}daily` · `{p}spin`", None),
@@ -39,21 +40,18 @@ class ChannelGuide(commands.Cog):
             ),
         ),
         (
-            "🎮  Party Games",
-            None,
-            (
-                ("Battleship", "🚢 **Battleship**", "`{p}battleship`", None),
-                ("Trivia", "❓ **Trivia**", "`{p}trivia list`", None),
-            ),
-        ),
-        (
-            "📊  Games & Stats",
+            "🎮  Games & Pokémon",
             None,
             (
                 ("PokéBot", "⚡ **PokéBot**", "`{p}start` · catch the wild spawns", None),
-                (("FortniteStats", "Overwatch"), "🎮 **Fortnite & Overwatch**", "`{p}fn stats` · `{p}fn shop` · `{p}ow profile`", None),
-                ("UFC", "🥊 **UFC / Fight Night**", "`{p}ufc card` · `{p}ufc pick`", None),
+                (("FortniteStats", "Overwatch"), "📊 **Fortnite & Overwatch**", "`{p}fn stats` · `{p}fn shop` · `{p}ow profile`", None),
+                (("Trivia", "Battleship"), "❓ **Trivia & Battleship**", "`{p}trivia list` · `{p}battleship`", None),
             ),
+        ),
+        (
+            "🏈  Sports & Bets",
+            None,
+            (("UFC", "🥊 **UFC / Fight Night**", "`{p}ufc card` · `{p}ufc pick` · `{p}ufc bet`", None),),
         ),
         (
             "🔔  Alerts",
@@ -92,17 +90,8 @@ class ChannelGuide(commands.Cog):
                     continue
             parsed[str(cog_name)] = ids
 
-        # The lobby lives in casino channels that aren't a specific game's home;
-        # if every casino channel is claimed, it works in all of them.
-        casino = parsed.get("Casino", [])
-        if casino:
-            claimed = {
-                cid
-                for key, *_ in self.SECTIONS[0][2]
-                if key != LOBBY
-                for cid in parsed.get(key, [])
-            }
-            parsed[LOBBY] = [cid for cid in casino if cid not in claimed] or casino
+        if parsed.get("Casino"):
+            parsed[LOBBY] = parsed["Casino"]
         return parsed
 
     @staticmethod
@@ -138,11 +127,21 @@ class ChannelGuide(commands.Cog):
         if guild and guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
+        # Every channel used by the casino section, so a game allowed in all of
+        # them can say "any casino channel" in place of a long row of links.
+        casino_all = {
+            cid for key, *_ in self.SECTIONS[0][2] for cid in (self._channels(rules, key) or [])
+        }
+        lobby_ids = rules.get(LOBBY, [])
+        lobby = f"<#{lobby_ids[0]}>" if lobby_ids else "any casino channel"
+
         for title, tip, entries in self.SECTIONS:
             lines = []
             for key, label, cmds, fallback in entries:
                 ids = self._channels(rules, key)
-                if ids:
+                if ids and len(ids) > 2 and set(ids) == casino_all:
+                    where = "*any casino channel*"
+                elif ids:
                     where = " ".join(f"<#{cid}>" for cid in ids)
                 elif fallback:
                     where = f"*{fallback}*"
@@ -152,9 +151,9 @@ class ChannelGuide(commands.Cog):
             if not lines:
                 continue
             if tip:
-                lines.insert(0, f"> 💡 {tip.format(p=prefix)}\n")
+                lines.insert(0, f"> 💡 {tip.format(p=prefix, lobby=lobby)}\n")
             # Trailing blank line gives each section room to breathe.
-            embed.add_field(name=f"━━━  {title}  ━━━", value="\n".join(lines) + "\n​", inline=False)
+            embed.add_field(name=f"━━━  {title}  ━━━", value="\n".join(lines) + "\n\u200b", inline=False)
 
         embed.set_footer(text="Typed it in the wrong channel? The bot just ignores it. No harm done!")
         return embed

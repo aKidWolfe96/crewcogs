@@ -1,55 +1,82 @@
 COG:
+  # ── Casino ──────────────────────────────────────────
+  # Lobby (!casino), daily rewards, stats & achievements
   Casino:
-    1480285926151160000: true
-    1499218723368734831: true
-    1480285772849352786: true
-    1493785521317478430: true
-    1480285845645955254: true
-    1531734965023408128: true
-    1531754413381783635: true
+    1480285926151160000: true   # ruthless-saloon
+    1481475760467480731: true   # achievement-track
     default: false
   Blackjack:
-    1480285772849352786: true
-    default: false
-  Battleship:
-    1496308219172356207: true 
-    default: false
-  Trivia:
-    1496308508247855134: true 
+    1480285772849352786: true   # blackjack-21
     default: false
   CoinFlip:
-    1499218723368734831: true
-    default: false
-  DailySpin:
-    1480285926151160000: true
-    default: false
-  FortniteStats:
-    1493752940912050296: true
-    1350546941766930576: true
-    default: false
-  Overwatch:
-    1493752940912050296: true
-    1350546941766930576: true
-    default: false
-  PokéBot:
-    1492801872262725813: true
-    default: false
-  Slots:
-    1493785521317478430: true
-    default: false
-  UFC:
-    1515373883849572592: true
-    1492931006028709948: true
-    default: false
-  TwitchAlerts:
-    1525353570260619354: true
-    default: false
-  Economy:
-    1480285926151160000: true
+    1499218723368734831: true   # coin-flip
     default: false
   Roulette:
-    1531734965023408128: true
+    1531734965023408128: true   # roulette
     default: false
   HighLow:
-    1531754413381783635: true
+    1531754413381783635: true   # high-low
+    default: false
+  # Slots, Crash & Mines work in every casino channel
+  Slots:
+    1480285926151160000: true   # ruthless-saloon
+    1480285772849352786: true   # blackjack-21
+    1531734965023408128: true   # roulette
+    1499218723368734831: true   # coin-flip
+    1531754413381783635: true   # high-low
+    1481475760467480731: true   # achievement-track
+    default: false
+  Crash:
+    1480285926151160000: true   # ruthless-saloon
+    1480285772849352786: true   # blackjack-21
+    1531734965023408128: true   # roulette
+    1499218723368734831: true   # coin-flip
+    1531754413381783635: true   # high-low
+    1481475760467480731: true   # achievement-track
+    default: false
+  Mines:
+    1480285926151160000: true   # ruthless-saloon
+    1480285772849352786: true   # blackjack-21
+    1531734965023408128: true   # roulette
+    1499218723368734831: true   # coin-flip
+    1531754413381783635: true   # high-low
+    1481475760467480731: true   # achievement-track
+    default: false
+  DailySpin:
+    1480285926151160000: true   # ruthless-saloon
+    default: false
+  Economy:
+    1480285926151160000: true   # ruthless-saloon
+    default: false
+
+  # ── Party games ─────────────────────────────────────
+  Battleship:
+    1350546941766930575: true   # krew-chat
+    default: false
+  Trivia:
+    1350546941766930575: true   # krew-chat
+    default: false
+
+  # ── Games & stats ───────────────────────────────────
+  PokéBot:
+    1492801872262725813: true   # pokemon-center
+    default: false
+  FortniteStats:
+    1524529883370225794: true   # krusty-stats
+    1493752940912050296: true   # game-updates
+    default: false
+  Overwatch:
+    1524529883370225794: true   # krusty-stats
+    1493752940912050296: true   # game-updates
+    default: false
+
+  # ── Sports & bets ───────────────────────────────────
+  UFC:
+    1515373883849572592: true   # fight-predictions
+    1492931006028709948: true   # parlay-hub
+    default: false
+
+  # ── Alerts ──────────────────────────────────────────
+  TwitchAlerts:
+    1525353570260619354: true   # stream-updates
     default: false
