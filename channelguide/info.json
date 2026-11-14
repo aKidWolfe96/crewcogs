@@ -2,7 +2,7 @@
     "author": ["KrustyKrew"],
     "name": "ChannelGuide",
     "short": "Posts a guide showing which commands belong in which channels.",
-    "description": "A simple utility cog that posts an embed mapping KrustyKrew bot features to their designated channels. Admin-only command to post or refresh the guide in any channel.",
+    "description": "Posts an easy-to-follow embed showing each KrustyKrew bot feature, the channel it lives in and the command to type. Channels come from the bundled permissions YAML. Admin-only command to post or refresh the guide in any channel.",
     "tags": ["utility", "embed", "guide", "channels", "help"],
     "requirements": [],
     "min_bot_version": "3.5.0",

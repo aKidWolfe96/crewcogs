@@ -1,58 +1,71 @@
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import discord
 import yaml
 from redbot.core import commands
+from redbot.core.utils.chat_formatting import box, pagify
 
 __red_end_user_data_statement__ = "This cog does not store any end user data."
 
+CogKey = Union[str, Tuple[str, ...]]
+
+# Sentinel for the casino lobby: casino channels that no single game claims.
+LOBBY = "__lobby__"
+
 
 class ChannelGuide(commands.Cog):
-    """Posts a compact channel-location guide from the permissions YAML."""
+    """Posts a friendly "where do I go?" guide built from the permissions YAML."""
 
     CONFIG_FILE = Path(__file__).with_name("config.yaml")
 
-    # The generic Casino permission entry is intentionally omitted because it
-    # is a parent rule spanning all casino channels, not a separate destination.
+    # Each entry: (cog key(s) in config.yaml, label, commands to show, text when no channel is set).
+    # `{p}` is replaced with the server's prefix.
     SECTIONS = (
         (
-            "━━ 🎰  CASINO & ECONOMY  ━━",
+            "🎰  Casino",
+            "Type `{p}casino` in any casino channel for a menu with every game, your stats and rewards.",
             (
-                ("Blackjack", "🃏 Blackjack"),
-                ("CoinFlip", "🪙 Coin Flip"),
-                ("DailySpin", "🎁 Daily Spin"),
-                ("Slots", "🎰 Slots"),
-                ("Roulette", "🎡 Roulette"),
-                ("HighLow", "♥️ High / Low"),
-                ("Crash", "🚀 Crash"),
-                ("Mines", "💣 Mines"),
-                ("Economy", "💰 Balance / Economy"),
+                (LOBBY, "🏛️ **Casino Lobby**", "`{p}casino`", None),
+                ("Blackjack", "🃏 **Blackjack**", "`{p}bj`", None),
+                ("CoinFlip", "🪙 **Coin Flip**", "`{p}cf`", None),
+                ("Slots", "🎰 **Slots**", "`{p}slots`", None),
+                ("Roulette", "🎡 **Roulette**", "`{p}roulette` · `{p}rtable`", None),
+                ("HighLow", "↕️ **High / Low**", "`{p}hl`", None),
+                ("Crash", "🚀 **Crash**", "`{p}crash`", "open it from the lobby"),
+                ("Mines", "💣 **Mines**", "`{p}mines`", "open it from the lobby"),
+                ("DailySpin", "🎁 **Daily Rewards**", "`{p}daily` · `{p}spin`", None),
+                ("Economy", "💰 **Wallet**", "`{p}payday` · `{p}bank balance`", None),
             ),
         ),
         (
-            "━━ 🎮  PARTY GAMES  ━━",
+            "🎮  Party Games",
+            None,
             (
-                ("Battleship", "🚢 Battleship"),
-                ("Trivia", "❓ Trivia"),
+                ("Battleship", "🚢 **Battleship**", "`{p}battleship`", None),
+                ("Trivia", "❓ **Trivia**", "`{p}trivia list`", None),
             ),
         ),
         (
-            "━━ 📊  GAME STATS  ━━",
+            "📊  Games & Stats",
+            None,
             (
-                ("PokéBot", "⚡ PokéBot"),
-                (("FortniteStats", "Overwatch"), "🎮 Fortnite / Overwatch"),
-                ("UFC", "🥊 UFC / Fight Night"),
+                ("PokéBot", "⚡ **PokéBot**", "`{p}start` · catch the wild spawns", None),
+                (("FortniteStats", "Overwatch"), "🎮 **Fortnite & Overwatch**", "`{p}fn stats` · `{p}fn shop` · `{p}ow profile`", None),
+                ("UFC", "🥊 **UFC / Fight Night**", "`{p}ufc card` · `{p}ufc pick`", None),
             ),
         ),
         (
-            "━━ 🔔  ALERTS  ━━",
-            (("TwitchAlerts", "📺 Twitch Alerts"),),
+            "🔔  Alerts",
+            None,
+            (("TwitchAlerts", "📺 **Twitch Live**", "posts automatically", None),),
         ),
     )
 
     def __init__(self, bot):
         self.bot = bot
+
+    # ── Config ────────────────────────────────────────────────────────────────
 
     def _load_rules(self) -> Dict[str, List[int]]:
         """Read enabled channel IDs from the bundled Red Permissions YAML."""
@@ -69,88 +82,119 @@ class ChannelGuide(commands.Cog):
         for cog_name, rules in cog_rules.items():
             if not isinstance(rules, dict):
                 continue
-
-            channel_ids: List[int] = []
+            ids: List[int] = []
             for target, allowed in rules.items():
                 if str(target).lower() == "default" or allowed is not True:
                     continue
                 try:
-                    channel_ids.append(int(target))
+                    ids.append(int(target))
                 except (TypeError, ValueError):
                     continue
+            parsed[str(cog_name)] = ids
 
-            parsed[str(cog_name)] = channel_ids
-
+        # The lobby lives in casino channels that aren't a specific game's home;
+        # if every casino channel is claimed, it works in all of them.
+        casino = parsed.get("Casino", [])
+        if casino:
+            claimed = {
+                cid
+                for key, *_ in self.SECTIONS[0][2]
+                if key != LOBBY
+                for cid in parsed.get(key, [])
+            }
+            parsed[LOBBY] = [cid for cid in casino if cid not in claimed] or casino
         return parsed
 
     @staticmethod
-    def _channel_mentions(channel_ids: List[int]) -> str:
-        if not channel_ids:
-            return "*No channel configured*"
-        return " ".join(f"<#{channel_id}>" for channel_id in channel_ids)
-
-    @staticmethod
-    def _combined_channels(rules: Dict[str, List[int]], cog_names) -> List[int]:
-        """Combine channels for grouped cogs while preserving YAML order."""
+    def _channels(rules: Dict[str, List[int]], key: CogKey) -> Optional[List[int]]:
+        """Channel IDs for a key (or several), or None if the cog isn't in the YAML."""
+        keys: Iterable[str] = key if isinstance(key, tuple) else (key,)
+        present = [k for k in keys if k in rules]
+        if not present:
+            return None
         combined: List[int] = []
-        for cog_name in cog_names:
-            for channel_id in rules.get(cog_name, []):
-                if channel_id not in combined:
-                    combined.append(channel_id)
+        for k in present:
+            for cid in rules[k]:
+                if cid not in combined:
+                    combined.append(cid)
         return combined
 
-    def build_embed(self) -> discord.Embed:
+    # ── Embed ─────────────────────────────────────────────────────────────────
+
+    def build_embed(self, prefix: str = "!", guild: Optional[discord.Guild] = None) -> discord.Embed:
         rules = self._load_rules()
 
         embed = discord.Embed(
-            title="📍 KrustyKrew Channel Guide",
+            title="🗺️  Where Do I Go?",
             description=(
-                "Each bot feature is locked to its own channel.\n"
-                "Tap a channel below to jump straight there."
+                "Every bot feature has its own home channel.\n"
+                "**1.** Find what you want below\n"
+                "**2.** Tap the channel to jump there\n"
+                "**3.** Type the command shown\n"
+                "​"
             ),
-            color=discord.Color.blurple(),
+            color=discord.Color.from_rgb(88, 101, 242),
         )
+        if guild and guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
 
-        for section_title, entries in self.SECTIONS:
+        for title, tip, entries in self.SECTIONS:
             lines = []
-            for cog_key, label in entries:
-                if isinstance(cog_key, tuple):
-                    present = [name for name in cog_key if name in rules]
-                    if not present:
-                        continue
-                    channel_ids = self._combined_channels(rules, present)
+            for key, label, cmds, fallback in entries:
+                ids = self._channels(rules, key)
+                if ids:
+                    where = " ".join(f"<#{cid}>" for cid in ids)
+                elif fallback:
+                    where = f"*{fallback}*"
                 else:
-                    if cog_key not in rules:
-                        continue
-                    channel_ids = rules[cog_key]
+                    continue
+                lines.append(f"{label} ➜ {where}\n╰ {cmds.format(p=prefix)}")
+            if not lines:
+                continue
+            if tip:
+                lines.insert(0, f"> 💡 {tip.format(p=prefix)}\n")
+            # Trailing blank line gives each section room to breathe.
+            embed.add_field(name=f"━━━  {title}  ━━━", value="\n".join(lines) + "\n​", inline=False)
 
-                lines.append(f"**{label}** → {self._channel_mentions(channel_ids)}")
-
-            if lines:
-                embed.add_field(
-                    name=section_title,
-                    value="\n".join(lines),
-                    inline=False,
-                )
-
-        embed.set_footer(text="Wrong channel? The bot will simply ignore the command.")
+        embed.set_footer(text="Typed it in the wrong channel? The bot just ignores it. No harm done!")
         return embed
+
+    # ── Command ───────────────────────────────────────────────────────────────
 
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     @commands.command()
-    async def channelguide(self, ctx, channel: discord.TextChannel = None):
-        """Post the compact channel guide here or in another channel."""
+    async def channelguide(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Post the channel guide here, or in another channel."""
         target = channel or ctx.channel
         try:
-            embed = self.build_embed()
+            embed = self.build_embed(ctx.clean_prefix, ctx.guild)
         except RuntimeError as exc:
             await ctx.send(f"❌ ChannelGuide configuration error: {exc}")
             return
 
-        await target.send(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await target.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         if channel is not None:
             await ctx.tick()
+
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    @commands.command(aliases=["channelid", "chids"])
+    async def channelids(self, ctx: commands.Context):
+        """List every channel in this server with its ID, grouped by category."""
+        icons = {
+            discord.ChannelType.text: "#",
+            discord.ChannelType.news: "📢",
+            discord.ChannelType.voice: "🔊",
+            discord.ChannelType.stage_voice: "🎙️",
+            discord.ChannelType.forum: "💬",
+        }
+        lines = []
+        for category, channels in ctx.guild.by_category():
+            lines.append(f"\n[{category.name}]  {category.id}" if category else "[No category]")
+            for ch in channels:
+                lines.append(f"  {icons.get(ch.type, '•')} {ch.name}  {ch.id}")
+
+        for page in pagify("\n".join(lines).strip(), page_length=1900):
+            await ctx.send(box(page, lang="ini"))
+
