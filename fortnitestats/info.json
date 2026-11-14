@@ -1,12 +1,15 @@
 {
     "author": ["Aaron"],
     "name": "FortniteStats",
-    "short": "Graphical Fortnite stats, item shop, news and cosmetics.",
-    "description": "Self-hosted Fortnite cog powered by the official fortnite-api.com library. Graphical BR player stats, daily item shop (with optional auto-post), in-game news, and cosmetic lookups. Account linking stored locally in Red's Config.",
-    "tags": ["fortnite", "games", "stats", "shop"],
-    "requirements": ["fortnite-api>=3.3.0"],
+    "short": "Fortnite stat cards, a browsable item shop, wishlists and news.",
+    "description": "Self-hosted Fortnite cog powered by fortnite-api.com. Custom stat cards with Lifetime/Season and input toggles (Epic, PlayStation and Xbox names), head-to-head compares and a server leaderboard. The item shop posts as a clean cover image with a private section-by-section browser, plus item lookups with shop history and wishlist pings in the daily shop post.",
+    "install_msg": "Thanks for installing FortniteStats! Get a free API key at https://dash.fortnite-api.com, then run `[p]fnset apikey <key>` in DMs. Set the daily shop with `[p]fnset shopchannel #channel`.",
+    "tags": ["fortnite", "games", "stats", "shop", "wishlist"],
+    "requirements": ["fortnite-api>=3.3.0", "Pillow>=10.1"],
     "min_bot_version": "3.5.0",
+    "min_python_version": [3, 9, 0],
     "hidden": false,
     "disabled": false,
-    "type": "COG"
+    "type": "COG",
+    "end_user_data_statement": "This cog stores your linked Fortnite account name/ID and your item wishlist, keyed by your Discord user ID. Use `[p]fn unlink` and `[p]fn wishlist clear` to remove them."
 }
