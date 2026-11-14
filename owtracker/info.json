@@ -1,0 +1,14 @@
+{
+  "author": ["KrustyKrew"],
+  "name": "Overwatch",
+  "short": "Overwatch stat cards, rank-up alerts, party tools and a spray-challenge board.",
+  "description": "Links BattleTags and pulls stats from the unofficial OverFast API: profile cards with ranks and top heroes, per-hero cards, head-to-head compares, server leaderboards, automatic rank-up announcements, the current meta, random hero/team rolls and map picks. Plus a spray-challenge board with a picture of everyone's collection and a tick-box editor.",
+  "install_msg": "Thanks for installing Overwatch! Link with `[p]ow link Name#1234`, set announcements with `[p]owset channel #channel`, and load the cute sprays with `[p]ow challenge seedcute`.",
+  "tags": ["overwatch", "games", "stats", "tracker", "sprays"],
+  "requirements": ["aiohttp", "Pillow>=10.1"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog stores the BattleTag you choose to link, the OverFast player id derived from it, your last-seen competitive ranks (for rank-up alerts), and, per server, the spray-challenge IDs you mark complete. Use [p]ow unlink to remove your link, or the bot's [p]mydata commands to delete all stored data."
+}
