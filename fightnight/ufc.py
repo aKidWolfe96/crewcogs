@@ -1,179 +1,149 @@
 """
-UFC Cog for Red-DiscordBot v3.
+UFC Cog for Red-DiscordBot v3 — fight night, done properly.
 
-Picks are tied to the EVENT they were made for, and `settle` re-fetches that
-specific event's results by date — so it always settles the right card even
-after ESPN's scoreboard has rolled over to a new event.
+  • Picture cards: fight-card poster, Tale of the Tape, fighter cards, leaderboards
+  • Tap-to-pick: a dropdown per fight (winner + optional method/round bonus)
+  • Every fight locks automatically when its part of the card starts
+  • Bets pay at the DraftKings moneyline locked in when you bet
+  • A watcher posts the card before the event, creates a Discord event, posts
+    each result live, settles picks/bets on the spot and posts a recap
 
-Commands
-  !ufc card                 upcoming fight card
-  !ufc results              most recent event results
-  !ufc fighter <name>       fighter stats + recent fights
-  !ufc pick <name>          lock in a pick for the upcoming card
-  !ufc picks                show server picks for the upcoming card
-  !ufc standings            pick-em leaderboard
-  !ufc settle [YYYY-MM-DD]  [admin] score picks vs results, update standings
-  !ufc clearpicks           [admin] clear all picks without scoring
-  !ufc resetstandings       [admin] wipe standings (confirmation required)
+Commands live under `[p]ufc`; settings under `[p]ufcset`.
 """
+from __future__ import annotations
+
 import asyncio
-import aiohttp
 import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import aiohttp
 import discord
-from datetime import datetime, timezone, timedelta
-from redbot.core import commands, Config, checks, bank
+from discord.ext import tasks
+from redbot.core import Config, bank, checks, commands
 from redbot.core.bot import Red
+from redbot.core.utils.chat_formatting import box
 
-from .api import (
-    get_upcoming_event, get_recent_event,
-    get_event_on_date, get_event_by_id, get_fighter, espn_api_status,
-)
 from . import embeds
+from . import render
+from . import scoring as sc
+from .api import (attach_odds, espn_api_status, get_event_by_id, get_event_on_date, get_fighter,
+                  get_recent_event, get_upcoming_event)
+from .views import CardView, PickEditor, is_locked, png_file
 
-MAX_BETS = 3   # max active bets per user per card
+log = logging.getLogger("red.akidwolfe.fightnight")
+
+__version__ = "6.0.0"
+MAX_BETS = 3
 STALE_EVENT_GRACE = timedelta(hours=36)
+EVENT_TTL_IDLE = 900
+EVENT_TTL_LIVE = 120
+MEDALS = ("🥇", "🥈", "🥉")
+METHOD_WORDS = {"ko": "ko", "tko": "ko", "knockout": "ko", "sub": "sub", "submission": "sub",
+                "dec": "dec", "decision": "dec", "points": "dec"}
 
 
 def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
-
 def _event_is_stale(meta: dict) -> bool:
-    """Return True only when a stored event is safely beyond its live window."""
-    now = datetime.now(timezone.utc)
     compact = str(meta.get("date_compact", "") or "")
     if len(compact) == 8 and compact.isdigit():
         try:
-            # ESPN dates identify the event day, not the exact closing time.
-            # Treat the card as stale only after the following day plus grace.
             start = datetime.strptime(compact, "%Y%m%d").replace(tzinfo=timezone.utc)
-            return now >= start + timedelta(days=1) + STALE_EVENT_GRACE
+            return datetime.now(timezone.utc) >= start + timedelta(days=1) + STALE_EVENT_GRACE
         except ValueError:
             return False
     return False
 
 
-def _all_entries(mapping: dict):
-    """Yield (fight_key, uid, value) from a fight-keyed user mapping."""
-    for fight_key, users in (mapping or {}).items():
-        for uid, value in (users or {}).items():
-            yield fight_key, uid, value
-
-def _merge_deltas(total: dict, part: dict):
-    for uid, d in part.items():
-        t = total.setdefault(uid, {"correct": 0, "total": 0})
-        t["correct"] += d["correct"]
-        t["total"]   += d["total"]
-
-
-def _score_picks(picks_dict: dict, results_event: dict):
-    """
-    Score {fight_key: {uid: picked_name}} against a results event.
-    Matches by FIGHTER NAME (order-independent), robust to card changes.
-    Returns (deltas, resolved):
-        deltas   = {uid: {"correct": int, "total": int}}
-        resolved = [(fight_key, uid), ...]
-    """
-    result_fights = results_event.get("fights", []) if results_event else []
-
-    def find_result(picked: str):
-        pn = _norm(picked)
-        for rf in result_fights:
-            r, b = _norm(rf["red"]), _norm(rf["blue"])
-            if pn == r or pn == b or pn in r or pn in b:
-                return rf
-        return None
-
+def _legacy_score(picks_dict: dict, results_event: dict):
+    """Score the pre-v5 flat picks table (kept so nothing old is lost)."""
+    fights = results_event.get("fights", []) if results_event else []
     deltas, resolved = {}, []
-    for fight_key, fp in picks_dict.items():
+    for key, fp in picks_dict.items():
         for uid, picked in fp.items():
-            rf = find_result(picked)
+            pn = _norm(picked)
+            rf = next((f for f in fights if pn in (_norm(f["red"]), _norm(f["blue"]))), None)
             if not rf or not rf.get("winner"):
                 continue
-            resolved.append((fight_key, uid))
+            resolved.append((key, uid))
             d = deltas.setdefault(uid, {"correct": 0, "total": 0})
             d["total"] += 1
-            if _norm(rf["winner"]) == _norm(picked):
-                d["correct"] += 1
+            d["correct"] += int(_norm(rf["winner"]) == pn)
     return deltas, resolved
 
 
-def _score_bets(bets_dict: dict, results_event: dict):
-    """
-    Score {fight_key: {uid: {"pick": name, "amount": int}}} against results.
-    Returns (payouts, outcomes, resolved):
-        payouts  = {uid: credits_to_deposit}            # stake*2 for a win
-        outcomes = {uid: {"net": int, "won": int, "lost": int}}
-        resolved = [(fight_key, uid), ...]
-    """
-    result_fights = results_event.get("fights", []) if results_event else []
-
-    def find_result(picked: str):
-        pn = _norm(picked)
-        for rf in result_fights:
-            r, b = _norm(rf["red"]), _norm(rf["blue"])
-            if pn == r or pn == b or pn in r or pn in b:
-                return rf
-        return None
-
-    payouts, outcomes, resolved = {}, {}, []
-    for fight_key, ub in bets_dict.items():
-        for uid, bet in ub.items():
-            picked, amount = bet.get("pick", ""), bet.get("amount", 0)
-            rf = find_result(picked)
-            if not rf or not rf.get("winner"):
-                continue
-            resolved.append((fight_key, uid))
-            o = outcomes.setdefault(uid, {"net": 0, "won": 0, "lost": 0})
-            if _norm(rf["winner"]) == _norm(picked):
-                payouts[uid] = payouts.get(uid, 0) + amount * 2
-                o["net"] += amount
-                o["won"] += 1
-            else:
-                o["net"] -= amount
-                o["lost"] += 1
-    return payouts, outcomes, resolved
+def _first_start(event: dict) -> Optional[int]:
+    starts = [f["start"] for f in event.get("fights", []) if f.get("start")]
+    return min(starts) if starts else event.get("timestamp")
 
 
-def _merge_payouts(total: dict, part: dict):
-    for uid, amt in part.items():
-        total[uid] = total.get(uid, 0) + amt
-
-
-def _merge_outcomes(total: dict, part: dict):
-    for uid, o in part.items():
-        s = total.setdefault(uid, {"net": 0, "won": 0, "lost": 0})
-        s["net"]  += o["net"]
-        s["won"]  += o["won"]
-        s["lost"] += o["lost"]
-
-
-log = logging.getLogger("red.akidwolfe.fightnight")
+def _parse_pick(text: str):
+    """'Jon Jones ko 2' -> ('Jon Jones', 'ko:2'); 'Jones dec' -> ('Jones', 'dec')."""
+    words = text.split()
+    method = rnd = None
+    if words and words[-1].lstrip("r").isdigit() and len(words) > 1:
+        rnd = words[-1].lstrip("r")
+        words = words[:-1]
+    if words and words[-1].lower() in METHOD_WORDS and len(words) > 1:
+        method = METHOD_WORDS[words[-1].lower()]
+        words = words[:-1]
+    if method == "dec":
+        value = "dec"
+    elif method and rnd:
+        value = f"{method}:{rnd}"
+    else:
+        value = None
+    return " ".join(words), value
 
 
 class UFC(commands.Cog):
-    """UFC fight cards, results, fighter stats, and a server pick-em game."""
+    """UFC fight cards, results, fighter cards, live pick'em and betting."""
 
     def __init__(self, bot: Red):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=7833209, force_registration=True)
         self.config.register_guild(
-            events={},      # { eid: {"meta": {...},
-                            #         "picks": {"Red|Blue": {uid: name}},
-                            #         "bets":  {"Red|Blue": {uid: {"pick": name, "amount": int}}} } }
+            events={},      # {eid: {meta, picks, methods, bets, odds, settled, scores, posted}}
             picks={},       # legacy flat picks (pre-event-scoping) — still settle-able
-            standings={},   # { uid: {"correct": int, "total": int} }
-            betting={},     # { uid: {"net": int, "won": int, "lost": int} }
+            standings={},   # {uid: {correct, total, bonus, best_upset}}
+            betting={},     # {uid: {net, won, lost}}
+            periods={},     # {"2026-11": {uid: {...}}, "2026": {...}}
+            last_card={},   # {"name", "scores"} for `standings card`
+            channel=None, ping_role=None, hype_hours=6, live=True,
+            sched_events=False, sched_created={},
         )
-        self._session: aiohttp.ClientSession = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._event: Optional[dict] = None
+        self._event_at = 0.0
+        self._event_lock = asyncio.Lock()
+        self._images: dict[str, Optional[bytes]] = {}
+        self._card_view: Optional[CardView] = None
 
     async def cog_load(self):
         self._session = aiohttp.ClientSession()
+        self._card_view = CardView(self)
+        self.bot.add_view(self._card_view)
+        self.watch.start()
 
     async def cog_unload(self):
+        self.watch.cancel()
+        if self._card_view:
+            self._card_view.stop()
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def red_delete_data_for_user(self, *, requester, user_id: int):
+        uid = str(user_id)
+        for gid, g in (await self.config.all_guilds()).items():
+            conf = self.config.guild_from_id(gid)
+            async with conf.standings() as s:
+                s.pop(uid, None)
+            async with conf.betting() as b:
+                b.pop(uid, None)
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -181,643 +151,885 @@ class UFC(commands.Cog):
             self._session = aiohttp.ClientSession()
         return self._session
 
+    # ------------------------------------------------------------------ #
+    # Data helpers
+    # ------------------------------------------------------------------ #
+    async def get_event(self, force: bool = False) -> Optional[dict]:
+        """Current/next card with odds, cached (2 min near fight time, 15 min otherwise)."""
+        async with self._event_lock:
+            ev = self._event
+            live = ev and (_first_start(ev) or 0) - 3600 <= time.time() <= (_first_start(ev) or 0) + 12 * 3600
+            ttl = EVENT_TTL_LIVE if live else EVENT_TTL_IDLE
+            if ev and not force and time.time() - self._event_at < ttl:
+                return ev
+            fresh = await get_upcoming_event(self.session)
+            if fresh:
+                try:
+                    await attach_odds(self.session, fresh)
+                except Exception:  # noqa: BLE001
+                    log.debug("odds fetch failed", exc_info=True)
+                # keep last-known odds for fights whose line was pulled at lock
+                if ev and ev.get("id") == fresh.get("id"):
+                    old = {sc.fight_key(f): f for f in ev.get("fights", [])}
+                    for f in fresh.get("fights", []):
+                        o = old.get(sc.fight_key(f)) or {}
+                        for side in ("red_odds", "blue_odds"):
+                            if f.get(side) is None and o.get(side) is not None:
+                                f[side] = o[side]
+                self._event, self._event_at = fresh, time.time()
+            return self._event
+
+    async def images(self, urls) -> dict:
+        need = [u for u in dict.fromkeys(urls) if u and u not in self._images]
+
+        async def one(u):
+            try:
+                async with self.session.get(u, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    self._images[u] = await r.read() if r.status == 200 else None
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                self._images[u] = None
+
+        await asyncio.gather(*(one(u) for u in need))
+        if len(self._images) > 600:
+            self._images = {k: self._images[k] for k in list(self._images)[-300:]}
+        return {u: self._images.get(u) for u in urls if u}
+
+    async def _png(self, fn, *args) -> bytes:
+        return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
     @staticmethod
-    def _match_fighter(event: dict, fighter_name: str):
-        """Find (fight, picked, opponent) for a fighter name on the card, or (None, None, None)."""
-        q = _norm(fighter_name)
-        for fight in event.get("fights", []):
-            if q in _norm(fight["red"]):
-                return fight, fight["red"], fight["blue"]
-            if q in _norm(fight["blue"]):
-                return fight, fight["blue"], fight["red"]
+    def _meta(event: dict) -> dict:
+        return {"id": event["id"], "name": event["name"], "shortname": event["shortname"],
+                "date": event.get("date", ""), "date_compact": event.get("date_compact", "")}
+
+    @staticmethod
+    def _match_fighter(event: dict, name: str):
+        q = _norm(name)
+        if not q:
+            return None, None, None
+        for f in event.get("fights", []):
+            for side, other in (("red", "blue"), ("blue", "red")):
+                n = _norm(f[side])
+                if q == n or q in n or n.split()[-1] == q:
+                    return f, f[side], f[other]
         return None, None, None
 
-    # ── group ──────────────────────────────────────────────────────────────-
+    def _snapshot_odds(self, bucket: dict, fight: dict):
+        key = sc.fight_key(fight)
+        if fight.get("red_odds") is None and fight.get("blue_odds") is None:
+            return
+        bucket.setdefault("odds", {})[key] = {_norm(fight["red"]): fight.get("red_odds"),
+                                              _norm(fight["blue"]): fight.get("blue_odds")}
 
+    async def save_pick(self, guild, event, fight, user, picked: str):
+        key, uid = sc.fight_key(fight), str(user.id)
+        async with self.config.guild(guild).events() as evs:
+            b = evs.setdefault(event["id"], {"meta": {}, "picks": {}})
+            b["meta"] = self._meta(event)
+            b.setdefault("picks", {}).setdefault(key, {})[uid] = picked
+            self._snapshot_odds(b, fight)
+
+    async def save_method(self, guild, event, fight, user, method: Optional[str]):
+        key, uid = sc.fight_key(fight), str(user.id)
+        async with self.config.guild(guild).events() as evs:
+            b = evs.setdefault(event["id"], {"meta": self._meta(event), "picks": {}})
+            m = b.setdefault("methods", {}).setdefault(key, {})
+            if method is None:
+                m.pop(uid, None)
+            else:
+                method_key, _, rnd = method.partition(":")
+                m[uid] = {"method": method_key, "round": rnd or None}
+
+    async def _my_picks(self, guild, event, uid: str) -> dict:
+        b = (await self.config.guild(guild).events()).get(event["id"], {})
+        out = {}
+        for f in event.get("fights", []):
+            key = sc.fight_key(f)
+            pick = (b.get("picks", {}).get(key) or {}).get(uid)
+            m = (b.get("methods", {}).get(key) or {}).get(uid)
+            method = None
+            if m:
+                method = m["method"] if m["method"] == "dec" else f"{m['method']}:{m.get('round')}"
+            if pick:
+                out[key] = {"pick": pick, "method": method}
+        return out
+
+    async def _splits(self, guild, event) -> dict:
+        b = (await self.config.guild(guild).events()).get(event["id"], {})
+        out = {}
+        for f in event.get("fights", []):
+            fp = b.get("picks", {}).get(sc.fight_key(f)) or {}
+            r = sum(1 for v in fp.values() if _norm(v) == _norm(f["red"]))
+            out[sc.fight_key(f)] = (r, len(fp) - r)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Interactions
+    # ------------------------------------------------------------------ #
+    async def open_pick_editor(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("Picks live on a server.", ephemeral=True)
+        event = await self.get_event()
+        if not event:
+            return await interaction.response.send_message("Couldn't load the card right now.", ephemeral=True)
+        mine = await self._my_picks(interaction.guild, event, str(interaction.user.id))
+        editor = PickEditor(self, interaction.guild, interaction.user, event, mine)
+        if not editor.open_fights:
+            return await interaction.response.send_message("⏱️ Every fight on this card is locked.", ephemeral=True)
+        await interaction.response.send_message(editor.caption(), view=editor, ephemeral=True)
+
+    async def show_my_picks(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("Picks live on a server.", ephemeral=True)
+        event = await self.get_event()
+        if not event:
+            return await interaction.response.send_message("Couldn't load the card right now.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=await self._mine_embed(interaction.guild, event, interaction.user), ephemeral=True)
+
+    async def _mine_embed(self, guild, event, user) -> discord.Embed:
+        uid = str(user.id)
+        mine = await self._my_picks(guild, event, uid)
+        b = (await self.config.guild(guild).events()).get(event["id"], {})
+        lines = []
+        for f in event.get("fights", []):
+            key = sc.fight_key(f)
+            m = mine.get(key)
+            lock = "🔒 " if is_locked(f) else ""
+            if m:
+                how = f" · {sc.method_choice_label(m['method'])}" if m.get("method") else ""
+                bet = (b.get("bets", {}).get(key) or {}).get(uid)
+                bet_txt = f" · 💰 {bet['amount']:,} @ {sc.fmt_odds(bet.get('odds'))}" if bet else ""
+                lines.append(f"{lock}✅ **{m['pick']}**{how}{bet_txt}\n╰ vs {f['blue'] if m['pick'] == f['red'] else f['red']}")
+            else:
+                lines.append(f"{lock}⬜ {f['red']} vs {f['blue']}")
+        e = discord.Embed(title=f"📋 {user.display_name}'s picks · {event['shortname']}",
+                          description="\n".join(lines)[:4000] or "No fights.", color=embeds.UFC_BLUE)
+        e.set_footer(text="🔒 = locked · tap 'Make my picks' to change open fights")
+        return e
+
+    # ------------------------------------------------------------------ #
+    # Commands: info
+    # ------------------------------------------------------------------ #
     @commands.group(name="ufc", invoke_without_command=True)
-    async def ufc(self, ctx):
+    async def ufc(self, ctx: commands.Context):
+        """UFC cards, picks, betting and standings."""
         p = ctx.clean_prefix
-        e = discord.Embed(title="🥊  UFC Bot", color=0xD20A0A, description=(
-            f"`{p}ufc card` — upcoming fight card\n"
-            f"`{p}ufc results` — recent event results\n"
-            f"`{p}ufc fighter <name>` — fighter stats\n"
-            f"`{p}ufc pick <name>` — lock in your pick\n"
-            f"`{p}ufc picks` — server picks\n"
-            f"`{p}ufc bet <amount> <name>` — bet credits (win pays 2×)\n"
-            f"`{p}ufc unbet <name>` — cancel a bet & refund\n"
-            f"`{p}ufc bets` — your active bets\n"
-            f"`{p}ufc standings` — leaderboard (picks + money)\n"
+        e = discord.Embed(title="🥊  UFC Fight Night", color=embeds.UFC_RED, description=(
+            f"`{p}ufc card` — the card, with a **Make my picks** button\n"
+            f"`{p}ufc tape [fighter]` — Tale of the Tape (main event by default)\n"
+            f"`{p}ufc results` — last event's results\n"
+            f"`{p}ufc fighter <name>` — fighter card\n"
+            f"`{p}ufc pick <name> [ko 2|sub 1|dec]` — pick by typing instead\n"
+            f"`{p}ufc mypicks` · `{p}ufc picks` — yours / everyone's\n"
+            f"`{p}ufc bet <amount> <name>` — bet at the real odds · `{p}ufc unbet` · `{p}ufc bets`\n"
+            f"`{p}ufc standings [card|month|year|all]` — leaderboard\n\n"
+            "Fights lock when their part of the card starts. Results, scoring and payouts are automatic."
         ))
         await ctx.send(embed=e)
 
-    # ── card / results ───────────────────────────────────────────────────────
+    async def _send_card(self, destination, event: dict, guild: Optional[discord.Guild], content: str = None,
+                         ping=None):
+        splits = await self._splits(guild, event) if guild else None
+        imgs = await self.images(render.card_image_urls(event))
+        png = await self._png(render.render_card, event, imgs, splits)
+        segs = []
+        for seg, label in (("prelims2", "Early prelims"), ("prelims1", "Prelims"), ("main", "Main card")):
+            starts = [f["start"] for f in event.get("fights", []) if f.get("segment") == seg and f.get("start")]
+            if starts:
+                segs.append(f"{label} <t:{min(starts)}:t>")
+        text = content or f"## 🥊 {event['name']}"
+        if segs:
+            text += "\n" + " · ".join(segs) + f" · <t:{_first_start(event)}:R>"
+        text += "\n-# Tap **Make my picks**: winner + optional method & round. Each fight locks when its segment starts."
+        if ping:
+            text = f"{ping.mention}\n{text}"
+        return await destination.send(
+            text, file=png_file(png, "ufc-card"), view=self._card_view,
+            allowed_mentions=discord.AllowedMentions(roles=True) if ping else discord.AllowedMentions.none(),
+        )
 
     @ufc.command(name="card")
-    async def ufc_card(self, ctx):
-        try:
-            async with ctx.typing():
-                event = await get_upcoming_event(self.session)
+    @commands.cooldown(1, 15, commands.BucketType.channel)
+    async def ufc_card(self, ctx: commands.Context):
+        """The upcoming card as a poster, with buttons to make your picks."""
+        async with ctx.typing():
+            event = await self.get_event()
             if not event:
                 return await ctx.send(embed=embeds.error_embed(
-                    "Couldn't fetch the upcoming UFC card from ESPN right now.\n\n"
-                    f"Run `{ctx.clean_prefix}ufc apistatus` and send me the output."))
+                    f"Couldn't fetch the upcoming card from ESPN. `{ctx.clean_prefix}ufc apistatus` shows why."))
             try:
-                card = embeds.card_embed(event)
-            except Exception:
-                log.exception("Failed to build UFC card embed for event %s", event.get("id"))
-                # Keep the command useful even if ESPN slips in an unexpected field.
-                card = discord.Embed(
-                    title=f"🥊  {event.get('name') or 'Upcoming UFC Event'}",
-                    color=0xD20A0A,
-                    description=(
-                        f"📅  {event.get('date') or 'Date TBD'}\n"
-                        f"📍  {event.get('location') or 'Location TBD'}\n\n"
-                        "ESPN returned the event, but one or more bout fields could not be formatted."
-                    ),
-                )
-                card.set_footer(text="UFC • via ESPN")
-            await ctx.send(embed=card)
-        except Exception:
-            log.exception("Unexpected error in ufc card")
-            await ctx.send(embed=embeds.error_embed(
-                "ESPN responded, but the card data could not be parsed. "
-                "Check the Red console for `Unexpected error in ufc card`."))
+                await self._send_card(ctx, event, ctx.guild)
+            except Exception:  # noqa: BLE001
+                log.exception("card render failed")
+                await ctx.send(embed=embeds.card_embed(event), view=self._card_view)
+
+    @ufc.command(name="tape", aliases=["taleofthetape", "tott"])
+    @commands.cooldown(1, 10, commands.BucketType.channel)
+    async def ufc_tape(self, ctx: commands.Context, *, fighter: str = None):
+        """Tale of the Tape for the main event, or the fight with this fighter."""
+        async with ctx.typing():
+            event = await self.get_event()
+            if not event or not event.get("fights"):
+                return await ctx.send(embed=embeds.error_embed("No card available right now."))
+            fight = event["fights"][0]
+            if fighter:
+                fight, _, _ = self._match_fighter(event, fighter)
+                if not fight:
+                    return await ctx.send(embed=embeds.error_embed(f"**{fighter}** isn't on this card."))
+            imgs = await self.images(render.tape_image_urls(fight))
+            png = await self._png(render.render_tape, fight, event["shortname"], imgs)
+        await ctx.send(file=png_file(png, "tale-of-the-tape"))
+
+    @ufc.command(name="results")
+    @commands.cooldown(1, 15, commands.BucketType.channel)
+    async def ufc_results(self, ctx: commands.Context, date: str = None):
+        """Results of the most recent event (or `YYYY-MM-DD`)."""
+        async with ctx.typing():
+            if date:
+                event = await get_event_on_date(self.session, date.replace("-", "").replace("/", ""))
+            else:
+                event = await get_recent_event(self.session)
+            if not event:
+                return await ctx.send(embed=embeds.error_embed("Couldn't fetch results right now."))
+            try:
+                imgs = await self.images(render.card_image_urls(event))
+                png = await self._png(render.render_card, event, imgs, None)
+                await ctx.send(f"## 📊 Results · {event['name']}", file=png_file(png, "ufc-results"))
+            except Exception:  # noqa: BLE001
+                log.exception("results render failed")
+                await ctx.send(embed=embeds.results_embed(event))
+
+    @ufc.command(name="fighter")
+    @commands.cooldown(2, 10, commands.BucketType.user)
+    async def ufc_fighter(self, ctx: commands.Context, *, name: str):
+        """A fighter card: record, bio and recent fights."""
+        async with ctx.typing():
+            f = await get_fighter(self.session, name)
+            if not f:
+                return await ctx.send(embed=embeds.error_embed(
+                    f"Couldn't find **{name}**. Try their full fight name, e.g. `Jon Jones`."))
+            try:
+                imgs = await self.images([f.get("headshot")])
+                png = await self._png(render.render_fighter, f, imgs)
+                await ctx.send(file=png_file(png, "fighter"))
+            except Exception:  # noqa: BLE001
+                log.exception("fighter render failed")
+                await ctx.send(embed=embeds.fighter_embed(f))
 
     @ufc.command(name="apistatus")
     @checks.admin_or_permissions(administrator=True)
-    async def ufc_apistatus(self, ctx):
-        """Test the ESPN endpoints used by the cog and report failures in Discord."""
+    async def ufc_apistatus(self, ctx: commands.Context):
+        """Test the ESPN endpoints and report failures."""
         async with ctx.typing():
             results = await espn_api_status(self.session)
         lines = [f"aiohttp: {getattr(aiohttp, '__version__', 'unknown')}"]
         healthy = True
         for label, ok, detail in results:
-            legacy = "(legacy)" in label
-            if ok:
-                state = "OK"
-            elif legacy:
-                state = "WARN"
-            else:
-                state = "FAIL"
-                healthy = False
+            state = "OK" if ok else ("WARN" if "(legacy)" in label else "FAIL")
+            healthy &= ok or "(legacy)" in label
             lines.append(f"{state} {label}: {detail}")
-        text = "\n".join(lines)
-        e = discord.Embed(
-            title="🥊 UFC API Status",
-            description=f"```text\n{text[:3800]}\n```",
-            color=0x2ECC71 if healthy else 0xE67E22,
-        )
-        e.set_footer(text="ESPN endpoint diagnostics • safe to paste back here")
-        await ctx.send(embed=e)
+        await ctx.send(embed=discord.Embed(title="🥊 UFC API Status", description=box("\n".join(lines)[:3800]),
+                                           color=0x2ECC71 if healthy else 0xE67E22))
 
-    @ufc.command(name="results")
-    async def ufc_results(self, ctx):
-        async with ctx.typing():
-            event = await get_recent_event(self.session)
-        if not event:
-            return await ctx.send(embed=embeds.error_embed(
-                "Couldn't fetch recent results right now. Try again shortly."))
-        await ctx.send(embed=embeds.results_embed(event))
-
-    # ── fighter ────────────────────────────────────────────────────────────-
-
-    @ufc.command(name="fighter")
-    async def ufc_fighter(self, ctx, *, name: str):
-        """Look up a fighter's stats and recent fights. Example: !ufc fighter Jon Jones"""
-        async with ctx.typing():
-            f = await get_fighter(self.session, name)
-        if not f:
-            return await ctx.send(embed=embeds.error_embed(
-                f"Couldn't find **{name}**.\n\n"
-                "• Use their full name (`Jon Jones`, not `Jones`)\n"
-                "• Check the spelling / use their official fight name"))
-        await ctx.send(embed=embeds.fighter_embed(f))
-
-    # ── pick ───────────────────────────────────────────────────────────────-
-
+    # ------------------------------------------------------------------ #
+    # Commands: picks & bets
+    # ------------------------------------------------------------------ #
     @ufc.command(name="pick")
-    async def ufc_pick(self, ctx, *, fighter_name: str):
-        """Lock in your pick for a fight on the upcoming card. Example: !ufc pick Jon Jones"""
-        async with ctx.typing():
-            event = await get_upcoming_event(self.session)
+    @commands.guild_only()
+    async def ufc_pick(self, ctx: commands.Context, *, pick: str):
+        """Pick a fighter by typing. Add a bonus: `ko 2`, `sub 1` or `dec`.
+
+        Examples: `[p]ufc pick Gane` · `[p]ufc pick Gane ko 2` · `[p]ufc pick Harrison dec`
+        """
+        name, method = _parse_pick(pick)
+        event = await self.get_event()
         if not event:
+            return await ctx.send(embed=embeds.error_embed("Couldn't fetch the upcoming card."))
+        fight, picked, opponent = self._match_fighter(event, name)
+        if not fight:
             return await ctx.send(embed=embeds.error_embed(
-                "Couldn't fetch the upcoming card to match your pick."))
+                f"**{name}** isn't on the upcoming card. See `{ctx.clean_prefix}ufc card`."))
+        if is_locked(fight):
+            return await ctx.send(embed=embeds.error_embed(f"⏱️ **{fight['red']} vs {fight['blue']}** has started, picks are locked."))
+        if method and method != "dec" and int(method.split(":")[1]) > (fight.get("rounds") or 3):
+            return await ctx.send(embed=embeds.error_embed(f"That fight is only {fight.get('rounds') or 3} rounds."))
+        await self.save_pick(ctx.guild, event, fight, ctx.author, picked)
+        if method:
+            await self.save_method(ctx.guild, event, fight, ctx.author, method)
+        how = f" by **{sc.method_choice_label(method)}**" if method else ""
+        odds = fight.get("red_odds" if picked == fight["red"] else "blue_odds")
+        await ctx.send(f"✅ {ctx.author.mention} picked **{picked}**{how} over {opponent}"
+                       + (f" ({sc.fmt_odds(odds)})" if odds is not None else ""),
+                       allowed_mentions=discord.AllowedMentions.none())
 
-        matched, picked, opponent = self._match_fighter(event, fighter_name)
+    @ufc.command(name="mypicks")
+    @commands.guild_only()
+    async def ufc_mypicks(self, ctx: commands.Context):
+        """Your picks for the upcoming card."""
+        event = await self.get_event()
+        if not event:
+            return await ctx.send(embed=embeds.error_embed("Couldn't fetch the upcoming card."))
+        await ctx.send(embed=await self._mine_embed(ctx.guild, event, ctx.author), view=self._card_view)
 
-        if not matched:
-            return await ctx.send(embed=embeds.error_embed(
-                f"**{fighter_name}** isn't on the upcoming card.\n"
-                f"Use `{ctx.clean_prefix}ufc card` to see current matchups."))
-
-        if matched.get("completed") or matched.get("winner"):
-            return await ctx.send(embed=embeds.error_embed(
-                f"That fight (**{matched['red']}** vs **{matched['blue']}**) has "
-                "already happened — picks for it are locked."))
-
-        fight_key = f"{matched['red']}|{matched['blue']}"
-        eid = event["id"]
-        uid = str(ctx.author.id)
-
-        async with self.config.guild(ctx.guild).events() as evs:
-            bucket = evs.setdefault(eid, {"meta": {}, "picks": {}})
-            bucket["meta"] = {
-                "id": eid,
-                "name": event["name"],
-                "shortname": event["shortname"],
-                "date": event.get("date", ""),
-                "date_compact": event.get("date_compact", ""),
-            }
-            bucket["picks"].setdefault(fight_key, {})
-            old = bucket["picks"][fight_key].get(uid)
-            bucket["picks"][fight_key][uid] = picked
-
-        if old and old != picked:
-            await ctx.send(f"🔄 {ctx.author.mention} changed pick: **{old}** → **{picked}**")
-        else:
-            await ctx.send(embed=embeds.pick_confirm_embed(
-                ctx.author, picked, opponent, event["shortname"]))
-
-    # ── bet ────────────────────────────────────────────────────────────────-
+    @ufc.command(name="picks")
+    @commands.guild_only()
+    async def ufc_picks(self, ctx: commands.Context):
+        """Everyone's picks for the upcoming card."""
+        event = await self.get_event()
+        evs = await self.config.guild(ctx.guild).events()
+        if not event:
+            return await ctx.send(embed=embeds.error_embed("Couldn't fetch the upcoming card."))
+        picks = dict(evs.get(event["id"], {}).get("picks", {}))
+        for k, v in (await self.config.guild(ctx.guild).picks() or {}).items():
+            picks.setdefault(k, {}).update(v)
+        await ctx.send(embed=embeds.picks_embed(event, picks, ctx.guild), view=self._card_view)
 
     @ufc.command(name="bet")
-    async def ufc_bet(self, ctx, amount: int, *, fighter_name: str):
-        """Bet credits on a fighter (1:1, win pays double). Also sets your pick.
+    @commands.guild_only()
+    async def ufc_bet(self, ctx: commands.Context, amount: int, *, fighter_name: str):
+        """Bet credits on a fighter at the current odds (also sets your pick).
 
-        Example: !ufc bet 100 Jon Jones
-        Max 3 active bets per card. Re-betting the same fight adjusts your stake.
+        `+250` underdog: 100 returns 350 · `-300` favourite: 100 returns 133.
+        Max 3 bets per card. Betting the same fight again changes your stake.
         """
         if amount <= 0:
             return await ctx.send(embed=embeds.error_embed("Bet amount must be positive."))
-
-        async with ctx.typing():
-            event = await get_upcoming_event(self.session)
+        event = await self.get_event()
         if not event:
-            return await ctx.send(embed=embeds.error_embed(
-                "Couldn't fetch the upcoming card to match your bet."))
-
-        matched, picked, opponent = self._match_fighter(event, fighter_name)
-        if not matched:
-            return await ctx.send(embed=embeds.error_embed(
-                f"**{fighter_name}** isn't on the upcoming card.\n"
-                f"Use `{ctx.clean_prefix}ufc card` to see current matchups."))
-        if matched.get("completed") or matched.get("winner"):
-            return await ctx.send(embed=embeds.error_embed(
-                f"That fight (**{matched['red']}** vs **{matched['blue']}**) has "
-                "already happened — betting is locked."))
-
-        fight_key = f"{matched['red']}|{matched['blue']}"
-        eid = event["id"]
-        uid = str(ctx.author.id)
+            return await ctx.send(embed=embeds.error_embed("Couldn't fetch the upcoming card."))
+        fight, picked, opponent = self._match_fighter(event, fighter_name)
+        if not fight:
+            return await ctx.send(embed=embeds.error_embed(f"**{fighter_name}** isn't on the upcoming card."))
+        if is_locked(fight):
+            return await ctx.send(embed=embeds.error_embed("⏱️ That fight has started, betting is locked."))
+        key, eid, uid = sc.fight_key(fight), event["id"], str(ctx.author.id)
+        odds = fight.get("red_odds" if picked == fight["red"] else "blue_odds")
         currency = await bank.get_currency_name(ctx.guild)
-
-        evs = await self.config.guild(ctx.guild).events()
-        bucket = evs.get(eid, {})
-        bets = bucket.get("bets", {})
-
-        existing = bets.get(fight_key, {}).get(uid)
-        prev_amount = existing["amount"] if existing else 0
-
-        distinct_fights = {fk for fk, ub in bets.items() if uid in ub}
-        if fight_key not in distinct_fights and len(distinct_fights) >= MAX_BETS:
+        bets = (await self.config.guild(ctx.guild).events()).get(eid, {}).get("bets", {})
+        existing = (bets.get(key) or {}).get(uid)
+        prev = existing["amount"] if existing else 0
+        slots = {k for k, ub in bets.items() if uid in ub}
+        if key not in slots and len(slots) >= MAX_BETS:
             return await ctx.send(embed=embeds.error_embed(
-                f"You're at the **{MAX_BETS}-bet max** for this card.\n"
-                f"Use `{ctx.clean_prefix}ufc unbet <fighter>` to free a slot first."))
-
-        delta = amount - prev_amount
+                f"You're at the **{MAX_BETS}-bet max** for this card. `{ctx.clean_prefix}ufc unbet <fighter>` frees a slot."))
+        delta = amount - prev
         if delta > 0:
             if not await bank.can_spend(ctx.author, delta):
                 bal = await bank.get_balance(ctx.author)
                 return await ctx.send(embed=embeds.error_embed(
-                    f"Not enough {currency}. You have **{bal:,}**, "
-                    f"need **{delta:,}** more for this bet."))
+                    f"Not enough {currency}. You have **{bal:,}**, need **{delta:,}** more."))
             await bank.withdraw_credits(ctx.author, delta)
         elif delta < 0:
             await bank.deposit_credits(ctx.author, -delta)
-
-        async with self.config.guild(ctx.guild).events() as evs_w:
-            b = evs_w.setdefault(eid, {"meta": {}, "picks": {}, "bets": {}})
-            b["meta"] = {
-                "id": eid, "name": event["name"], "shortname": event["shortname"],
-                "date": event.get("date", ""), "date_compact": event.get("date_compact", ""),
-            }
-            b.setdefault("bets", {}).setdefault(fight_key, {})[uid] = {
-                "pick": picked, "amount": amount,
-            }
-            b.setdefault("picks", {}).setdefault(fight_key, {})[uid] = picked
-
-        cur_bets = (await self.config.guild(ctx.guild).events())[eid]["bets"]
-        slots_left = MAX_BETS - len({fk for fk, ub in cur_bets.items() if uid in ub})
-
-        await ctx.send(embed=embeds.bet_confirm_embed(
-            ctx.author, picked, opponent, amount, event["shortname"],
-            currency=currency, slots_left=slots_left,
-            changed_from=prev_amount if existing else None))
-
-    # ── unbet ──────────────────────────────────────────────────────────────-
+        async with self.config.guild(ctx.guild).events() as evs:
+            b = evs.setdefault(eid, {"meta": {}, "picks": {}})
+            b["meta"] = self._meta(event)
+            b.setdefault("bets", {}).setdefault(key, {})[uid] = {"pick": picked, "amount": amount, "odds": odds}
+            b.setdefault("picks", {}).setdefault(key, {})[uid] = picked
+            self._snapshot_odds(b, fight)
+        ret = sc.payout(amount, odds)
+        e = discord.Embed(title=f"💰 Bet locked: {picked}", color=embeds.GREEN, description=(
+            f"**{amount:,} {currency}** on **{picked}** over {opponent}\n"
+            f"Odds **{sc.fmt_odds(odds)}** → a win returns **{ret:,} {currency}** (+{ret - amount:,})"
+            + (f"\n-# Changed from {prev:,}" if existing else "")
+            + ("" if odds is not None else "\n-# No line yet, so this pays even money (2×).")
+        ))
+        e.set_footer(text=f"{MAX_BETS - len(slots | {key})} bet slot(s) left on {event['shortname']}")
+        await ctx.send(embed=e)
 
     @ufc.command(name="unbet")
-    async def ufc_unbet(self, ctx, *, fighter_name: str):
-        """Cancel a bet, get refunded, and free the slot. Example: !ufc unbet Jon Jones"""
-        async with ctx.typing():
-            event = await get_upcoming_event(self.session)
+    @commands.guild_only()
+    async def ufc_unbet(self, ctx: commands.Context, *, fighter_name: str):
+        """Cancel a bet before the fight starts and get refunded."""
+        event = await self.get_event()
         if not event:
-            return await ctx.send(embed=embeds.error_embed(
-                "Couldn't fetch the upcoming card."))
-
-        matched, picked, _ = self._match_fighter(event, fighter_name)
-        if not matched:
-            return await ctx.send(embed=embeds.error_embed(
-                f"**{fighter_name}** isn't on the upcoming card."))
-        if matched.get("completed") or matched.get("winner"):
-            return await ctx.send(embed=embeds.error_embed(
-                "That fight already happened — the bet can't be cancelled."))
-
-        fight_key = f"{matched['red']}|{matched['blue']}"
-        eid = event["id"]
-        uid = str(ctx.author.id)
-        currency = await bank.get_currency_name(ctx.guild)
-
-        evs = await self.config.guild(ctx.guild).events()
-        bet = evs.get(eid, {}).get("bets", {}).get(fight_key, {}).get(uid)
+            return await ctx.send(embed=embeds.error_embed("Couldn't fetch the upcoming card."))
+        fight, _, _ = self._match_fighter(event, fighter_name)
+        if not fight:
+            return await ctx.send(embed=embeds.error_embed(f"**{fighter_name}** isn't on the upcoming card."))
+        if is_locked(fight):
+            return await ctx.send(embed=embeds.error_embed("⏱️ That fight has started, the bet stands."))
+        key, eid, uid = sc.fight_key(fight), event["id"], str(ctx.author.id)
+        async with self.config.guild(ctx.guild).events() as evs:
+            ub = evs.get(eid, {}).get("bets", {}).get(key) or {}
+            bet = ub.pop(uid, None)
         if not bet:
-            return await ctx.send(embed=embeds.error_embed(
-                "You don't have a bet on that fight."))
-
-        refund = bet["amount"]
-        bet_pick = bet.get("pick", picked)
-        await bank.deposit_credits(ctx.author, refund)
-
-        async with self.config.guild(ctx.guild).events() as evs_w:
-            b = evs_w.get(eid, {})
-            if fight_key in b.get("bets", {}) and uid in b["bets"][fight_key]:
-                del b["bets"][fight_key][uid]
-                if not b["bets"][fight_key]:
-                    del b["bets"][fight_key]
-            if fight_key in b.get("picks", {}) and uid in b["picks"][fight_key]:
-                del b["picks"][fight_key][uid]
-                if not b["picks"][fight_key]:
-                    del b["picks"][fight_key]
-
-        used = len({fk for fk, ub in
-               (await self.config.guild(ctx.guild).events()).get(eid, {}).get("bets", {}).items()
-               if uid in ub})
-        await ctx.send(embed=embeds.unbet_embed(
-            ctx.author, bet_pick, refund, currency=currency, slots_left=MAX_BETS - used))
-
-    # ── bets ───────────────────────────────────────────────────────────────-
+            return await ctx.send(embed=embeds.error_embed("You don't have a bet on that fight."))
+        await bank.deposit_credits(ctx.author, bet["amount"])
+        currency = await bank.get_currency_name(ctx.guild)
+        await ctx.send(f"↩️ Cancelled your bet on **{bet['pick']}** and refunded **{bet['amount']:,} {currency}**. "
+                       "Your pick still stands.")
 
     @ufc.command(name="bets")
-    async def ufc_bets(self, ctx):
-        """Show your active bets for the upcoming card."""
-        async with ctx.typing():
-            event = await get_upcoming_event(self.session)
-            evs = await self.config.guild(ctx.guild).events()
+    @commands.guild_only()
+    async def ufc_bets(self, ctx: commands.Context):
+        """Your open bets and what they'd pay."""
+        event = await self.get_event()
+        evs = await self.config.guild(ctx.guild).events()
         currency = await bank.get_currency_name(ctx.guild)
         uid = str(ctx.author.id)
-
-        my_bets = []
+        lines = []
+        for eid, b in evs.items():
+            for key, ub in (b.get("bets") or {}).items():
+                bet = ub.get(uid)
+                if bet:
+                    ret = sc.payout(bet["amount"], bet.get("odds"))
+                    lines.append(f"💰 **{bet['pick']}** · {bet['amount']:,} @ {sc.fmt_odds(bet.get('odds'))} "
+                                 f"→ returns **{ret:,}**\n╰ {b.get('meta', {}).get('shortname', '')}")
+        e = discord.Embed(title=f"💰 {ctx.author.display_name}'s bets", color=embeds.UFC_GOLD,
+                          description="\n".join(lines) or "No open bets.")
         if event:
-            bets = evs.get(event["id"], {}).get("bets", {})
-            for fight_key, ub in bets.items():
-                if uid in ub:
-                    red, blue = fight_key.split("|", 1)
-                    pick = ub[uid]["pick"]
-                    opp = blue if pick == red else red
-                    my_bets.append({"fighter": pick, "opponent": opp,
-                                    "amount": ub[uid]["amount"]})
-        await ctx.send(embed=embeds.bets_embed(
-            ctx.author, my_bets, currency=currency, max_bets=MAX_BETS))
+            e.set_footer(text=f"Max {MAX_BETS} per card · amounts in {currency}")
+        await ctx.send(embed=e)
 
-    # ── picks ──────────────────────────────────────────────────────────────-
-
-    @ufc.command(name="picks")
-    async def ufc_picks(self, ctx):
-        """Show everyone's picks for the upcoming event."""
+    # ------------------------------------------------------------------ #
+    # Standings
+    # ------------------------------------------------------------------ #
+    @ufc.command(name="standings", aliases=["leaderboard", "lb"])
+    @commands.guild_only()
+    @commands.cooldown(1, 10, commands.BucketType.channel)
+    async def ufc_standings(self, ctx: commands.Context, period: str = "all"):
+        """Pick'em leaderboard: `card` (last event), `month`, `year` or `all`."""
+        g = await self.config.guild(ctx.guild).all()
+        now = datetime.now(timezone.utc)
+        period = period.lower()
+        betting = {}
+        if period in ("card", "last", "event"):
+            table = (g["last_card"] or {}).get("scores", {})
+            title, sub = "Last card", (g["last_card"] or {}).get("name", "No finished card yet")
+            betting = table
+        elif period in ("month", "monthly"):
+            table, title, sub = g["periods"].get(now.strftime("%Y-%m"), {}), "Monthly standings", now.strftime("%B %Y")
+            betting = table
+        elif period in ("year", "season", "yearly"):
+            table, title, sub = g["periods"].get(now.strftime("%Y"), {}), "Season standings", now.strftime("%Y season")
+            betting = table
+        else:
+            table, title, sub = g["standings"], "All-time standings", "Every card since the start"
+            betting = g["betting"]
+        rows = []
+        for uid, s in table.items():
+            if not s.get("total"):
+                continue
+            m = ctx.guild.get_member(int(uid))
+            up = s.get("best_upset")
+            rows.append({
+                "name": m.display_name if m else f"User {uid[-4:]}",
+                "points": sc.points(s), "correct": s.get("correct", 0), "total": s.get("total", 0),
+                "bonus": s.get("bonus", 0), "net": (betting.get(uid) or {}).get("net", 0),
+                "best_upset": f"Best upset: {up['fighter']} {sc.fmt_odds(up['ml'])}" if up else "",
+            })
+        rows.sort(key=lambda r: (-r["points"], -r["correct"], r["name"].lower()))
+        currency = await bank.get_currency_name(ctx.guild)
         async with ctx.typing():
-            event = await get_upcoming_event(self.session)
-            evs = await self.config.guild(ctx.guild).events()
-            legacy = await self.config.guild(ctx.guild).picks()
+            png = await self._png(render.render_standings, title, f"{sub} · {len(rows)} player(s)", rows[:20], currency)
+        await ctx.send(file=png_file(png, "standings"))
 
-        # If ESPN is unreachable, fall back to the most recent stored event
-        # bucket so picks still display from saved data.
-        if not event:
-            if evs:
-                eid = max(evs, key=lambda k: evs[k].get("meta", {}).get("date_compact", ""))
-                meta = evs[eid].get("meta", {})
-                event = {"shortname": meta.get("shortname", "Event"),
-                         "name": meta.get("name", "Event"),
-                         "date": meta.get("date", "TBD"), "fights": [], "id": eid}
-            else:
-                event = {"shortname": "Upcoming Event", "name": "Upcoming Event",
-                         "date": "TBD", "fights": [], "id": ""}
+    # ------------------------------------------------------------------ #
+    # Settling (automatic + manual)
+    # ------------------------------------------------------------------ #
+    async def process_event(self, guild: discord.Guild, event: dict, announce: bool) -> list:
+        """Settle every newly-finished fight of `event` for this guild. Returns summaries."""
+        eid = event["id"]
+        summaries = []
+        async with self.config.guild(guild).events() as evs:
+            bucket = evs.get(eid)
+            if bucket is None:
+                if not announce:
+                    return []
+                bucket = evs.setdefault(eid, {"meta": self._meta(event), "picks": {}})
+            settled = set(bucket.get("settled", []))
+            for f in event.get("fights", []):
+                if not f.get("completed") or sc.fight_key(f) in settled:
+                    continue
+                s = sc.settle_fight(bucket, f)
+                if s is not None and (s["total"] or s["bets"] or s["refunds"] or announce):
+                    summaries.append(s)
+            for f in event.get("fights", []):
+                if not is_locked(f):
+                    self._snapshot_odds(bucket, f)
+        if summaries:
+            await self._apply(guild, event, summaries)
+        return summaries
 
-        bucket = evs.get(event.get("id", ""), {})
-        picks = dict(bucket.get("picks", {}))
-        for k, v in (legacy or {}).items():
-            picks.setdefault(k, {}).update(v)
+    async def _apply(self, guild, event, summaries):
+        conf = self.config.guild(guild)
+        month = (event.get("date_compact") or datetime.now(timezone.utc).strftime("%Y%m%d"))
+        keys = (f"{month[:4]}-{month[4:6]}", month[:4])
+        async with conf.standings() as st, conf.betting() as bt, conf.periods() as per:
+            for s in summaries:
+                sc.merge_into(st, s["deltas"])
+                for k in keys:
+                    sc.merge_into(per.setdefault(k, {}), s["deltas"], keys=("correct", "total", "bonus", "net"))
+                for uid, d in s["deltas"].items():
+                    if d.get("won") or d.get("lost"):
+                        b = bt.setdefault(uid, {"net": 0, "won": 0, "lost": 0})
+                        b["net"] += d["net"]
+                        b["won"] += d["won"]
+                        b["lost"] += d["lost"]
+        for s in summaries:
+            for uid, _pick, amount, paid, won, _odds in s["bets"]:
+                if won and paid:
+                    await self._deposit(guild, uid, paid)
+            for uid, amount in s["refunds"]:
+                await self._deposit(guild, uid, amount)
 
-        await ctx.send(embed=embeds.picks_embed(event, picks, ctx.guild))
+    async def _deposit(self, guild, uid, amount):
+        member = guild.get_member(int(uid))
+        if member and amount > 0:
+            try:
+                await bank.deposit_credits(member, amount)
+            except Exception:  # noqa: BLE001
+                log.warning("couldn't pay %s %s in %s", amount, uid, guild.id)
 
-    # ── standings ────────────────────────────────────────────────────────────
+    def _name(self, guild, uid):
+        m = guild.get_member(int(uid))
+        return m.display_name if m else f"User {uid[-4:]}"
 
-    @ufc.command(name="standings")
-    async def ufc_standings(self, ctx):
-        standings = await self.config.guild(ctx.guild).standings()
-        evs = await self.config.guild(ctx.guild).events()
-        legacy = await self.config.guild(ctx.guild).picks()
-        betting = await self.config.guild(ctx.guild).betting()
-        pending = sum(len(fp) for b in evs.values() for fp in b.get("picks", {}).values())
-        pending += sum(len(v) for v in (legacy or {}).values())
-        await ctx.send(embed=embeds.standings_embed(
-            standings, ctx.guild, pending, betting=betting))
+    async def result_embed(self, guild, s: dict) -> discord.Embed:
+        f = s["fight"]
+        currency = await bank.get_currency_name(guild)
+        if s["void"]:
+            e = discord.Embed(title=f"⚪ {f['red']} vs {f['blue']}: {f.get('method') or 'No decision'}",
+                              description="No winner, so picks are voided and bets refunded.", color=embeds.GREY)
+            return e
+        loser = f["blue"] if f["winner"] == f["red"] else f["red"]
+        how = f.get("method") or "Final"
+        if f.get("method_detail"):
+            how += f" ({f['method_detail']})"
+        if f.get("method_key") in ("ko", "sub"):
+            how += f" · R{f.get('round')} {f.get('time', '')}"
+        e = discord.Embed(title=f"🥊 {f['winner']} def. {loser}", description=how, color=embeds.UFC_RED)
+        info = f.get("red_info") if f["winner"] == f["red"] else f.get("blue_info")
+        if info and info.get("headshot"):
+            e.set_thumbnail(url=info["headshot"])
+        if s["total"]:
+            right = [self._name(guild, u) + (" 🎯" * b) for u, _p, ok, b in s["pickers"] if ok]
+            text = f"**{s['called']}/{s['total']}** called it"
+            if right:
+                text += ": " + ", ".join(right[:12]) + (" …" if len(right) > 12 else "")
+            e.add_field(name="🗳️ Pick'em", value=text, inline=False)
+        if s["upsets"]:
+            e.add_field(name="🐶 Upset called!", value=", ".join(
+                f"{self._name(guild, u)} ({sc.fmt_odds(ml)})" for u, _p, ml in s["upsets"]), inline=False)
+        if s["bets"]:
+            e.add_field(name="💰 Bets", value="\n".join(
+                f"{'💸' if won else '📉'} {self._name(guild, u)}: "
+                + (f"+{paid - amt:,}" if won else f"−{amt:,}") + f" {currency}"
+                for u, _p, amt, paid, won, _o in s["bets"]), inline=False)
+        e.set_footer(text="🎯 = nailed the method/round bonus")
+        return e
 
-    # ── settle ─────────────────────────────────────────────────────────────-
+    async def recap_embed(self, guild, event, bucket) -> Optional[discord.Embed]:
+        scores = bucket.get("scores") or {}
+        if not scores:
+            return None
+        ranked = sorted(scores.items(), key=lambda kv: (-sc.points(kv[1]), -kv[1].get("correct", 0)))
+        e = discord.Embed(title=f"🏆 {event['shortname']} pick'em results", color=embeds.UFC_GOLD)
+        lines = []
+        for i, (uid, s) in enumerate(ranked[:10]):
+            place = MEDALS[i] if i < 3 else f"`{i + 1}.`"
+            net = s.get("net", 0)
+            money = f" · {'+' if net >= 0 else '−'}{abs(net):,}" if (s.get("won") or s.get("lost")) else ""
+            bonus = f", +{s['bonus']} bonus" if s.get("bonus") else ""
+            lines.append(f"{place} **{self._name(guild, uid)}** — {sc.points(s)} pts "
+                         f"({s.get('correct', 0)}/{s.get('total', 0)}{bonus}){money}")
+        e.description = "\n".join(lines)
+        winner_uid, best = ranked[0]
+        e.add_field(name="👑 Card champion", value=f"**{self._name(guild, winner_uid)}** with {sc.points(best)} points",
+                    inline=False)
+        upsets = [(uid, s["best_upset"]) for uid, s in scores.items() if s.get("best_upset")]
+        if upsets:
+            uid, up = max(upsets, key=lambda x: x[1]["ml"])
+            e.add_field(name="🐶 Best upset call", value=f"{self._name(guild, uid)}: **{up['fighter']}** ({sc.fmt_odds(up['ml'])})",
+                        inline=False)
+        e.set_footer(text="See the full table with `ufc standings card`")
+        return e
 
     @ufc.command(name="settle")
     @checks.admin_or_permissions(manage_guild=True)
-    async def ufc_settle(self, ctx, date: str = None):
-        """[Admin] Score picks against results and update standings.
+    @commands.guild_only()
+    async def ufc_settle(self, ctx: commands.Context, date: str = None):
+        """[Admin] Settle finished fights now (normally automatic).
 
-        Normally just run `!ufc settle` after an event — it settles each event
-        you have picks for, fetching that exact card's results by date.
-
-        To force-settle everything against a specific past card, pass its date:
-            !ufc settle 2024-04-13
+        Also clears out cards that are long finished and refunds any bets on fights that never happened.
+        Pass a date (`YYYY-MM-DD`) to settle that day's card.
         """
         guild = ctx.guild
-
         async with ctx.typing():
             evs = await self.config.guild(guild).events()
-            legacy = await self.config.guild(guild).picks()
-
-            if not evs and not legacy:
-                return await ctx.send("No picks to settle.")
-
-            total_deltas = {}
-            settled_names = []
-            resolved_by_event = {}
-            resolved_legacy = []
-            total_payouts = {}        # uid -> credits to deposit
-            bet_outcomes = {}         # uid -> {net, won, lost}
-            resolved_bets_by_event = {}
-            stale_events = set()
-            stale_pick_count = 0
-            stale_refunds = {}       # uid -> stake returned for orphaned old bets
-
             if date:
-                ymd = date.replace("-", "").replace("/", "")
-                results = await get_event_on_date(self.session, ymd)
-                if not results:
-                    return await ctx.send(embed=embeds.error_embed(
-                        f"No UFC event found on **{date}**. "
-                        "Use the event date as `YYYY-MM-DD`."))
-                settled_names.append(results["shortname"])
-                for eid, bucket in evs.items():
-                    # A forced date must never score unrelated event buckets.
-                    # Prefer the exact ESPN event id; the stored date is only a
-                    # migration fallback for older buckets.
-                    meta = bucket.get("meta", {})
-                    stored_date = str(meta.get("date_compact", "") or "")
-                    if str(eid) != str(results.get("id", "")) and stored_date not in {
-                        ymd, str(results.get("date_compact", "") or "")
-                    }:
-                        continue
-                    d, r = _score_picks(bucket.get("picks", {}), results)
-                    _merge_deltas(total_deltas, d)
-                    resolved_by_event.setdefault(eid, []).extend(r)
-                    p, o, br = _score_bets(bucket.get("bets", {}), results)
-                    _merge_payouts(total_payouts, p)
-                    _merge_outcomes(bet_outcomes, o)
-                    resolved_bets_by_event.setdefault(eid, []).extend(br)
-                if legacy:
-                    d, r = _score_picks(legacy, results)
-                    _merge_deltas(total_deltas, d)
-                    resolved_legacy.extend(r)
+                ev = await get_event_on_date(self.session, date.replace("-", "").replace("/", ""))
+                if not ev:
+                    return await ctx.send(embed=embeds.error_embed(f"No UFC event found on **{date}**."))
+                targets = [ev]
             else:
-                for eid, bucket in evs.items():
-                    meta = bucket.get("meta", {})
-                    ymd = meta.get("date_compact", "")
-                    # Exact-id lookup only. Never score a bucket against a
-                    # different event merely because it occurred on the same day.
-                    results = await get_event_by_id(self.session, eid, ymd)
-                    if not results:
-                        # This is the case that used to leave old picks/bets
-                        # stuck forever: once ESPN stopped returning the card,
-                        # settle simply skipped the bucket. If the stored card
-                        # is safely expired, void it and refund all open bets.
-                        if _event_is_stale(meta):
-                            stale_pick_count += sum(
-                                1 for _fight_key, _uid, _picked
-                                in _all_entries(bucket.get("picks", {}))
-                            )
-                            for _fight_key, uid, bet in _all_entries(bucket.get("bets", {})):
-                                amount = int((bet or {}).get("amount", 0) or 0)
-                                if amount > 0:
-                                    stale_refunds[uid] = stale_refunds.get(uid, 0) + amount
-                            stale_events.add(eid)
-                            settled_names.append(meta.get("shortname", meta.get("name", "Expired event")))
-                        continue
-                    d, r = _score_picks(bucket.get("picks", {}), results)
-                    if r:
-                        settled_names.append(meta.get("shortname", results["shortname"]))
-                    _merge_deltas(total_deltas, d)
-                    resolved_by_event.setdefault(eid, []).extend(r)
-                    p, o, br = _score_bets(bucket.get("bets", {}), results)
-                    _merge_payouts(total_payouts, p)
-                    _merge_outcomes(bet_outcomes, o)
-                    resolved_bets_by_event.setdefault(eid, []).extend(br)
+                targets = []
+                for eid, b in evs.items():
+                    ev = await get_event_by_id(self.session, eid, b.get("meta", {}).get("date_compact", ""))
+                    if ev:
+                        targets.append(ev)
+            summaries = []
+            for ev in targets:
+                summaries += await self.process_event(guild, ev, announce=False)
+            voided, refunded = await self._cleanup_stale(guild)
+            legacy = await self.config.guild(guild).picks()
+            legacy_scored = 0
+            if legacy:
+                recent = await get_recent_event(self.session)
+                if recent:
+                    deltas, resolved = _legacy_score(legacy, recent)
+                    async with self.config.guild(guild).standings() as st:
+                        for uid, d in deltas.items():
+                            t = st.setdefault(uid, {"correct": 0, "total": 0})
+                            t["correct"] += d["correct"]
+                            t["total"] += d["total"]
+                            legacy_scored += d["total"]
+                    async with self.config.guild(guild).picks() as lw:
+                        for key, uid in resolved:
+                            (lw.get(key) or {}).pop(uid, None)
+        scored = sum(s["total"] for s in summaries) + legacy_scored
+        bets = sum(len(s["bets"]) for s in summaries)
+        msg = f"✅ Settled **{len(summaries)}** fight(s): **{scored}** pick(s) scored, **{bets}** bet(s) paid out."
+        if voided or refunded:
+            currency = await bank.get_currency_name(guild)
+            msg += f"\n🧹 Cleared {voided} pick(s) from finished cards and refunded {refunded:,} {currency} on fights that never happened."
+        await ctx.send(msg)
 
-                    # Once a card is safely old, anything still unresolved is an
-                    # orphaned/cancelled fight. Picks are discarded and stakes
-                    # are refunded. Current and future cards never enter here.
-                    if _event_is_stale(meta):
-                        resolved_pick_set = set(r)
-                        resolved_bet_set = set(br)
-                        for fight_key, uid, _picked in _all_entries(bucket.get("picks", {})):
-                            if (fight_key, uid) not in resolved_pick_set:
-                                stale_pick_count += 1
-                        for fight_key, uid, bet in _all_entries(bucket.get("bets", {})):
-                            if (fight_key, uid) not in resolved_bet_set:
-                                amount = int((bet or {}).get("amount", 0) or 0)
-                                if amount > 0:
-                                    stale_refunds[uid] = stale_refunds.get(uid, 0) + amount
-                        stale_events.add(eid)
-                        settled_names.append(meta.get("shortname", results["shortname"]))
-                if legacy:
-                    results = await get_recent_event(self.session)
-                    if results:
-                        d, r = _score_picks(legacy, results)
-                        if r:
-                            settled_names.append(results["shortname"])
-                        _merge_deltas(total_deltas, d)
-                        resolved_legacy.extend(r)
-
-        if not total_deltas and not bet_outcomes and not stale_events:
-            return await ctx.send(embed=embeds.error_embed(
-                "No finished fights matched the locked-in picks yet.\n"
-                "Run `!ufc settle` once results are posted, or settle a specific "
-                "card with `!ufc settle YYYY-MM-DD`."))
-
-        # pick-em standings
-        if total_deltas:
-            async with self.config.guild(guild).standings() as standings:
-                for uid, d in total_deltas.items():
-                    s = standings.setdefault(uid, {"correct": 0, "total": 0})
-                    s["correct"] += d["correct"]
-                    s["total"]   += d["total"]
-
-        # pay out winning bets via Red bank
-        for uid, amt in total_payouts.items():
-            if amt <= 0:
-                continue
-            member = guild.get_member(int(uid))
-            if member:
-                try:
-                    await bank.deposit_credits(member, amt)
-                except Exception:
-                    pass  # member may be unreachable; stats still recorded below
-
-        # Refund unresolved bets from safely expired cards. These are treated
-        # as void bets and do not affect lifetime betting W-L or net stats.
-        refunded_total = 0
-        refunded_bets = 0
-        for uid, amt in stale_refunds.items():
-            member = guild.get_member(int(uid))
-            if member and amt > 0:
-                try:
-                    await bank.deposit_credits(member, amt)
-                    refunded_total += amt
-                    refunded_bets += 1
-                except Exception:
-                    pass
-
-        # lifetime betting stats (net P/L and W-L)
-        if bet_outcomes:
-            async with self.config.guild(guild).betting() as betting:
-                for uid, o in bet_outcomes.items():
-                    s = betting.setdefault(uid, {"net": 0, "won": 0, "lost": 0})
-                    s["net"]  += o["net"]
-                    s["won"]  += o["won"]
-                    s["lost"] += o["lost"]
-
-        # remove resolved picks AND bets; drop an event only when both are empty
-        async with self.config.guild(guild).events() as evs_w:
-            touched = set(resolved_by_event) | set(resolved_bets_by_event) | stale_events
-            for eid in touched:
-                if eid not in evs_w:
+    async def _cleanup_stale(self, guild) -> tuple[int, int]:
+        voided = refunded = 0
+        refunds: dict[str, int] = {}
+        async with self.config.guild(guild).events() as evs:
+            for eid in list(evs):
+                b = evs[eid]
+                if not _event_is_stale(b.get("meta", {})):
                     continue
-                pmap = evs_w[eid].get("picks", {})
-                for fight_key, uid in resolved_by_event.get(eid, []):
-                    if fight_key in pmap and uid in pmap[fight_key]:
-                        del pmap[fight_key][uid]
-                    if fight_key in pmap and not pmap[fight_key]:
-                        del pmap[fight_key]
-                bmap = evs_w[eid].get("bets", {})
-                for fight_key, uid in resolved_bets_by_event.get(eid, []):
-                    if fight_key in bmap and uid in bmap[fight_key]:
-                        del bmap[fight_key][uid]
-                    if fight_key in bmap and not bmap[fight_key]:
-                        del bmap[fight_key]
-                if eid in stale_events or (not pmap and not bmap):
-                    del evs_w[eid]
-        if resolved_legacy:
-            async with self.config.guild(guild).picks() as legacy_w:
-                for fight_key, uid in resolved_legacy:
-                    if fight_key in legacy_w and uid in legacy_w[fight_key]:
-                        del legacy_w[fight_key][uid]
-                    if fight_key in legacy_w and not legacy_w[fight_key]:
-                        del legacy_w[fight_key]
-
-        scored = sum(d["total"] for d in total_deltas.values())
-        lines = [f"Scored **{scored}** pick(s):\n"]
-        for uid, d in sorted(total_deltas.items(), key=lambda x: -x[1]["correct"]):
-            m = guild.get_member(int(uid))
-            disp = m.display_name if m else f"<@{uid}>"
-            c, t = d["correct"], d["total"]
-            pct = round(c / t * 100) if t else 0
-            icon = "🔥" if c == t else ("✅" if c else "❌")
-            lines.append(f"{icon} **{disp}**: {c}/{t} ({pct}%)")
-
-        # money summary for users who had bets resolve
-        if bet_outcomes:
-            currency = await bank.get_currency_name(guild)
-            lines.append("\n**💰 Betting:**")
-            for uid, o in sorted(bet_outcomes.items(), key=lambda x: -x[1]["net"]):
-                m = guild.get_member(int(uid))
-                disp = m.display_name if m else f"<@{uid}>"
-                net = o["net"]
-                sign = "+" if net >= 0 else "−"
-                emoji = "💸" if net >= 0 else "📉"
-                lines.append(f"{emoji} **{disp}**: {sign}{abs(net):,} {currency} "
-                             f"({o['won']}W-{o['lost']}L)")
-
-        if stale_events:
-            currency = await bank.get_currency_name(guild)
-            lines.append(f"\n**🧹 Old-card cleanup:** removed **{stale_pick_count}** "
-                         f"unresolved pick(s) from **{len(stale_events)}** expired event(s).")
-            if refunded_total:
-                lines.append(f"Refunded **{refunded_total:,} {currency}** across "
-                             f"**{refunded_bets}** user account(s) for void bets.")
-
-        leftover = sum(len(fp) for b in (await self.config.guild(guild).events()).values()
-                       for fp in b.get("picks", {}).values())
-        leftover += sum(len(v) for v in (await self.config.guild(guild).picks()).values())
-        if leftover:
-            lines.append(f"\n*{leftover} pick(s) not yet scored (fights pending).*")
-        lines.append(f"\nUse `{ctx.clean_prefix}ufc standings` to see the leaderboard.")
-
-        label = ", ".join(dict.fromkeys(settled_names)) or "UFC"
-        await ctx.send(embed=embeds.settle_embed(label, lines))
-
-    # ── clearpicks / resetstandings ───────────────────────────────────────────
+                voided += sum(len(v) for v in (b.get("picks") or {}).values())
+                for ub in (b.get("bets") or {}).values():
+                    for uid, bet in ub.items():
+                        refunds[uid] = refunds.get(uid, 0) + int(bet.get("amount", 0) or 0)
+                del evs[eid]
+        for uid, amt in refunds.items():
+            await self._deposit(guild, uid, amt)
+            refunded += amt
+        return voided, refunded
 
     @ufc.command(name="clearpicks")
     @checks.admin_or_permissions(manage_guild=True)
-    async def ufc_clearpicks(self, ctx):
-        """[Admin] Clear all picks and bets (every event), refunding active bets."""
+    @commands.guild_only()
+    async def ufc_clearpicks(self, ctx: commands.Context):
+        """[Admin] Clear all open picks and bets (bets are refunded)."""
         evs = await self.config.guild(ctx.guild).events()
-        refunded_total = refunded_users = 0
-        for bucket in evs.values():
-            for ub in bucket.get("bets", {}).values():
+        total = 0
+        for b in evs.values():
+            for ub in (b.get("bets") or {}).values():
                 for uid, bet in ub.items():
-                    member = ctx.guild.get_member(int(uid))
-                    amt = bet.get("amount", 0)
-                    if member and amt > 0:
-                        try:
-                            await bank.deposit_credits(member, amt)
-                            refunded_total += amt
-                            refunded_users += 1
-                        except Exception:
-                            pass
+                    await self._deposit(ctx.guild, uid, int(bet.get("amount", 0) or 0))
+                    total += int(bet.get("amount", 0) or 0)
         await self.config.guild(ctx.guild).events.set({})
         await self.config.guild(ctx.guild).picks.set({})
-        msg = "✅ All picks and bets cleared."
-        if refunded_total:
-            currency = await bank.get_currency_name(ctx.guild)
-            msg += f" Refunded **{refunded_total:,} {currency}** across {refunded_users} bet(s)."
-        await ctx.send(msg)
+        await ctx.send("✅ All picks and bets cleared." + (f" Refunded {total:,}." if total else ""))
 
     @ufc.command(name="resetstandings")
     @checks.admin_or_permissions(administrator=True)
-    async def ufc_resetstandings(self, ctx):
-        """[Admin] Permanently wipe standings (asks for confirmation)."""
-        await ctx.send("⚠️ This permanently deletes all standings. "
-                       "Type `confirm` to proceed, or anything else to cancel.")
-
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
-
+    @commands.guild_only()
+    async def ufc_resetstandings(self, ctx: commands.Context):
+        """[Admin] Wipe all standings (asks for confirmation)."""
+        await ctx.send("⚠️ This deletes **all** standings, monthly/season tables and betting stats. Type `confirm`.")
         try:
-            msg = await self.bot.wait_for("message", check=check, timeout=30)
+            msg = await self.bot.wait_for("message", timeout=30,
+                                          check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
         except asyncio.TimeoutError:
-            return await ctx.send("Timed out — standings unchanged.")
-        if _norm(msg.content) == "confirm":
-            await self.config.guild(ctx.guild).standings.set({})
-            await ctx.send("✅ Standings reset.")
-        else:
-            await ctx.send("Cancelled — standings unchanged.")
+            return await ctx.send("Timed out, nothing changed.")
+        if _norm(msg.content) != "confirm":
+            return await ctx.send("Cancelled.")
+        conf = self.config.guild(ctx.guild)
+        for item in (conf.standings, conf.betting, conf.periods, conf.last_card):
+            await item.set({})
+        await ctx.send("✅ Standings reset.")
+
+    # ------------------------------------------------------------------ #
+    # Settings
+    # ------------------------------------------------------------------ #
+    @commands.group(name="ufcset")
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def ufcset(self, ctx: commands.Context):
+        """Fight-night automation settings."""
+
+    @ufcset.command(name="channel")
+    async def ufcset_channel(self, ctx, channel: Optional[discord.TextChannel] = None):
+        """Fight-night channel: card post, live results and recap. Leave empty to turn off."""
+        await self.config.guild(ctx.guild).channel.set(channel.id if channel else None)
+        await ctx.send(f"🥊 Fight night posts go to {channel.mention}." if channel else "Fight-night posts turned off.")
+
+    @ufcset.command(name="role")
+    async def ufcset_role(self, ctx, role: Optional[discord.Role] = None):
+        """Role to ping when the card is posted. Leave empty for no ping."""
+        await self.config.guild(ctx.guild).ping_role.set(role.id if role else None)
+        await ctx.send(f"Will ping {role.mention}." if role else "No role ping.",
+                       allowed_mentions=discord.AllowedMentions.none())
+
+    @ufcset.command(name="hype")
+    async def ufcset_hype(self, ctx, hours: int):
+        """Post the card this many hours before the first fight (0 = don't auto-post)."""
+        await self.config.guild(ctx.guild).hype_hours.set(max(0, min(hours, 168)))
+        await ctx.send(f"Card auto-post: {f'{hours}h before the first fight' if hours else 'off'}.")
+
+    @ufcset.command(name="live")
+    async def ufcset_live(self, ctx, on: bool):
+        """Post each result as it happens (`on`/`off`). Scoring is automatic either way."""
+        await self.config.guild(ctx.guild).live.set(on)
+        await ctx.send(f"Live results {'on' if on else 'off'}.")
+
+    @ufcset.command(name="events")
+    async def ufcset_events(self, ctx, on: bool):
+        """Create a Discord scheduled event for each card (`on`/`off`). Needs Manage Events."""
+        if on and not ctx.guild.me.guild_permissions.manage_events:
+            return await ctx.send("I need the **Manage Events** permission for that.")
+        await self.config.guild(ctx.guild).sched_events.set(on)
+        await ctx.send(f"Discord events for each card: {'on' if on else 'off'}.")
+
+    @ufcset.command(name="post")
+    async def ufcset_post(self, ctx):
+        """Post the card to the fight-night channel now (with the role ping)."""
+        g = await self.config.guild(ctx.guild).all()
+        channel = ctx.guild.get_channel(g["channel"]) if g["channel"] else None
+        if channel is None:
+            return await ctx.send(f"Set a channel first: `{ctx.clean_prefix}ufcset channel #channel`.")
+        event = await self.get_event()
+        if not event:
+            return await ctx.send("Couldn't fetch the card.")
+        async with ctx.typing():
+            await self._send_card(channel, event, ctx.guild, ping=ctx.guild.get_role(g["ping_role"]) if g["ping_role"] else None)
+        async with self.config.guild(ctx.guild).events() as evs:
+            b = evs.setdefault(event["id"], {"meta": self._meta(event), "picks": {}})
+            b.setdefault("posted", {})["hype"] = True
+        await ctx.tick()
+
+    @ufcset.command(name="settings")
+    async def ufcset_settings(self, ctx):
+        """Show fight-night settings."""
+        g = await self.config.guild(ctx.guild).all()
+        ch = ctx.guild.get_channel(g["channel"]) if g["channel"] else None
+        role = ctx.guild.get_role(g["ping_role"]) if g["ping_role"] else None
+        await ctx.send(box(
+            f"Channel        : {'#' + ch.name if ch else 'off'}\n"
+            f"Ping role      : {'@' + role.name if role else 'none'}\n"
+            f"Card auto-post : {str(g['hype_hours']) + 'h before' if g['hype_hours'] else 'off'}\n"
+            f"Live results   : {'on' if g['live'] else 'off'}\n"
+            f"Discord events : {'on' if g['sched_events'] else 'off'}",
+            lang="yaml"))
+
+    # ------------------------------------------------------------------ #
+    # The watcher
+    # ------------------------------------------------------------------ #
+    @tasks.loop(minutes=3)
+    async def watch(self):
+        await self.bot.wait_until_red_ready()
+        try:
+            await self._tick()
+        except Exception:  # noqa: BLE001
+            log.exception("fight-night watcher failed")
+
+    async def _tick(self):
+        guilds = await self.config.all_guilds()
+        if not guilds:
+            return
+        event = await self.get_event()
+        now = time.time()
+        for gid, g in guilds.items():
+            guild = self.bot.get_guild(gid)
+            if guild is None:
+                continue
+            channel = guild.get_channel(g["channel"]) if g.get("channel") else None
+            if event:
+                await self._maybe_schedule(guild, g, event)
+                await self._maybe_hype(guild, g, event, channel, now)
+                summaries = await self.process_event(guild, event, announce=bool(channel and g.get("live")))
+                if channel and g.get("live"):
+                    for s in summaries:
+                        try:
+                            await channel.send(embed=await self.result_embed(guild, s))
+                        except discord.HTTPException:
+                            pass
+                await self._maybe_recap(guild, event, channel)
+            # older cards that still hold picks (e.g. the bot was offline on fight night)
+            for eid, b in (g.get("events") or {}).items():
+                if event and eid == event.get("id"):
+                    continue
+                if not (b.get("picks") or b.get("bets")):
+                    continue
+                old = await get_event_by_id(self.session, eid, b.get("meta", {}).get("date_compact", ""))
+                if old:
+                    await self.process_event(guild, old, announce=False)
+                    await self._maybe_recap(guild, old, channel)
+            await self._cleanup_stale(guild)
+
+    async def _maybe_schedule(self, guild, g, event):
+        if not g.get("sched_events") or event["id"] in (g.get("sched_created") or {}):
+            return
+        start = _first_start(event)
+        if not start or start < time.time() + 600 or start > time.time() + 14 * 86400:
+            return
+        if not guild.me.guild_permissions.manage_events:
+            return
+        main = event["fights"][0] if event.get("fights") else None
+        desc = f"Main event: {main['red']} vs {main['blue']} ({main.get('weight_class', '')})" if main else ""
+        try:
+            se = await guild.create_scheduled_event(
+                name=event["name"][:100], description=(desc + "\nMake your picks with the UFC bot!")[:1000],
+                start_time=datetime.fromtimestamp(start, timezone.utc),
+                end_time=datetime.fromtimestamp(start + 7 * 3600, timezone.utc),
+                entity_type=discord.EntityType.external, location=(event.get("location") or "UFC")[:100],
+                privacy_level=discord.PrivacyLevel.guild_only,
+            )
+        except discord.HTTPException:
+            log.warning("couldn't create scheduled event in %s", guild.id, exc_info=True)
+            return
+        async with self.config.guild(guild).sched_created() as sc_map:
+            sc_map[event["id"]] = se.id
+
+    async def _maybe_hype(self, guild, g, event, channel, now):
+        hours = g.get("hype_hours") or 0
+        start = _first_start(event)
+        if not channel or not hours or not start:
+            return
+        if not (start - hours * 3600 <= now < start + 3600):
+            return
+        bucket = (g.get("events") or {}).get(event["id"]) or {}
+        if (bucket.get("posted") or {}).get("hype"):
+            return
+        role = guild.get_role(g["ping_role"]) if g.get("ping_role") else None
+        try:
+            await self._send_card(channel, event, guild, content=f"## 🥊 It's fight night: {event['name']}", ping=role)
+        except discord.HTTPException:
+            return
+        async with self.config.guild(guild).events() as evs:
+            b = evs.setdefault(event["id"], {"meta": self._meta(event), "picks": {}})
+            b.setdefault("posted", {})["hype"] = True
+
+    async def _maybe_recap(self, guild, event, channel):
+        fights = event.get("fights", [])
+        if not fights or not all(f.get("completed") for f in fights):
+            return
+        evs = await self.config.guild(guild).events()
+        bucket = evs.get(event["id"])
+        if not bucket or (bucket.get("posted") or {}).get("recap"):
+            return
+        embed = await self.recap_embed(guild, event, bucket)
+        if embed and channel:
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+        async with self.config.guild(guild).events() as evs_w:
+            b = evs_w.get(event["id"])
+            if b is not None:
+                b.setdefault("posted", {})["recap"] = True
+        if bucket.get("scores"):
+            await self.config.guild(guild).last_card.set({"name": event["name"], "scores": bucket["scores"]})
 
 
 async def setup(bot: Red):

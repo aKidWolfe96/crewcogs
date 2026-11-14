@@ -256,18 +256,36 @@ def _fmt_fightcenter(data: dict) -> Optional[dict]:
         note_blob = " ".join(str((n or {}).get("text", "") or "") for n in notes)
         title_blob = f"{weight_class} {comp.get('note', '')} {note_blob}".lower()
 
+        start = _parse_date(comp)
+        seg = comp.get("cardSegment") or {}
+        is_title = "title" in title_blob or "championship" in title_blob
+        is_main_event = "main event" in title_blob
         fights.append({
             "red": _athlete_name(red_c),
             "blue": _athlete_name(blue_c),
             "red_record": _athlete_record(red_c),
             "blue_record": _athlete_record(blue_c),
             "weight_class": weight_class,
-            "is_title": "title" in title_blob or "championship" in title_blob,
+            "is_title": is_title,
             "winner": winner,
             "method": method,
             "round": str(status.get("period", "") or ""),
             "time": status.get("displayClock", "") or "",
             "completed": completed,
+            # ── richer fields (v6) ──
+            "id": str(comp.get("id", "")),
+            "start": int(start.timestamp()) if start else None,
+            "state": status_type.get("state", "") or ("post" if completed else "pre"),
+            "segment": seg.get("name", "") or "",
+            "segment_label": seg.get("description", "") or "",
+            "main_event": is_main_event,
+            "rounds": 5 if (is_title or is_main_event) else 3,
+            "method_key": _method_key(result),
+            "method_detail": result.get("displayDescription", "") or result.get("description", "") or "",
+            "red_info": _athlete_info(red_c),
+            "blue_info": _athlete_info(blue_c),
+            "red_odds": None,
+            "blue_odds": None,
         })
 
     dt = _parse_date(event)
@@ -281,6 +299,76 @@ def _fmt_fightcenter(data: dict) -> Optional[dict]:
         "location": _fightcenter_location(event),
         "fights": fights,
     }
+
+
+def _method_key(result: dict) -> str:
+    """ESPN result -> 'ko' | 'sub' | 'dec' | '' (draws, DQs, no contests)."""
+    name = (result or {}).get("name", "") or ""
+    disp = ((result or {}).get("displayName", "") or "").lower()
+    blob = f"{name} {disp}".lower()
+    if "ko" in blob or "tko" in blob:
+        return "ko"
+    if "sub" in blob:
+        return "sub"
+    if "decision" in blob or "dec" in blob:
+        return "dec"
+    return ""
+
+
+def _athlete_info(competitor: dict) -> dict:
+    a = competitor.get("athlete") or {}
+    images = {(i.get("rel") or [""])[0]: i.get("href") for i in (a.get("images") or []) if isinstance(i, dict)}
+    stats = {}
+    for st in (competitor.get("stats") or []):
+        if isinstance(st, dict) and st.get("name"):
+            stats[st["name"]] = st.get("displayValue")
+    return {
+        "id": str(a.get("id", "") or competitor.get("id", "")),
+        "headshot": (a.get("headshot") or {}).get("href"),
+        "flag": (a.get("flag") or {}).get("href"),
+        "country": a.get("country") or (a.get("flag") or {}).get("alt") or "",
+        "age": a.get("age"),
+        "height": a.get("displayHeight") or "",
+        "weight": a.get("displayWeight") or "",
+        "reach": a.get("displayReach") or "",
+        "stance": (a.get("stance") or {}).get("text", "") or "",
+        "stance_left": images.get("leftStance"),
+        "stance_right": images.get("rightStance"),
+        "short": a.get("shortName") or "",
+        "stats": stats,
+    }
+
+
+ESPN_ODDS = "https://sports.core.api.espn.com/v2/sports/mma/leagues/ufc/events/{eid}/competitions/{cid}/odds"
+
+
+async def _fight_odds(session: aiohttp.ClientSession, eid: str, cid: str) -> dict:
+    """{athlete_id: american moneyline} for one fight (empty if no line)."""
+    data = await _get_json(session, ESPN_ODDS.format(eid=eid, cid=cid) + "?lang=en&region=us")
+    out = {}
+    for item in ((data or {}).get("items") or [])[:1]:
+        for side in ("homeAthleteOdds", "awayAthleteOdds"):
+            o = item.get(side) or {}
+            ref = ((o.get("athlete") or {}).get("$ref") or "")
+            m = re.search(r"/athletes/(\d+)", ref)
+            ml = o.get("moneyLine")
+            if m and isinstance(ml, (int, float)):
+                out[m.group(1)] = int(ml)
+    return out
+
+
+async def attach_odds(session: aiohttp.ClientSession, event: dict) -> dict:
+    """Fill red_odds/blue_odds on every not-yet-finished fight. Safe to call repeatedly."""
+    if not event or not event.get("id"):
+        return event
+    todo = [f for f in event.get("fights", []) if f.get("id") and not f.get("completed")]
+    results = await asyncio.gather(*(_fight_odds(session, event["id"], f["id"]) for f in todo),
+                                   return_exceptions=True)
+    for f, odds in zip(todo, results):
+        if isinstance(odds, dict):
+            f["red_odds"] = odds.get((f.get("red_info") or {}).get("id"))
+            f["blue_odds"] = odds.get((f.get("blue_info") or {}).get("id"))
+    return event
 
 
 async def _web_event_full(session: aiohttp.ClientSession, header_event: dict) -> Optional[dict]:
@@ -671,6 +759,8 @@ async def get_fighter(session: aiohttp.ClientSession, name: str) -> Optional[dic
 
     # merge — prefer whichever field has data, keep ESPN headshot + Sherdog history
     merged = dict(espn)
+    if merged.get("record") in ("0-0-0", "0-0"):
+        merged["record"] = ""  # ESPN placeholder; Sherdog has the real one
     for key in ("record", "height", "weight", "nickname", "weight_class"):
         if not merged.get(key) and sher.get(key):
             merged[key] = sher[key]
@@ -695,6 +785,9 @@ async def _espn_fighter(session: aiohttp.ClientSession, name: str) -> Optional[d
         if aid:
             detail = await _espn_athlete_detail(session, aid)
         base = _espn_from_search(candidate)
+        base["espn_id"] = str(aid or "")
+        if aid and not base.get("headshot"):
+            base["headshot"] = f"https://a.espncdn.com/i/headshots/mma/players/full/{aid}.png"
         if detail:
             base = _merge_espn_detail(base, detail)
             stats = await _espn_athlete_stats(session, aid)
@@ -709,17 +802,19 @@ async def _espn_fighter(session: aiohttp.ClientSession, name: str) -> Optional[d
 async def _espn_search_athlete(session: aiohttp.ClientSession, name: str) -> Optional[dict]:
     # try both query param styles ESPN has used
     urls = [
+        f"{ESPN_SEARCH}?query={quote(name)}&limit=10&type=player",
         f"{ESPN_SEARCH}?query={quote(name)}&limit=10&mode=prefix",
         f"{ESPN_SEARCH}?query={quote(name)}&limit=10",
     ]
-    data = None
     for u in urls:
         data = await _get_json(session, u)
-        if data:
-            break
-    if not data:
-        return None
+        hit = _pick_search_hit(data, name) if data else None
+        if hit:
+            return hit
+    return None
 
+
+def _pick_search_hit(data: dict, name: str) -> Optional[dict]:
     # flatten results, tagging each item with its group-level type/name
     items = []
     for group in data.get("results", []):

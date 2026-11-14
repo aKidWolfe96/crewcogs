@@ -1,0 +1,14 @@
+{
+  "author": ["KrustyKrew"],
+  "name": "DeadByDaylight",
+  "short": "Shrine of Secrets, perk lookups, build randomizers and a Prestige 100 tracker.",
+  "description": "Dead by Daylight for every platform (no accounts needed). Weekly Shrine of Secrets posts with perk wishlist pings, perk and character lookups with tier values filled in, random builds for you or your whole voice channel, and a Prestige 100 tracker with a picture board, tick-box editor and leaderboard. Game data from dbd.tricky.lol.",
+  "install_msg": "Thanks for installing Dead by Daylight! Try `[p]dbd shrine`, `[p]dbd build`, and `[p]dbd p100`. Set weekly Shrine posts with `[p]dbdset shrine #channel`.",
+  "tags": ["deadbydaylight", "dbd", "games", "perks", "randomizer", "prestige"],
+  "requirements": ["aiohttp", "Pillow>=10.1"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog stores which characters you've marked as Prestige 100 and your perk wishlist, keyed by your Discord user ID."
+}
