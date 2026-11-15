@@ -28,8 +28,8 @@ from redbot.core.utils.chat_formatting import box
 from . import embeds
 from . import render
 from . import scoring as sc
-from .api import (attach_odds, espn_api_status, get_event_by_id, get_event_on_date, get_fighter,
-                  get_recent_event, get_upcoming_event)
+from .api import (attach_odds, card_last_start, espn_api_status, fight_done, get_event_by_id,
+                  get_event_on_date, get_fighter, get_recent_event, get_upcoming_event)
 from .views import CardView, PickEditor, is_locked, png_file
 
 log = logging.getLogger("red.akidwolfe.fightnight")
@@ -959,11 +959,23 @@ class UFC(commands.Cog):
             for eid, b in (g.get("events") or {}).items():
                 if event and eid == event.get("id"):
                     continue
-                if not (b.get("picks") or b.get("bets")):
+                pending = b.get("picks") or b.get("bets")
+                needs_recap = b.get("scores") and not (b.get("posted") or {}).get("recap")
+                if not (pending or needs_recap):
                     continue
                 old = await get_event_by_id(self.session, eid, b.get("meta", {}).get("date_compact", ""))
                 if old:
-                    await self.process_event(guild, old, announce=False)
+                    # A card from the last day or so (e.g. the bot restarted mid-event)
+                    # still gets live result posts; anything older settles quietly.
+                    recent = (_first_start(old) or 0) > now - 30 * 3600
+                    live = bool(channel and g.get("live") and recent and not (b.get("posted") or {}).get("recap"))
+                    summaries = await self.process_event(guild, old, announce=live)
+                    if live:
+                        for s in summaries:
+                            try:
+                                await channel.send(embed=await self.result_embed(guild, s))
+                            except discord.HTTPException:
+                                pass
                     await self._maybe_recap(guild, old, channel)
             await self._cleanup_stale(guild)
 
@@ -1012,7 +1024,9 @@ class UFC(commands.Cog):
 
     async def _maybe_recap(self, guild, event, channel):
         fights = event.get("fights", [])
-        if not fights or not all(f.get("completed") for f in fights):
+        last = card_last_start(event) or 0
+        over = fights and (all(fight_done(f) for f in fights) or time.time() > last + 8 * 3600)
+        if not over:
             return
         evs = await self.config.guild(guild).events()
         bucket = evs.get(event["id"])

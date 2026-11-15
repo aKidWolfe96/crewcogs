@@ -134,16 +134,17 @@ async def _web_header_events(session: aiohttp.ClientSession, ymd: str) -> list:
 
 
 async def _web_find_event(session: aiohttp.ClientSession, *, forward: bool,
-                          days: int = 21, exact_ymd: str = "") -> Optional[dict]:
+                          days: int = 21, exact_ymd: str = "", skip_ids: frozenset = frozenset()) -> Optional[dict]:
     """Find a real UFC event using the site.web.api scoreboard/header feed."""
     now = datetime.now(timezone.utc)
     if exact_ymd:
         dates = [exact_ymd]
     else:
         base = now.date()
-        offsets = range(0, days + 1)
-        if not forward:
-            offsets = range(0, days + 1)
+        # Cards are filed under their US date, but main cards start after
+        # midnight UTC, so "today" in UTC can already be the next day while
+        # tonight's card is still running. Always look back one day too.
+        offsets = range(-1, days + 1) if forward else range(0, days + 1)
         dates = []
         for i in offsets:
             d = base + timedelta(days=i if forward else -i)
@@ -151,7 +152,7 @@ async def _web_find_event(session: aiohttp.ClientSession, *, forward: bool,
 
     for ymd in dates:
         events = await _web_header_events(session, ymd)
-        real = [e for e in events if _is_ufc_event(e)]
+        real = [e for e in events if _is_ufc_event(e) and str(e.get("id", "")) not in skip_ids]
         if not real:
             continue
         parsed = [(d, e) for e in real if (d := _parse_date(e))]
@@ -581,6 +582,35 @@ def _fmt_event(raw: dict) -> dict:
     }
 
 
+# How long a fully finished card stays "current" after its last segment
+# starts (so results, settling and the recap all happen before moving on).
+CARD_LINGER = timedelta(hours=6)
+
+
+CARD_GIVE_UP = timedelta(hours=12)
+
+
+def fight_done(f: dict) -> bool:
+    """Finished, or marked over by ESPN without a result (e.g. a bout cancelled on the night)."""
+    return bool(f.get("completed") or f.get("state") == "post")
+
+
+def card_last_start(event: dict) -> Optional[float]:
+    starts = [f.get("start") for f in (event.get("fights") or []) if f.get("start")]
+    return max(starts) if starts else event.get("timestamp")
+
+
+def _card_is_over(event: dict) -> bool:
+    fights = event.get("fights") or []
+    last = card_last_start(event)
+    now = datetime.now(timezone.utc).timestamp()
+    if last and now > last + CARD_GIVE_UP.total_seconds():
+        return True  # ESPN never closed a bout out; don't hold the next card hostage
+    if not fights or not all(fight_done(f) for f in fights):
+        return False
+    return not last or now > last + CARD_LINGER.total_seconds()
+
+
 # A card runs several hours; treat an event that started within this window as
 # the "current" event so `card`/`picks` keep working once the fights go live.
 LIVE_WINDOW = timedelta(hours=24)
@@ -610,11 +640,17 @@ async def get_upcoming_event(session: aiohttp.ClientSession) -> Optional[dict]:
     HTTP 403 from site.api.espn.com's scoreboard while site.web.api remains
     reachable. The legacy scoreboard remains as a fallback.
     """
-    header = await _web_find_event(session, forward=True, days=21)
-    if header:
+    skip: set = set()
+    for _ in range(3):
+        header = await _web_find_event(session, forward=True, days=21, skip_ids=frozenset(skip))
+        if not header:
+            break
         full = await _web_event_full(session, header)
-        if full:
+        if not full:
+            break
+        if not _card_is_over(full):
             return full
+        skip.add(str(full.get("id", "")))  # finished hours ago: move to the next card
 
     now = datetime.now(timezone.utc)
     raw = _select_current_or_next(await _scoreboard(session), now)
