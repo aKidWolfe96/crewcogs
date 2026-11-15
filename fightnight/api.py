@@ -587,15 +587,28 @@ def _fmt_event(raw: dict) -> dict:
 CARD_LINGER = timedelta(hours=6)
 
 
+CARD_GIVE_UP = timedelta(hours=12)
+
+
+def fight_done(f: dict) -> bool:
+    """Finished, or marked over by ESPN without a result (e.g. a bout cancelled on the night)."""
+    return bool(f.get("completed") or f.get("state") == "post")
+
+
+def card_last_start(event: dict) -> Optional[float]:
+    starts = [f.get("start") for f in (event.get("fights") or []) if f.get("start")]
+    return max(starts) if starts else event.get("timestamp")
+
+
 def _card_is_over(event: dict) -> bool:
     fights = event.get("fights") or []
-    if not fights or not all(f.get("completed") for f in fights):
+    last = card_last_start(event)
+    now = datetime.now(timezone.utc).timestamp()
+    if last and now > last + CARD_GIVE_UP.total_seconds():
+        return True  # ESPN never closed a bout out; don't hold the next card hostage
+    if not fights or not all(fight_done(f) for f in fights):
         return False
-    starts = [f.get("start") for f in fights if f.get("start")]
-    last = max(starts) if starts else event.get("timestamp")
-    if not last:
-        return True
-    return datetime.now(timezone.utc).timestamp() > last + CARD_LINGER.total_seconds()
+    return not last or now > last + CARD_LINGER.total_seconds()
 
 
 # A card runs several hours; treat an event that started within this window as
