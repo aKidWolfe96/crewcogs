@@ -50,3 +50,36 @@ An inspirational Bible verse as an elegant image card every day, with seven card
 ```
 
 Try `[p]verse John 3:16`, `[p]verse compare John 3:16`, `[p]verse read Psalm 23`, `[p]verse random hope`, `[p]verse pick` and `[p]verseset preview`.
+
+---
+
+## 🔊 Chatterbox TTS
+
+Reads messages out loud in voice chat using your own [Chatterbox TTS server](https://github.com/devnen/Chatterbox-TTS-Server). If Red's Audio cog is playing music, the music steps aside for the message and then comes back where it left off, with the same song, position, queue and volume.
+
+**1. Run the TTS server in Docker** (on the machine with the GPU). The scripts are in [`chatterbox_tts/docker`](chatterbox_tts/docker).
+
+**Windows** (needs [Docker Desktop](https://www.docker.com/products/docker-desktop/) running and [Git](https://git-scm.com/download/win)). In PowerShell or Command Prompt, from that folder:
+
+```bash
+.\chatterbox-docker.cmd up                # auto-picks NVIDIA or CPU; add -Gpu cu128 for RTX 50-series
+```
+
+**Linux / WSL / macOS:**
+
+```bash
+./chatterbox-docker.sh up                 # auto-picks NVIDIA or CPU; --gpu cu128 for RTX 50-series
+```
+
+The first start downloads the model, so give it a few minutes. When it's ready, the script prints the exact `[p]ttsset url` command to run. Other commands: `status`, `logs`, `restart`, `down` and `update`. Use `help` (Windows) or `--help` to see every option (port, install folder, GPU type).
+
+**2. Install the cog** (the bot host needs `ffmpeg`):
+
+```bash
+[p]cog install crewcogs chatterbox_tts
+[p]load chatterbox_tts
+[p]ttsset url http://192.168.1.227:8000  # the address the script printed
+[p]ttsset status
+```
+
+Try `[p]tts hello everyone` and `[p]tts #Some-Voice-Channel surprise!`. The cog always speaks with **`voice.wav`**: put that file in the server's `voices` folder (`C:\Users\<you>\chatterbox-tts-server\voices` with the Windows script). `[p]ttsset status` confirms the server can see it. The bot owner can set the longest message with `[p]ttsset maxlength 400`.
