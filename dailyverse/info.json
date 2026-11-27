@@ -1,0 +1,28 @@
+{
+  "author": [
+    "aKidWolfe"
+  ],
+  "name": "DailyVerse",
+  "short": "A beautiful, inspirational Bible verse card every day, with lookups and side-by-side translations.",
+  "description": "Posts an inspirational Bible verse as an elegant image card every day, with seven styles that rotate daily, weekday themes (Motivation Monday, Faith Friday...) and holiday verses. Look up any verse, compare the New King James Version, New International Version and New American Standard Bible (1995) side by side, read whole chapters, search the King James Version, pick verses by theme (Hope, Strength, Peace, Anxiety & Worry...), save favorites and get the daily verse by DM. Copyrighted translations load through API.Bible with your own key; the public-domain King James Version is built in and always works.",
+  "install_msg": "Thanks for installing Daily Verse! Set your API.Bible key with `[p]set api apibible api_key,YOUR_KEY` (in DMs), check it with `[p]verseset apistatus`, then pick a channel with `[p]verseset channel #channel`. Try `[p]verse John 3:16` and `[p]verse compare John 3:16`.",
+  "tags": [
+    "bible",
+    "verse",
+    "daily",
+    "scripture",
+    "christian",
+    "inspiration",
+    "faith"
+  ],
+  "requirements": [
+    "aiohttp",
+    "Pillow>=10.1",
+    "tzdata"
+  ],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog stores the verses you save as favorites and whether you've asked to get the daily verse in your DMs, keyed by your Discord user ID."
+}
