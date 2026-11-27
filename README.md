@@ -50,3 +50,30 @@ An inspirational Bible verse as an elegant image card every day, with seven card
 ```
 
 Try `[p]verse John 3:16`, `[p]verse compare John 3:16`, `[p]verse read Psalm 23`, `[p]verse random hope`, `[p]verse pick` and `[p]verseset preview`.
+
+---
+
+## 🔊 Chatterbox TTS
+
+Reads messages out loud in voice chat using your own [Chatterbox TTS server](https://github.com/devnen/Chatterbox-TTS-Server). If Red's Audio cog is playing music, the music steps aside for the message and then comes back where it left off, with the same song, position, queue and volume.
+
+**1. Run the TTS server in Docker** (on the machine with the GPU):
+
+```bash
+curl -O https://raw.githubusercontent.com/aKidWolfe96/crewcogs/main/chatterbox_tts/docker/chatterbox-docker.sh
+chmod +x chatterbox-docker.sh
+./chatterbox-docker.sh up                 # auto-picks NVIDIA or CPU; --gpu cu128 for RTX 50-series
+```
+
+The first start downloads the model, so give it a few minutes. When it's ready, the script prints the exact `[p]ttsset url` command to run. Other commands: `./chatterbox-docker.sh status`, `logs`, `restart`, `down` and `update`. Run `--help` to see every option (port, install folder, GPU type).
+
+**2. Install the cog** (the bot host needs `ffmpeg`):
+
+```bash
+[p]cog install crewcogs chatterbox_tts
+[p]load chatterbox_tts
+[p]ttsset url http://192.168.1.227:8000  # the address the script printed
+[p]ttsset status
+```
+
+Try `[p]tts hello everyone`, `[p]tts #Some-Voice-Channel surprise!`, `[p]ttsvoice list` and `[p]ttsvoice Olivia`. Changing the voice needs Manage Server. To add voices, put `.wav` files in the server's `voices` folder. The bot owner can set the longest message with `[p]ttsset maxlength 400`.

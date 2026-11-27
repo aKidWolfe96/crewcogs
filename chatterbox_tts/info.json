@@ -1,10 +1,14 @@
 {
   "author": ["aKidWolfe"],
   "name": "ChatterboxTTS",
-  "description": "Sends text to a local Chatterbox TTS server and plays it in your voice channel. Pauses and resumes Red's Audio cog automatically.",
-  "install_msg": "Use `[p]tts <message>` while in a voice channel. Make sure your Chatterbox server is running at 192.168.1.227:8000.",
+  "short": "Speak messages in voice chat with a self-hosted Chatterbox TTS server.",
+  "description": "Sends text to your own Chatterbox TTS server and plays it in a voice channel. If Red's Audio cog is playing music, it steps aside for the message and then puts the music back where it was: same song, position, queue and volume.",
+  "install_msg": "Point the cog at your Chatterbox server with `[p]ttsset url http://HOST:PORT` (check it with `[p]ttsset status`), then use `[p]tts <message>` while in a voice channel. The bot host needs ffmpeg installed. A Docker setup script for the server is in the repo: chatterbox_tts/docker/chatterbox-docker.sh",
   "requirements": [],
+  "min_bot_version": "3.5.0",
   "tags": ["tts", "voice", "audio", "chatterbox"],
   "hidden": false,
-  "type": "COG"
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog does not store any data about users."
 }
