@@ -18,22 +18,11 @@ except ImportError:  # pragma: no cover - Red always installs it
 log = logging.getLogger("red.crewcogs.chatterbox_tts")
 
 DEFAULT_URL = "http://192.168.1.227:8000"
-DEFAULT_VOICE = "Ryan.wav"
+VOICE_FILE = "voice.wav"   # the one voice this cog speaks with
 DEFAULT_MAX_CHARS = 400
 
-# Used only when the Chatterbox server can't be asked for its voice list.
-FALLBACK_VOICES = [
-    "Abigail.wav", "Adrian.wav", "Alexander.wav", "Alice.wav",
-    "Austin.wav", "Axel.wav", "Connor.wav", "Cora.wav",
-    "Elena.wav", "Eli.wav", "Emily.wav", "Everett.wav",
-    "Gabriel.wav", "Gianna.wav", "Henry.wav", "Ian.wav",
-    "Jade.wav", "Jeremiah.wav", "Jordan.wav", "Julian.wav",
-    "Layla.wav", "Leonardo.wav", "Michael.wav", "Miles.wav",
-    "Olivia.wav", "Ryan.wav", "Taylor.wav", "Thomas.wav",
-]
-
 MAX_QUEUE = 10            # pending messages per server
-VOICE_CACHE_SECONDS = 300
+VOICE_CHECK_SECONDS = 300
 TTS_TIMEOUT = 120         # seconds Chatterbox gets to generate one message
 PLAYBACK_TIMEOUT = 600    # hard stop for a single clip
 
@@ -92,20 +81,17 @@ class ChatterboxTTS(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=5544332211, force_registration=True)
-        self.config.register_global(
-            url=DEFAULT_URL, max_chars=DEFAULT_MAX_CHARS, migrated_v1=False
-        )
-        self.config.register_guild(voice_id=DEFAULT_VOICE)
+        self.config.register_global(url=DEFAULT_URL, max_chars=DEFAULT_MAX_CHARS)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._queues: Dict[int, asyncio.Queue] = {}
         self._workers: Dict[int, asyncio.Task] = {}
-        self._voice_cache: Optional[List[str]] = None
-        self._voice_cache_at = 0.0
+        self._voice_mode: Optional[str] = None  # "predefined" or "clone", see _voice_payload
+        self._voice_name = VOICE_FILE
+        self._voice_mode_at = 0.0
 
     async def cog_load(self):
         self._session = aiohttp.ClientSession()
-        await self._migrate_old_config()
 
     async def cog_unload(self):
         workers = [t for t in self._workers.values() if not t.done()]
@@ -124,20 +110,6 @@ class ChatterboxTTS(commands.Cog):
 
     async def red_delete_data_for_user(self, **kwargs):
         return  # No per-user data is stored.
-
-    async def _migrate_old_config(self):
-        """Earlier versions stored each server's voice under the cog name "NoneType"."""
-        if await self.config.migrated_v1():
-            return
-        try:
-            old = Config.get_conf(None, identifier=5544332211, cog_name="NoneType")
-            old.register_guild(voice_id=None)
-            for guild_id, data in (await old.all_guilds()).items():
-                if data.get("voice_id"):
-                    await self.config.guild_from_id(guild_id).voice_id.set(data["voice_id"])
-        except Exception:
-            log.exception("Could not migrate old TTS voice settings")
-        await self.config.migrated_v1.set(True)
 
     # ------------------------------------------------------------------ commands
 
@@ -190,35 +162,6 @@ class ChatterboxTTS(commands.Cog):
         else:
             await ctx.tick()
 
-    @commands.command()
-    @commands.guild_only()
-    async def ttsvoice(self, ctx: commands.Context, *, voice: str = None):
-        """Show the TTS voices, or set this server's voice (needs Manage Server)."""
-        voices, live = await self._get_voices()
-        current = await self.config.guild(ctx.guild).voice_id()
-
-        if voice is None or voice.lower() == "list":
-            names = ", ".join(self._display(v) for v in voices)
-            note = "" if live else "\n*(Couldn't reach the Chatterbox server; showing the default list.)*"
-            return await ctx.send(
-                f"**Current voice:** {self._display(current)}\n"
-                f"**Available voices:**\n{names}{note}\n\n"
-                f"Use `{ctx.clean_prefix}ttsvoice <name>` to set one."
-            )
-
-        if not await self._can_manage(ctx):
-            return await ctx.send("You need the Manage Server permission to change the TTS voice.")
-
-        wanted = _strip_suffix(voice.lower(), ".wav")
-        match = next((v for v in voices if self._display(v).lower() == wanted), None)
-        if not match:
-            return await ctx.send(
-                f"Voice `{voice}` not found. Use `{ctx.clean_prefix}ttsvoice list` to see all options."
-            )
-
-        await self.config.guild(ctx.guild).voice_id.set(match)
-        await ctx.send(f"TTS voice set to **{self._display(match)}**.")
-
     @commands.group()
     @commands.is_owner()
     async def ttsset(self, ctx: commands.Context):
@@ -231,7 +174,7 @@ class ChatterboxTTS(commands.Cog):
         if not url.startswith(("http://", "https://")):
             return await ctx.send("The address must start with `http://` or `https://`.")
         await self.config.url.set(url)
-        self._voice_cache = None
+        self._voice_mode = None
         ok, detail = await self._check_server(url)
         status = f"Connected, {detail}." if ok else f"Saved, but I couldn't reach it: {detail}"
         await ctx.send(f"Chatterbox URL set to `{url}`. {status}")
@@ -252,7 +195,7 @@ class ChatterboxTTS(commands.Cog):
         await ctx.send(
             f"**Server:** `{url}` - {'online' if ok else 'unreachable'} ({detail})\n"
             f"**Max length:** {await self.config.max_chars()} characters\n"
-            f"**This server's voice:** {self._display(await self.config.guild(ctx.guild).voice_id()) if ctx.guild else '-'}"
+            f"**Voice:** `{VOICE_FILE}`"
         )
 
     # ------------------------------------------------------------------ worker
@@ -412,8 +355,7 @@ class ChatterboxTTS(commands.Cog):
         url = await self.config.url()
         payload = {
             "text": text,
-            "voice_mode": "predefined",
-            "predefined_voice_id": await self.config.guild(guild).voice_id(),
+            **await self._voice_payload(url),
             "output_format": "wav",
             "split_text": True,
         }
@@ -432,37 +374,52 @@ class ChatterboxTTS(commands.Cog):
                 f"Couldn't reach Chatterbox at `{url}`. Is the server running?"
             ) from None
 
-    async def _get_voices(self):
-        """Return (voices, came_from_server)."""
-        now = time.monotonic()
-        if self._voice_cache and now - self._voice_cache_at < VOICE_CACHE_SECONDS:
-            return self._voice_cache, True
-        url = await self.config.url()
-        try:
-            async with self._session.get(
-                f"{url}/get_predefined_voices", timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
+    async def _find_voice(self, url: str):
+        """Where voice.wav lives on the server: (mode, exact filename), with mode
+        "predefined" for the voices folder or "clone" for the web UI's
+        voice-cloning uploads. (None, None) if it isn't there."""
+        timeout = aiohttp.ClientTimeout(total=5)
+        for endpoint, mode in (("get_predefined_voices", "predefined"), ("get_reference_files", "clone")):
+            async with self._session.get(f"{url}/{endpoint}", timeout=timeout) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-            voices = sorted({v["filename"] for v in data if v.get("filename")}, key=str.lower)
-            if voices:
-                self._voice_cache, self._voice_cache_at = voices, now
-                return voices, True
-        except Exception as exc:
-            log.debug("Couldn't fetch Chatterbox voices: %s", exc)
-        return FALLBACK_VOICES, False
+            names = [item.get("filename") if isinstance(item, dict) else item for item in data]
+            for name in names:
+                if str(name).lower() == VOICE_FILE:  # match Voice.wav too
+                    return mode, name
+        return None, None
+
+    async def _voice_payload(self, url: str) -> dict:
+        now = time.monotonic()
+        if self._voice_mode is None or now - self._voice_mode_at > VOICE_CHECK_SECONDS:
+            try:
+                mode, name = await self._find_voice(url)
+            except aiohttp.ClientConnectionError:
+                raise RuntimeError(
+                    f"Couldn't reach Chatterbox at `{url}`. Is the server running?"
+                ) from None
+            except Exception as exc:
+                log.debug("Couldn't look up %s on the server: %s", VOICE_FILE, exc)
+                mode, name = "predefined", VOICE_FILE  # older servers: try the voices folder
+            if mode is None:
+                raise RuntimeError(
+                    f"The Chatterbox server doesn't have `{VOICE_FILE}`. "
+                    "Put it in the server's `voices` folder."
+                )
+            self._voice_mode, self._voice_name, self._voice_mode_at = mode, name, now
+        if self._voice_mode == "clone":
+            return {"voice_mode": "clone", "reference_audio_filename": self._voice_name}
+        return {"voice_mode": "predefined", "predefined_voice_id": self._voice_name}
 
     async def _check_server(self, url: str):
         try:
-            async with self._session.get(
-                f"{url}/get_predefined_voices", timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                if resp.status != 200:
-                    return False, f"HTTP {resp.status}"
-                data = await resp.json()
-                return True, f"{len(data)} voices available"
+            mode, _ = await self._find_voice(url)
         except Exception as exc:
             return False, str(exc) or type(exc).__name__
+        if mode is None:
+            return True, f"but `{VOICE_FILE}` is missing: put it in the server's voices folder"
+        where = "voices folder" if mode == "predefined" else "voice-cloning uploads"
+        return True, f"`{VOICE_FILE}` found in its {where}"
 
     # ------------------------------------------------------------------ helpers
 
@@ -476,17 +433,6 @@ class ChatterboxTTS(commands.Cog):
         text = CUSTOM_EMOJI_RE.sub(r"\1", text)
         text = LINK_RE.sub("link", text)
         return " ".join(text.split())
-
-    @staticmethod
-    def _display(voice: str) -> str:
-        return _strip_suffix(voice, ".wav")
-
-    async def _can_manage(self, ctx) -> bool:
-        if await self.bot.is_owner(ctx.author):
-            return True
-        if ctx.author.guild_permissions.manage_guild:
-            return True
-        return await self.bot.is_admin(ctx.author)
 
     @staticmethod
     async def _safe_send(channel, content: str):

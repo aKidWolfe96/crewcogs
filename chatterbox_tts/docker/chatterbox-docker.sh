@@ -101,7 +101,7 @@ print_next_steps() {
 
 Chatterbox TTS is running.
   Web UI:  http://$ip:$PORT
-  Voices:  $DIR/voices  (drop extra .wav files here, then [p]ttsvoice list)
+  Voice:   copy your voice.wav into $DIR/voices (the cog only uses that file)
 
 Point the cog at it from Discord:
   [p]ttsset url http://$ip:$PORT

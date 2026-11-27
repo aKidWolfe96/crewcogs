@@ -124,7 +124,7 @@ function Show-NextSteps {
     Write-Host ""
     Write-Host "Chatterbox TTS is running." -ForegroundColor Green
     Write-Host "  Web UI:  http://${ip}:$Port"
-    Write-Host "  Voices:  $(Join-Path $Dir 'voices')  (drop extra .wav files here, then [p]ttsvoice list)"
+    Write-Host "  Voice:   copy your voice.wav into $(Join-Path $Dir 'voices') (the cog only uses that file)"
     Write-Host ""
     Write-Host "Point the cog at it from Discord:"
     Write-Host "  [p]ttsset url http://${ip}:$Port" -ForegroundColor Green

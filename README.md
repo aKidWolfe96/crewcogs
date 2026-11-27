@@ -82,4 +82,4 @@ The first start downloads the model, so give it a few minutes. When it's ready, 
 [p]ttsset status
 ```
 
-Try `[p]tts hello everyone`, `[p]tts #Some-Voice-Channel surprise!`, `[p]ttsvoice list` and `[p]ttsvoice Olivia`. Changing the voice needs Manage Server. To add voices, put `.wav` files in the server's `voices` folder. The bot owner can set the longest message with `[p]ttsset maxlength 400`.
+Try `[p]tts hello everyone` and `[p]tts #Some-Voice-Channel surprise!`. The cog always speaks with **`voice.wav`**: put that file in the server's `voices` folder (`C:\Users\<you>\chatterbox-tts-server\voices` with the Windows script). `[p]ttsset status` confirms the server can see it. The bot owner can set the longest message with `[p]ttsset maxlength 400`.
